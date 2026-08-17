@@ -130,3 +130,12 @@ plots:
 	cd plots && python3 plot_tflops_efa.py
 
 .PHONY: all clean bench check test-slot-math plots
+
+run_gemm_ar_blackwell : gemm_ar_blackwell
+	python -m torch.distributed.run --standalone --nproc-per-node=4 bench/gemm_ar_blackwell_bench.py
+
+gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
+
+$(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -fdevice-sanitize=memcheck -lineinfo $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_$*) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
