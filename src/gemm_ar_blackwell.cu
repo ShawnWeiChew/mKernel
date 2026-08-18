@@ -25,17 +25,24 @@ constexpr int K = 128;
 namespace gemm_ar_intranode_blackwell {
 
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
-    const int m_idx = blockIdx.x / 2;
-    const int n_idx = threadIdx.x % N + (blockIdx.x % 2) * 1024;
+    // allocate smem and tmem
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator((int*)&__shm[0]);
 
-    float val = __bfloat162float(G.A[{m_idx, 0}]) * __bfloat162float(G.B[{0, n_idx}]);
-    for (int k_iter = 1; k_iter < K; k_iter++) {
-        val += __bfloat162float(G.A[{m_idx, k_iter}]) * __bfloat162float(G.B[{k_iter, n_idx}]);
+    __shared__ comm::bf16 A_smem = allocator.allocate<G.A_tile>();
+    __shared__ comm::bf16 B_smem = allocator.allocate<G.B_tile>();
+
+    __shared__ semaphore tma_load;
+    __shared__ semaphore mma_finish;
+
+    if (kittens::elect_warp_leader()) {
+        kittens::init_semaphore(&tma_load, 1, 0);
+        kittens::init_semaphore(&mma_finish, 1, 0);
     }
 
-    G.C_dist[G.dev_idx][{m_idx, n_idx}] = __float2bfloat16_rn(val);
-
+    // TODO: change when we are a cluster
     __syncthreads();
+
     if (threadIdx.x == 0) {
         // TODO: difference between signal() and this
         comm::atomic_u32::release_add_sys(&G.comp_comm_barrier[G.dev_idx][{0, 0}], 1);
@@ -75,13 +82,20 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     }
 }
 
-__global__ void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
+__global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(
+    config::NUM_THREADS) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
     fused_kernel(G);
 }
 
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    gemm_ar_fused_kernel_stub<<<M * N / 1024 + M * N / 2048, 1024, 0, stream>>>(G);
+
+    const int smem_size = (G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / G.CLUSTER_SIZE * G.RED_BLOCK) *
+        sizeof(comm::bf16);
+    const int num_threads = config::NUM_THREADS;
+    const int grid = G.M * G.N / (G.ROW_BLOCK * G.COL_BLOCK) + 20;  // the last 20 are for comm
+
+    gemm_ar_fused_kernel_stub<<<grid, num_threads, smem_size, stream>>>(G);
 }
 
 };  // namespace gemm_ar_intranode_blackwell

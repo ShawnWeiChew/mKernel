@@ -2,6 +2,7 @@
 
 #include "comm/comm.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/tk_common_util.cuh"
 #include "common/tk_types_shared_st.cuh"
 #include "common/types.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
@@ -33,10 +34,11 @@ struct config {
     static constexpr int CONSUMER_WARPS = 1;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = 4;
+    static constexpr int NUM_CLUSTERS = 2;
     // TODO: get a number for this
     // static constexpr int INTRANODE_COMM_WARPS = ???;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
-    // static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
     static constexpr int PRODUCER_REGISTERS = 40;
     static constexpr int CONSUMER_REGISTERS = 232;
@@ -57,12 +59,12 @@ struct fused_globals {
 
     // NOTE: I am storing it as BT
     static_assert(COL_BLOCK % CLUSTER_SIZE == 0, "COL_BLOCK should be divisible");
-    using B_tile = kittens::st_bf<COL_BLOCK / CLUSTER_SIZE, RED_BLOCK>;
+    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / CLUSTER_SIZE>;
     // TODO: benchmark against writing to SMEM and then to GMEM,
     // compared to just writing to GMEM
 
-    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1>;
-    using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1>;
+    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
+    using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
 
     // I assume that this gives me a pointer to global memory, not sure
     // this part is so sketchy help
@@ -84,6 +86,9 @@ struct fused_globals {
     barrier_distributed_tensor comp_comm_barrier;
 
     int dev_idx;
+    int M;
+    int N;
+    int K;
 };
 
 __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A,
@@ -91,7 +96,10 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
                                                              dist::ParallelBuffer& C,
                                                              dist::ParallelBuffer& barrier,
                                                              dist::ParallelBuffer& C_final,
-                                                             int dev_idx) {
+                                                             int dev_idx,
+                                                             int M,
+                                                             int N,
+                                                             int K) {
     return {
         .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),
         .B = ::dist::local_tensor_from_tensor<fused_globals::B_local_tensor>(B),
@@ -101,7 +109,10 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
         .comp_comm_barrier =
             ::dist::distributed_tensor_from_buffer<fused_globals::barrier_distributed_tensor>(
                 barrier),
-        .dev_idx = dev_idx};
+        .dev_idx = dev_idx,
+        .M = M,
+        .N = N,
+        .K = K};
 }
 
 void entrypoint(const at::Tensor& A,
@@ -114,7 +125,7 @@ void entrypoint(const at::Tensor& A,
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
-    fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx);
+    fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
 
     launch_fused_gemm_ar_blackwell(G);
     MKERNEL_CUDACHECK(cudaGetLastError());
