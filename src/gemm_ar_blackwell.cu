@@ -71,7 +71,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         init_semaphore(mma_finish, 0, 1);
         init_semaphore(epilogue_ready, 0, 1);
     }
-    everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::sync();
 
     auto load = [&](int iter_k) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
@@ -119,15 +119,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         warpgroup::sync(1);
 
         if (warpgroup::laneid() == 0) {
-            dist::tma::store_async(
-                G.C_dist[G.dev_idx], C_smem, {row_tile_id, col_tile_id * 2 + cta_rank});
+            dist::tma::store_async(G.C_dist[G.dev_idx], C_smem, {row_tile_id, col_tile_id});
             dist::tma::store_async_wait();
         }
     };
 
     // producer
     if (warp_id == 4) {
-        warp::decrease_registers<56>();
         if (elect_warp_leader()) {
             load(0);
         }
@@ -197,10 +195,12 @@ __global__ __cluster_dims__(config::NUM_CLUSTERS) void gemm_ar_fused_kernel_stub
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // NOTE: must add 1024 so this can be aligned by TK
     const int smem_size =
         (G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / config::NUM_CLUSTERS * G.RED_BLOCK +
          G.ROW_BLOCK * G.COL_BLOCK) *
-        sizeof(comm::bf16);
+            sizeof(comm::bf16) +
+        1024;
     const int num_threads = config::NUM_THREADS;
     const int grid = G.M * G.N / (G.ROW_BLOCK * G.COL_BLOCK) + 2048;  // the last 2048 are for comm
 
