@@ -1,5 +1,13 @@
 #pragma once
 
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
 #include "comm/comm.cuh"
 #include "common/cuda_checks.cuh"
 #include "common/tk_common_util.cuh"
@@ -8,16 +16,8 @@
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
-#include "memory/tk_ops_group_group.cuh"
-
 #include "dist/tma.cuh"
-
-#include <ATen/ATen.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
+#include "memory/tk_ops_group_group.cuh"
 
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
@@ -38,7 +38,7 @@ struct config {
     // TODO: get a number for this
     // static constexpr int INTRANODE_COMM_WARPS = ???;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
-    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
 
     static constexpr int PRODUCER_REGISTERS = 40;
     static constexpr int CONSUMER_REGISTERS = 232;
@@ -53,22 +53,25 @@ struct fused_globals {
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
-    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr int MMA_K = 16;
 
     using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
 
     // NOTE: I am storing it as BT
-    static_assert(COL_BLOCK % CLUSTER_SIZE == 0, "COL_BLOCK should be divisible");
-    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / CLUSTER_SIZE>;
+    static_assert(COL_BLOCK % config::NUM_CLUSTERS == 0, "COL_BLOCK should be divisible");
+    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / config::NUM_CLUSTERS>;
     // TODO: benchmark against writing to SMEM and then to GMEM,
     // compared to just writing to GMEM
+
+    using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK>;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
 
     // I assume that this gives me a pointer to global memory, not sure
     // this part is so sketchy help
-    using C_local_tensor = dist::gl<comm::bf16, 1, 1, -1, -1>;
+    using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
     using C_distributed_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
     using C_final_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
     using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;

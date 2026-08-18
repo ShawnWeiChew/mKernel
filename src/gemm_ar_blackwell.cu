@@ -1,48 +1,150 @@
-#include "comm/comm.cuh"
-#include "common/cuda_checks.cuh"
-#include "common/types.cuh"
-#include "dist/dbuf_buffer_bridge.cuh"
-#include "dist/distributed_buffer.cuh"
-#include "memory/tk_ops_group_group.cuh"
-#include "operators/gemm_ar/gemm_ar_blackwell.cuh"
-
-#include "dist/tma.cuh"
-
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
+
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
-using namespace kittens;
+#include "comm/comm.cuh"
+#include "comm/multimem.cuh"
+#include "common/cuda_checks.cuh"
+#include "common/tk_common_util.cuh"
+#include "common/tk_types_register_rt.cuh"
+#include "common/tk_types_shared_st.cuh"
+#include "common/tk_types_tensor_tensor.cuh"
+#include "common/types.cuh"
+#include "dist/dbuf_buffer_bridge.cuh"
+#include "dist/distributed_buffer.cuh"
+#include "dist/local_tensor.cuh"
+#include "memory/tk_ops_group_group.cuh"
+// clang-format off
+// this has to go under tk_ops_group_group
+#include "dist/tma.cuh"
+// clang-format on
+#include "memory/tk_ops_thread_memory_tile_tma.cuh"
+#include "memory/tk_ops_thread_util_sync.cuh"
+#include "memory/tk_ops_thread_util_tma.cuh"
+#include "memory/tk_ops_thread_util_util.cuh"
+#include "operators/gemm_ar/gemm_ar_blackwell.cuh"
 
-constexpr int M = 2048;
-constexpr int N = 2048;
-constexpr int K = 128;
+using namespace kittens;
 
 namespace gemm_ar_intranode_blackwell {
 
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
+    // TODO: prefetch tensormap
+    // if (elect_warp_leader()) {
+    // dist::tma::prefetch_tensormap(const TensorMapT *desc)
+    // }
+    const int cta_rank = cluster_ctarank();
+    const int warp_id = warpid();
+
+    const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
+    const int row_tile_id =
+        blockIdx.x / (num_tiles_per_row * config::NUM_CLUSTERS) * config::NUM_CLUSTERS +
+        blockIdx.x % config::NUM_CLUSTERS;
+    const int col_tile_id = (blockIdx.x / config::NUM_CLUSTERS) % num_tiles_per_row;
+
+    const int row_offset = row_tile_id * fused_globals::ROW_BLOCK;
+    const int col_offset = (col_tile_id * fused_globals::COL_BLOCK / config::NUM_CLUSTERS) +
+        ((warp_id % config::NUM_CLUSTERS) * (fused_globals::COL_BLOCK / config::NUM_CLUSTERS));
+
     // allocate smem and tmem
     extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
+    tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
 
-    __shared__ comm::bf16 A_smem = allocator.allocate<G.A_tile>();
-    __shared__ comm::bf16 B_smem = allocator.allocate<G.B_tile>();
+    fused_globals::A_tile& A_smem = smem_allocator.allocate<fused_globals::A_tile>();
+    fused_globals::B_tile& B_smem = smem_allocator.allocate<fused_globals::B_tile>();
+    fused_globals::C_tile& C_smem = smem_allocator.allocate<fused_globals::C_tile>();
 
     __shared__ semaphore tma_load;
     __shared__ semaphore mma_finish;
+    __shared__ semaphore epilogue_ready;
 
-    if (kittens::elect_warp_leader()) {
-        kittens::init_semaphore(&tma_load, 1, 0);
-        kittens::init_semaphore(&mma_finish, 1, 0);
+    tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
+    uint32_t phasebit = 0xFFFF0000;
+    fused_globals::C_tt_tile tmem;
+
+    if (warp_id == 0 && elect_warp_leader()) {
+        init_semaphore(tma_load, 0, 2);
+        init_semaphore(mma_finish, 1, 0);
+        init_semaphore(epilogue_ready, 0, 1);
+    } else if (warp_id == 1) {
+        tmem = tm_alloc.allocate<fused_globals::C_tt_tile>(0);
+    }
+    everyone::tma::cluster::arrive_aligned();
+
+    auto load = [&](int iter_k) {
+        wait(mma_finish, get_phasebit<0>(phasebit, 0));
+
+        tma::expect_bytes(tma_load, sizeof(fused_globals::A_tile) + sizeof(fused_globals::B_tile));
+        // TODO: how do I know that this is the 3D load?
+        tma::cluster::load_async(A_smem,
+                                 G.A,
+                                 {row_offset, iter_k * fused_globals::MMA_K},
+                                 tma_load,
+                                 (uint16_t)(1 << cta_rank),
+                                 0);
+        tma::cluster::load_async(B_smem,
+                                 G.B,
+                                 {iter_k * fused_globals::MMA_K, col_offset},
+                                 tma_load,
+                                 (uint16_t)(1 << cta_rank),
+                                 0);
+
+        update_phasebit<0>(phasebit, 0);
+    };
+
+    // each only handles 16
+    auto consume = [&](int iter_k) {
+        wait(tma_load, get_phasebit<1>(phasebit, 0));
+
+        for (int i = 0; i < fused_globals::RED_BLOCK / fused_globals::MMA_K; i++) {
+            if (iter_k == 0) {
+                mm2_AB(tmem, A_smem, B_smem, mma_finish);
+            } else {
+                mma2_AB(tmem, A_smem, B_smem, mma_finish);
+            }
+        }
+    };
+
+    auto epilogue = [&]() {
+        wait(epilogue_ready, get_phasebit<1>(phasebit, 1));
+
+        rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
+        warpgroup::load_async(c_reg, tmem);
+        tensor_load_wait();
+
+        warpgroup::sync(1);
+        warpgroup::store(C_smem, c_reg);
+        warpgroup::sync(1);
+
+        if (warpgroup::laneid() == 0) {
+            dist::tma::store_async(G.C_dist[G.dev_idx], C_smem, {row_tile_id, col_tile_id});
+            dist::tma::store_async_wait();
+        }
+    };
+
+    // producer
+    if (warp_id == 0) {
+        warp::decrease_registers<56>();
+        if (elect_warp_leader()) {
+            load(0);
+        }
+    } else if (warp_id == 1 && cta_rank == 0) {
+        if (elect_warp_leader()) {
+            consume(0);
+            kittens::detail::tcgen05::commit<config::NUM_CLUSTERS>(epilogue_ready);
+        }
+    } else if (warp_id < 6) {
+        epilogue();
     }
 
-    // TODO: change when we are a cluster
-    __syncthreads();
-
+    everyone::tma::cluster::arrive_aligned();
     if (threadIdx.x == 0) {
         // TODO: difference between signal() and this
         comm::atomic_u32::release_add_sys(&G.comp_comm_barrier[G.dev_idx][{0, 0}], 1);
@@ -50,7 +152,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 }
 
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
-    const int m_idx = (blockIdx.x - 4096);
+    const int m_idx = (blockIdx.x - 128);
     const int n_idx = threadIdx.x * 2;
 
     if (threadIdx.x == 0) {
@@ -59,7 +161,7 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         do {
             comm::multimem<int>::ld_reduce<comm::reduce_op::MIN, comm::memory_model::STRONG>(
                 val, reinterpret_cast<const int*>(G.comp_comm_barrier.mc_ptr_at({0, 0})));
-        } while (val < (int)4096);
+        } while (val < (int)128);
     }
 
     __syncthreads();
@@ -75,26 +177,31 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 }
 
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (blockIdx.x < 4096) {
+    if (blockIdx.x < 128) {
         fused_comp_sm(G);
     } else {
         fused_intranode_sm(G);
     }
 }
 
-__global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(
-    config::NUM_THREADS) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
+__global__ __cluster_dims__(config::NUM_CLUSTERS) void gemm_ar_fused_kernel_stub(
+    const __grid_constant__ fused_globals G) {
     fused_kernel(G);
 }
 
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int smem_size = (G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / G.CLUSTER_SIZE * G.RED_BLOCK) *
+    const int smem_size =
+        (G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / config::NUM_CLUSTERS * G.RED_BLOCK +
+         G.ROW_BLOCK * G.COL_BLOCK) *
         sizeof(comm::bf16);
     const int num_threads = config::NUM_THREADS;
-    const int grid = G.M * G.N / (G.ROW_BLOCK * G.COL_BLOCK) + 20;  // the last 20 are for comm
+    const int grid = G.M * G.N / (G.ROW_BLOCK * G.COL_BLOCK) + 2048;  // the last 2048 are for comm
 
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(gemm_ar_fused_kernel_stub,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           smem_size));
     gemm_ar_fused_kernel_stub<<<grid, num_threads, smem_size, stream>>>(G);
 }
 
