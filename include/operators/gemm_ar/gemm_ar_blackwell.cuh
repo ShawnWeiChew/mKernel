@@ -43,13 +43,12 @@ struct config {
     static constexpr int PRODUCER_REGISTERS = 40;
     static constexpr int CONSUMER_REGISTERS = 232;
 
-    static constexpr int NUM_DEVICES = 4;
+    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
 
 struct fused_globals {
     // TODO: tune
     static constexpr int PIPELINE_STAGES = 5;
-    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
@@ -72,9 +71,10 @@ struct fused_globals {
     // I assume that this gives me a pointer to global memory, not sure
     // this part is so sketchy help
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
-    using C_distributed_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
-    using C_final_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
-    using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;
+    using C_distributed_tensor =
+        dist::distributed_tensor<C_local_tensor, config::NUM_DEVICES, true>;
+    using C_final_tensor = dist::distributed_tensor<C_local_tensor, config::NUM_DEVICES, true>;
+    using barrier_distributed_tensor = dist::barrier_distributed_tensor<config::NUM_DEVICES>;
 
     A_local_tensor A;
     B_local_tensor B;

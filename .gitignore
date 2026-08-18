@@ -6,3 +6,4 @@ bench/source_of_truth
 
 .clang*
 .vscode
+modal_scripts
