@@ -54,61 +54,77 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
 
-    fused_globals::A_tile& A_smem = smem_allocator.allocate<fused_globals::A_tile>();
-    fused_globals::B_tile& B_smem = smem_allocator.allocate<fused_globals::B_tile>();
+    fused_globals::pipeline_inputs(&inputs_smem)[fused_globals::PIPELINE_STAGES] =
+        smem_allocator.allocate<fused_globals::pipeline_inputs, fused_globals::PIPELINE_STAGES>();
     fused_globals::C_tile& C_smem = smem_allocator.allocate<fused_globals::C_tile>();
 
-    __shared__ semaphore tma_load;
-    __shared__ semaphore mma_finish;
+    __shared__ semaphore tma_load[fused_globals::PIPELINE_STAGES];
+    __shared__ semaphore mma_finish[fused_globals::PIPELINE_STAGES];
     __shared__ semaphore epilogue_ready;
 
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
-    uint32_t phasebit = 0xFFFF0000;
+    uint32_t inputs_phasebit = 0xFFFF0000;
+    uint32_t epilogue_phasebit = 0x0000;
     fused_globals::C_tt_tile tmem = tm_alloc.allocate<fused_globals::C_tt_tile>(0);
 
     if (warp_id == 0 && elect_warp_leader()) {
-        init_semaphore(tma_load, 0, 2);
-        init_semaphore(mma_finish, 0, 1);
+#pragma unroll
+        for (int i = 0; i < fused_globals::PIPELINE_STAGES; i++) {
+            init_semaphore(tma_load[i], 0, 2);
+            init_semaphore(mma_finish[i], 0, 1);
+        }
         init_semaphore(epilogue_ready, 0, 1);
     }
     everyone::tma::cluster::sync();
 
     auto load = [&](int iter_k) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
-            wait(mma_finish, get_phasebit<1>(phasebit, 0));
+            const int stage_id = i % fused_globals::PIPELINE_STAGES;
+            fused_globals::A_tile& A_smem = inputs_smem[stage_id].A;
+            fused_globals::B_tile& B_smem = inputs_smem[stage_id].B;
+
+            wait(mma_finish[stage_id], get_phasebit<1>(inputs_phasebit, stage_id));
 
             tma::cluster::expect_bytes(
-                tma_load, sizeof(fused_globals::A_tile) + sizeof(fused_globals::B_tile), 0);
+                tma_load[stage_id],
+                sizeof(fused_globals::A_tile) + sizeof(fused_globals::B_tile),
+                0);
             tma::cluster::load_async(
-                A_smem, G.A, {row_tile_id, i}, tma_load, (uint16_t)(1 << cta_rank), 0);
+                A_smem, G.A, {row_tile_id, i}, tma_load[stage_id], (uint16_t)(1 << cta_rank), 0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {i, col_tile_id * config::NUM_CLUSTERS + cta_rank},
-                                     tma_load,
+                                     tma_load[stage_id],
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
-            update_phasebit<1>(phasebit, 0);
+            update_phasebit<1>(inputs_phasebit, stage_id);
         }
     };
 
     // each only handles 16
     auto consume = [&](int iter_k) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
-            wait(tma_load, get_phasebit<0>(phasebit, 0));
+            const int stage_id = i % fused_globals::PIPELINE_STAGES;
+            fused_globals::A_tile& A_smem = inputs_smem[stage_id].A;
+            fused_globals::B_tile& B_smem = inputs_smem[stage_id].B;
+
+            wait(tma_load[stage_id], get_phasebit<0>(inputs_phasebit, stage_id));
             if (i == 0) {
-                mm2_AB(tmem, A_smem, B_smem, mma_finish);
+                mm2_AB(tmem, A_smem, B_smem, mma_finish[stage_id]);
             } else {
-                mma2_AB(tmem, A_smem, B_smem, mma_finish);
+                mma2_AB(tmem, A_smem, B_smem, mma_finish[stage_id]);
             }
-            update_phasebit<0>(phasebit, 0);
+
+            // TODO: can probably optimize this away later to be one phasebit per barrier
+            update_phasebit<0>(inputs_phasebit, stage_id);
         }
 
         kittens::detail::tcgen05::commit<config::NUM_CLUSTERS>(epilogue_ready);
     };
 
     auto epilogue = [&]() {
-        wait(epilogue_ready, get_phasebit<0>(phasebit, 1));
+        wait(epilogue_ready, get_phasebit<0>(epilogue_phasebit, 0));
 
         rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
         warpgroup::load_async(c_reg, tmem);
@@ -196,12 +212,11 @@ __global__ __cluster_dims__(config::NUM_CLUSTERS) void gemm_ar_fused_kernel_stub
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // NOTE: must add 1024 so this can be aligned by TK
     const int smem_size =
-        (G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / config::NUM_CLUSTERS * G.RED_BLOCK +
-         G.ROW_BLOCK * G.COL_BLOCK) *
-            sizeof(comm::bf16) +
-        1024;
+        ((G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / config::NUM_CLUSTERS * G.RED_BLOCK) *
+         sizeof(comm::bf16) * fused_globals::PIPELINE_STAGES) +
+        ((G.ROW_BLOCK * G.COL_BLOCK) * sizeof(comm::bf16)) +
+        1024;  // NOTE: must add 1024 so this can be aligned by TK
     const int num_threads = config::NUM_THREADS;
     const int grid = G.M * G.N / (G.ROW_BLOCK * G.COL_BLOCK) + 2048;  // the last 2048 are for comm
 

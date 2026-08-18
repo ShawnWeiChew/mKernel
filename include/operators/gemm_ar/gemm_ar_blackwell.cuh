@@ -49,10 +49,12 @@ struct config {
 struct fused_globals {
     // TODO: tune
     static constexpr int PIPELINE_STAGES = 5;
+    // TODO: the amount of smem used by this configuration is too big -> see what I can do about it
+    // later
+    static constexpr int EPILOGUE_STAGES = 2;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
-    static constexpr int MMA_K = 16;
 
     using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
 
@@ -92,6 +94,15 @@ struct fused_globals {
     int M;
     int N;
     int K;
+
+    struct pipeline_inputs {
+        A_tile A;
+        B_tile B;
+    };
+
+    struct pipeline_outputs {
+        C_tile C;
+    };
 };
 
 __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A,
