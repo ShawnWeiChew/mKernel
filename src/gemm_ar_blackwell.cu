@@ -137,7 +137,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         epilogue();
     }
 
-    everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::sync();
+
     if (threadIdx.x == 0) {
         // TODO: difference between signal() and this
         comm::atomic_u32::release_add_sys(&G.comp_comm_barrier[G.dev_idx][{0, 0}], 1);
