@@ -10,8 +10,35 @@ sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import check_close
 
-base_n = 4096
-K_denom = 16
+SHAPES= [2048, 4096, 8192, 16384, 32768]
+WARMUP = 20
+BENCH_ITER = 10
+NUM_DEVICES = 4
+K_DENOM = NUM_DEVICES
+
+def elapsed_ms(samples):
+    """Drain (start, end) cuda event pairs into per-iter wall times (ms)."""
+    return [s.elapsed_time(e) for s, e in samples]
+
+
+def median_then_max_cuda(samples, label=""):
+    """Local median over iters, then max over ranks (the slowest rank sets the
+    collective's cost). Also prints the per-rank medians so a straggler is
+    visible instead of being hidden behind the max."""
+    sorted_samples = sorted(float(x) for x in samples)
+    median = sorted_samples[len(sorted_samples) // 2]
+
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
+    gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, t)
+    if label and dist.get_rank() == 0:
+        per_rank = " ".join(
+            f"r{i}={float(x.item()):.3f}" for i, x in enumerate(gathered)
+        )
+        print(f"  [rank-ms] {label}: {per_rank}", flush=True)
+
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
 
 def main():
     rank = int(os.environ["RANK"])
@@ -23,56 +50,161 @@ def main():
     is_chief = local_rank == 0
     mod = load_module.load("gemm_ar_blackwell")
 
-    M, K, N = base_n, base_n // K_denom, base_n
+    for n in SHAPES:
+        M, K, N = n, n // NUM_DEVICES, n
 
-    torch.manual_seed(42 + rank); torch.cuda.manual_seed(42 + rank)
-    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
-    B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+        torch.manual_seed(42 + rank); torch.cuda.manual_seed(42 + rank)
+        A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+        B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
 
-    C_dbuf = mod.DistBuffer((M, N), dtype=torch.bfloat16,
-        local_rank=local_rank, local_world_size=world_size, multicast=True)
-    C_dbuf.data_.zero_()
+        C_dbuf = mod.DistBuffer((M, N), dtype=torch.bfloat16,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        C_dbuf.data_.zero_()
 
-    barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
-        local_rank=local_rank, local_world_size=world_size, multicast=True)
-    barrier.data_.zero_()
+        barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        barrier.data_.zero_()
 
-    C_final = mod.DistBuffer((M, N), dtype=torch.bfloat16,
-        local_rank=local_rank, local_world_size=world_size, multicast=True)
-    C_final.data_.zero_()
+        C_final = mod.DistBuffer((M, N), dtype=torch.bfloat16,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        C_final.data_.zero_()
 
-    dist.barrier()
+        dist.barrier()
 
-    # collect a run first
-    C_ref_cpu = torch.matmul(A, B).detach().float()
-    local_ref_cpu = C_ref_cpu.clone()
-    dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize()
+        # collect a run first
+        C_ref_cpu = torch.matmul(A, B).detach().float()
+        local_ref_cpu = C_ref_cpu.clone()
+        dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
 
-    # do our own run
-    mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
-    torch.cuda.synchronize()
+        # do our own run
+        mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+        torch.cuda.synchronize()
 
-    gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
+        gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
 
-    correctness_ok = check_close(
-        f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
-    ) 
+        correctness_ok = check_close(
+            f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
+        ) 
+
+        if not gemm_correctness_check:
+            if is_chief:
+                print(f"{M=} GEMM error :(")
+            dist.destroy_process_group()
+            return 1
+        elif not correctness_ok:
+            if is_chief:
+                print(f"{M=} AR Error :(((")
+            dist.destroy_process_group()
+            return 1
+
+        if is_chief:
+            print(f"{M=} correct :)")
 
     if is_chief:
-        if not gemm_correctness_check:
-            print("GEMM error :(")
-        elif not correctness_ok:
-            print("AR Error :(")
-        else:
-            print("Correctness checks passed")
+        print("Correctness checks passed, benchmarking now...")
+
+    for n in SHAPES:
+        M, K, N = n, n // NUM_DEVICES, n
+
+        torch.manual_seed(42 + rank); torch.cuda.manual_seed(42 + rank)
+        A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+        B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+
+        C_dbuf = mod.DistBuffer((M, N), dtype=torch.bfloat16,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        C_dbuf.data_.zero_()
+
+        barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        barrier.data_.zero_()
+
+        C_final = mod.DistBuffer((M, N), dtype=torch.bfloat16,
+            local_rank=local_rank, local_world_size=world_size, multicast=True)
+        C_final.data_.zero_()
+
+        dist.barrier()
+        # warmup cublas + NCCL
+        for _ in range(WARMUP):
+            C_tmp = torch.matmul(A, B)
+            dist.all_reduce(C_tmp)
+            torch.cuda.synchronize()
+            del C_tmp
+
+        dist.barrier()
+
+        baseline_samples = []
+        for _ in range(BENCH_ITER):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            C_tmp = torch.matmul(A, B)
+            dist.all_reduce(C_tmp)
+            e.record()
+            baseline_samples.append((s, e))
+
+        # only sync after completion
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # warmp fused kernel
+        C_dbuf.data_.zero_()
+        barrier.data_.zero_()
+        C_final.data_.zero_()
+        dist.barrier()
+
+        for _ in range(WARMUP):
+            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+
+        torch.cuda.synchronize()
+        C_dbuf.data_.zero_()
+        barrier.data_.zero_()
+        C_final.data_.zero_()
+        dist.barrier()
+
+        fused_kernel_samples = []
+        for _ in range(BENCH_ITER):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+            e.record()
+            fused_kernel_samples.append((s, e))
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # events are only readable once the stream has drained
+        if is_chief:
+            print(f"M={M} K={K} N={N}", flush=True)
+
+        baseline_ms = median_then_max_cuda(
+            elapsed_ms(baseline_samples), label="cublas+nccl")
+        fused_ms = median_then_max_cuda(
+            elapsed_ms(fused_kernel_samples), label="fused")
+
+        # 2*M*K*N per rank for the local GEMM slice
+        flops = 2.0 * M * K * N
+        if is_chief:
+            speedup = baseline_ms / fused_ms if fused_ms > 0 else float("nan")
+            print(
+                f"  cublas+nccl : {baseline_ms:8.3f} ms  "
+                f"({flops / (baseline_ms * 1e9):7.1f} TFLOP/s)",
+                flush=True,
+            )
+            print(
+                f"  fused       : {fused_ms:8.3f} ms  "
+                f"({flops / (fused_ms * 1e9):7.1f} TFLOP/s)",
+                flush=True,
+            )
+            print(f"  speedup     : {speedup:8.3f}x", flush=True)
+
+        del C_dbuf, barrier, C_final, A, B
+        dist.barrier()
 
     dist.destroy_process_group()
-    if not correctness_ok:
-        return 1
-
     return 0
         
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
