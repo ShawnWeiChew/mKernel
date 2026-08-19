@@ -13,6 +13,7 @@
 #include "comm/comm.cuh"
 #include "comm/multimem.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/tk_common_base_types.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_register_rt.cuh"
 #include "common/tk_types_shared_st.cuh"
@@ -35,6 +36,16 @@
 using namespace kittens;
 
 namespace gemm_ar_intranode_blackwell {
+
+__device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int tile_id,
+                                                                   int num_tiles_per_row) {
+    int tile_row_idx = tile_id / (num_tiles_per_row * config::NUM_CLUSTERS) * config::NUM_CLUSTERS +
+        tile_id % config::NUM_CLUSTERS;
+
+    int tile_col_idx = (tile_id / config::NUM_CLUSTERS) % num_tiles_per_row;
+
+    return {tile_row_idx, tile_col_idx};
+};
 
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     // TODO: prefetch tensormap
@@ -82,16 +93,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
     everyone::tma::cluster::sync();
-
-    auto calculate_tile_idx = [&](int tile_id) -> std::tuple<int, int> {
-        int tile_row_idx =
-            tile_id / (num_tiles_per_row * config::NUM_CLUSTERS) * config::NUM_CLUSTERS +
-            tile_id % config::NUM_CLUSTERS;
-
-        int tile_col_idx = (tile_id / config::NUM_CLUSTERS) % num_tiles_per_row;
-
-        return {tile_row_idx, tile_col_idx};
-    };
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
@@ -185,7 +186,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             int input_stage_id = 0;
             for (int tile_id = block_idx; tile_id < num_tiles_total;
                  tile_id += config::NUM_COMP_SM) {
-                auto [tile_row_id, tile_col_id] = calculate_tile_idx(tile_id);
+                auto [tile_row_id, tile_col_id] = calculate_tile_idx(tile_id, num_tiles_per_row);
                 load(tile_row_id, tile_col_id, input_stage_id);
             }
         }
@@ -200,65 +201,76 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     } else if (warp_id >= 0 && warp_id < 4) {
         int epilogue_stage_id = 0;
         for (int tile_id = block_idx; tile_id < num_tiles_total; tile_id += config::NUM_COMP_SM) {
-            auto [tile_row_id, tile_col_id] = calculate_tile_idx(tile_id);
+            auto [tile_row_id, tile_col_id] = calculate_tile_idx(tile_id, num_tiles_per_row);
             epilogue(tile_row_id, tile_col_id, epilogue_stage_id);
+
+            // wait for the entire warpgroup, so that everything will be in HBM
+            // TODO: I dont think this will be very different from using an atomic counter, since
+            // these warpgroups are not going to get in the way of instruction issue
+            warpgroup::sync(2);
+
+            // currently, we assign in a round-robin fashion?
+            const int device_to_signal = tile_id % config::NUM_DEVICES;
+            if (warpgroup::laneid() == 0) {
+                dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);
+            }
         }
-    }
-
-    everyone::tma::cluster::sync();
-
-    if (threadIdx.x == 0) {
-        // TODO: difference between signal() and this
-        comm::atomic_u32::release_add_sys(&G.comp_comm_barrier[G.dev_idx][{0, 0}], 1);
     }
 }
 
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
-    // TODO: will need some scheduling block here
-    const int m_idx = (blockIdx.x - 128);
-    const int n_idx = threadIdx.x * 32;
+    // TODO: figure out how the per-device split should look like?
+    const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
+    const int num_tiles_total = G.M * G.N / (fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK);
+    const int comm_block_idx = blockIdx.x - config::NUM_COMP_SM;
 
-    if (threadIdx.x == 0) {
-        // we can have a lot more waiters than signallers, 1 in each warp
-        int val;
-        do {
-            comm::multimem<int>::ld_reduce<comm::reduce_op::MIN, comm::memory_model::STRONG>(
-                val, reinterpret_cast<const int*>(G.comp_comm_barrier.mc_ptr_at({0, 0})));
-        } while (val < (int)128);
-    }
+    const int tile_id_stride = config::NUM_DEVICES * config::NUM_COMM_SM;
+    for (int tile_id = G.dev_idx + comm_block_idx * config::NUM_DEVICES; tile_id < num_tiles_total;
+         tile_id += tile_id_stride) {
+        // wait for local device signal
+        auto [tile_row_idx, tile_col_idx] = calculate_tile_idx(tile_id, num_tiles_per_row);
 
-    __syncthreads();
+        // we can use a relaxed wait here, since every operation after this is multimem, which does
+        // not go through the L1 cache + signal from before is a release add operation
+        if (threadIdx.x == 0) {
+            dist::wait(
+                G.comp_comm_barrier, {tile_row_idx, tile_col_idx}, G.dev_idx, config::NUM_DEVICES);
+        }
+        __syncthreads();
 
-    // TODO: not sure if this is necessary to prevent reordering?
-    __threadfence_system();
-    // NOTE: not sure what the difference between weak and strong is here
-    // but I dont think strong in this case would be too big of a difference, since
-    // __syncthreads already prevents some sort of reordering
+        // TODO: pipeline the multimem loads without clobbering
+        // multimem load shared across threads
+        for (int i = threadIdx.x; i < fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK / 2;
+             i += blockDim.x) {
+            const int start_idx_within_tile = i * 2;
+            const int subtile_row_idx = start_idx_within_tile / fused_globals::COL_BLOCK;
+            const int subtile_col_idx = start_idx_within_tile % fused_globals::COL_BLOCK;
 
-    // only use 128 threads, each of which will load 16 items into GMEM
-    // 128 * 16 = 2048
-    if (threadIdx.x < 128) {
-        for (int i = 0; i < 16; i++) {
-            comm::bf16_2 res;
+            comm::bf16_2 tmp;
             comm::multimem<comm::bf16_2>::ld_reduce<comm::reduce_op::ADD, comm::memory_model::WEAK>(
-                res, reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at({m_idx, n_idx + i * 2})));
+                tmp,
+                reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
+                    {tile_row_idx + subtile_row_idx, tile_col_idx + subtile_col_idx})));
 
-            // I think there is an optimization that the stores can be split among the devices?
-            reinterpret_cast<comm::bf16_2*>(&G.C_final[G.dev_idx][{m_idx, n_idx + i * 2}])[0] = res;
+            // multimem store
+            comm::multimem<comm::bf16_2>::st(
+                reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
+                    {tile_row_idx + subtile_row_idx, tile_col_idx + subtile_col_idx})),
+                tmp);
         }
     }
 }
 
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (blockIdx.x < 128) {
+    if (blockIdx.x < config::NUM_COMP_SM) {
         fused_comp_sm(G);
     } else {
         fused_intranode_sm(G);
     }
 }
 
-__global__ __cluster_dims__(config::NUM_CLUSTERS) void gemm_ar_fused_kernel_stub(
-    const __grid_constant__ fused_globals G) {
+__global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(
+    config::NUM_THREADS) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
     fused_kernel(G);
 }
 
@@ -271,7 +283,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
         ((G.ROW_BLOCK * G.COL_BLOCK) * sizeof(comm::bf16)) +
         1024;  // NOTE: must add 1024 so this can be aligned by TK
     const int num_threads = config::NUM_THREADS;
-    const int grid = 128 + 4096;  // set aside 20 SMs for comm
+    const int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
     MKERNEL_CUDACHECK(cudaFuncSetAttribute(
         gemm_ar_fused_kernel_stub, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
