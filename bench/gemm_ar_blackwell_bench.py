@@ -10,7 +10,7 @@ sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import check_close
 
-base_n = 2048
+base_n = 4096
 K_denom = 16
 
 def main():
@@ -53,13 +53,17 @@ def main():
     mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
     torch.cuda.synchronize()
 
+    gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
+
     correctness_ok = check_close(
         f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
     ) 
 
     if is_chief:
-        if not correctness_ok:
-            print("Error :(")
+        if not gemm_correctness_check:
+            print("GEMM error :(")
+        elif not correctness_ok:
+            print("AR Error :(")
         else:
             print("Correctness checks passed")
 
