@@ -238,6 +238,13 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         }
         __syncthreads();
 
+        // mc_ptr_at indexes elements, not tiles, so the tile coords have to be
+        // scaled up before the intra-tile offset is added. Getting this wrong
+        // makes an odd tile_col_idx produce an odd element column, i.e. a
+        // 2-byte-aligned pointer for a 4-byte bf16x2 multimem access.
+        const int row_base = tile_row_idx * fused_globals::ROW_BLOCK;
+        const int col_base = tile_col_idx * fused_globals::COL_BLOCK;
+
         // TODO: pipeline the multimem loads without clobbering
         // multimem load shared across threads
         for (int i = threadIdx.x; i < fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK / 2;
@@ -246,17 +253,17 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
             const int subtile_row_idx = start_idx_within_tile / fused_globals::COL_BLOCK;
             const int subtile_col_idx = start_idx_within_tile % fused_globals::COL_BLOCK;
 
+            comm::bf16_2* mc_ld = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
+                {row_base + subtile_row_idx, col_base + subtile_col_idx}));
+
             comm::bf16_2 tmp;
             comm::multimem<comm::bf16_2>::ld_reduce<comm::reduce_op::ADD, comm::memory_model::WEAK>(
-                tmp,
-                reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
-                    {tile_row_idx + subtile_row_idx, tile_col_idx + subtile_col_idx})));
+                tmp, mc_ld);
 
             // multimem store
-            comm::multimem<comm::bf16_2>::st(
-                reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
-                    {tile_row_idx + subtile_row_idx, tile_col_idx + subtile_col_idx})),
-                tmp);
+            comm::bf16_2* mc_st = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at(
+                {row_base + subtile_row_idx, col_base + subtile_col_idx}));
+            comm::multimem<comm::bf16_2>::st(mc_st, tmp);
         }
     }
 }
