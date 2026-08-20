@@ -90,8 +90,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     __shared__ semaphore epilogue_finished[fused_globals::EPILOGUE_STAGES];
 
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
-    uint32_t inputs_phasebit = 0xFFFF0000;
-    uint32_t epilogue_phasebit = 0xFFFF0000;
+
+    // combined phasebits, one bit per barrier array (each flips once per full
+    // ring traversal, so the bit is toggled when the stage index wraps to 0):
+    // bit 3: epilogue_ready    - starts at 0
+    // bit 2: epilogue_finished - starts at 1
+    // bit 1: tma_load          - starts at 0
+    // bit 0: mma_finish        - starts at 1
+    uint32_t phasebits = 0b0101;
     fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES] = {
         tm_alloc.allocate<fused_globals::C_tt_tile>(0),
         tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
@@ -118,7 +124,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(mma_finish[input_stage_id], get_phasebit<1>(inputs_phasebit, input_stage_id));
+            wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
             tma::cluster::expect_bytes(
                 tma_load[input_stage_id],
@@ -141,44 +147,52 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
-            update_phasebit<1>(inputs_phasebit, input_stage_id);
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
+            if (input_stage_id == 0) {
+                phasebits ^= 1;
+            }
         }
     };
 
     // each only handles 16
     auto consume = [&](int& input_stage_id, int& epilogue_stage_id) {
-        wait(epilogue_finished[epilogue_stage_id],
-             get_phasebit<1>(epilogue_phasebit, epilogue_stage_id));
+        wait(epilogue_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
         {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id));
+            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
-            update_phasebit<0>(inputs_phasebit, input_stage_id);
+
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
+
+            if (input_stage_id == 0) {
+                phasebits ^= (1 << 1);
+            }
         }
 
         for (int i = 1; i < G.K / fused_globals::RED_BLOCK; i++) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
-            wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id));
+            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
-            // TODO: can probably optimize this away later to be one phasebit per barrier
-            update_phasebit<0>(inputs_phasebit, input_stage_id);
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
+            if (input_stage_id == 0) {
+                phasebits ^= (1 << 1);
+            }
         }
 
         kittens::detail::tcgen05::commit<config::NUM_CLUSTERS>(epilogue_ready[epilogue_stage_id]);
-        update_phasebit<1>(epilogue_phasebit, epilogue_stage_id);
+
         epilogue_stage_id = (epilogue_stage_id + 1) % fused_globals::EPILOGUE_STAGES;
+        if (epilogue_stage_id == 0) {
+            phasebits ^= (1 << 2);
+        }
     };
 
     auto epilogue = [&](int tile_row_idx, int tile_col_idx, int& epilogue_stage_id) {
-        wait(epilogue_ready[epilogue_stage_id],
-             get_phasebit<0>(epilogue_phasebit, epilogue_stage_id));
+        wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
         tensor_after_thread_sync();
 
         rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
@@ -202,8 +216,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // dist::tma::store_async_wait();
         }
 
-        update_phasebit<0>(epilogue_phasebit, epilogue_stage_id);
         epilogue_stage_id = (epilogue_stage_id + 1) % fused_globals::EPILOGUE_STAGES;
+        if (epilogue_stage_id == 0) {
+            phasebits ^= (1 << 3);
+        }
     };
 
     // producer
