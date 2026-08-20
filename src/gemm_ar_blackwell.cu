@@ -191,13 +191,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             tma::cluster::arrive(epilogue_finished[epilogue_stage_id], 0);
         }
         warpgroup::sync(1);
+        // this already does the swizzle inside it
         warpgroup::store(C_smem, c_reg);
         warpgroup::sync(1);
 
         if (warpgroup::laneid() == 0) {
             dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                 G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
-            dist::tma::store_async_wait();
+            // This definitely is not needed for GEMM, since nothing depends on it
+            // dist::tma::store_async_wait();
         }
 
         update_phasebit<0>(epilogue_phasebit, epilogue_stage_id);
