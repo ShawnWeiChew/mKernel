@@ -140,6 +140,17 @@ run_gemm_ar_blackwell : gemm_ar_blackwell
 
 gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
 
+# -fdevice-sanitize=memcheck instruments EVERY device memory access. That is
+# fine for the tcgen05/TMA compute path but ruinous for the multimem all-reduce
+# loop, which is nothing but discrete global accesses — it turns the AR into
+# the entire kernel and makes it immune to pipelining. Opt in explicitly with
+# `make SANITIZE=1 gemm_ar_blackwell` when chasing a memory bug; never
+# benchmark a sanitized build.
+SANITIZE ?= 0
+ifeq ($(SANITIZE),1)
+GEMM_AR_BLACKWELL_SANITIZE := -fdevice-sanitize=memcheck
+endif
+
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) -fdevice-sanitize=memcheck -lineinfo $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_$*) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
