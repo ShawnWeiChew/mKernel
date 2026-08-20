@@ -195,7 +195,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         warpgroup::sync(1);
 
         if (warpgroup::laneid() == 0) {
-            dist::tma::store_async(G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
+            dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
             dist::tma::store_async_wait();
         }
 
@@ -225,14 +226,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else if (warp_id >= 0 && warp_id < 4) {
         int epilogue_stage_id = 0;
-        for (int tile_id = cluster_idx; tile_id < num_tiles_total;
-             tile_id += num_comp_clusters) {
+        for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             auto [tile_row_id, tile_col_id] =
                 calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
             // This CTA holds the 128 output rows fed by its own half of A.
-            epilogue(tile_row_id * config::NUM_CLUSTERS + cta_rank,
-                     tile_col_id,
-                     epilogue_stage_id);
+            epilogue(tile_row_id * config::NUM_CLUSTERS + cta_rank, tile_col_id, epilogue_stage_id);
 
             // wait for the entire warpgroup, so that everything will be in HBM
             // TODO: I dont think this will be very different from using an atomic counter, since
