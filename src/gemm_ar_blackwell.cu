@@ -218,6 +218,73 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     }
 }
 
+// ============================================================================
+// Pipelined intra-node all-reduce tile helper
+// ============================================================================
+//
+// Ported from gemm_ar.cu's gemm_ar_pipelined_ar_tile (see the comment block
+// there). The naive version issued one multimem.ld_reduce and one multimem.st
+// per element, both carrying a "memory" ASM clobber, so every element cost two
+// serialized NVSwitch round-trips (~600 ns each) with exactly one 4-byte
+// request in flight per thread. That caps the AR at a few tens of GB/s
+// regardless of how much NVLink bandwidth is available.
+//
+// Fix: issue AR_UNROLL independent ld_reduce into separate registers before
+// any store, using the no-clobber variants, so the warp scheduler can keep
+// AR_UNROLL NVSwitch round-trips in flight at once.
+//
+// Safety: the caller's __syncthreads() after the per-tile barrier wait is the
+// acquire fence that makes every device's writes to C_dist visible, so the
+// individual loads do not need their own "memory" clobber. The ops are still
+// `asm volatile`, so they are neither reordered against each other nor
+// eliminated.
+constexpr int AR_UNROLL = 8;
+
+__device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
+                                                  int row_base,
+                                                  int col_base) {
+    // bf16_2 units — one 4-byte multimem access each.
+    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;                 // 128
+    constexpr int TOTAL_UNITS = fused_globals::ROW_BLOCK * UNITS_PER_ROW;       // 16384
+    constexpr int NT = config::NUM_THREADS;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     // TODO: figure out how the per-device split should look like?
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
@@ -245,29 +312,9 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         const int row_base = tile_row_idx * fused_globals::ROW_BLOCK;
         const int col_base = tile_col_idx * fused_globals::COL_BLOCK;
 
-        // TODO: pipeline the multimem loads without clobbering
-        // multimem load shared across threads
-        if (threadIdx.x < 128) {
-            for (int i = threadIdx.x; i < fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK / 2;
-             i += 128) {
-                const int start_idx_within_tile = i * 2;
-                const int subtile_row_idx = start_idx_within_tile / fused_globals::COL_BLOCK;
-                const int subtile_col_idx = start_idx_within_tile % fused_globals::COL_BLOCK;
-
-                comm::bf16_2* mc_ld = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
-                    {row_base + subtile_row_idx, col_base + subtile_col_idx}));
-
-                comm::bf16_2 tmp;
-                comm::multimem<comm::bf16_2>::ld_reduce<comm::reduce_op::ADD, comm::memory_model::WEAK>(
-                    tmp, mc_ld);
-
-                // multimem store
-                comm::bf16_2* mc_st = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at(
-                    {row_base + subtile_row_idx, col_base + subtile_col_idx}));
-                comm::multimem<comm::bf16_2>::st(mc_st, tmp);
-            }
-        }
-        
+        // All NUM_THREADS participate — the old loop used only the first 128,
+        // leaving a third of the CTA's in-flight capacity on the table.
+        pipelined_ar_tile(G, row_base, col_base);
     }
 }
 

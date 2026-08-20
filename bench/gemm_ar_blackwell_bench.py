@@ -99,7 +99,7 @@ def main():
         # there are no comm SMs, so nothing writes C_final. Point this back at
         # C_final/C_ref_cpu once the comm SMs are re-enabled.
         correctness_ok = check_close(
-            f"gemm_ar_blackwell M={M}", C_dbuf.data_, local_ref_cpu, atol=0.55, rtol=0.12
+            f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
         )
 
         if not gemm_correctness_check:
