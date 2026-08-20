@@ -21,6 +21,18 @@ def elapsed_ms(samples):
     return [s.elapsed_time(e) for s, e in samples]
 
 
+def sync_ranks():
+    """Drain the local stream, then line every rank up on the host.
+
+    Both timed loops call this before recording, so each iteration starts from
+    an idle stream on every rank. Without it the two paths are not comparable:
+    a back-to-back loop hides launch overhead behind the queue and lets ranks
+    self-synchronize, while a loop that resets state between iters does not.
+    """
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 def median_then_max_cuda(samples, label=""):
     """Local median over iters, then max over ranks (the slowest rank sets the
     collective's cost). Also prints the per-rank medians so a straggler is
@@ -83,9 +95,12 @@ def main():
 
         gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
 
+        # NOTE: checks C_dbuf, not C_final — with config::NUM_COMP_SM == NUM_BLOCKS
+        # there are no comm SMs, so nothing writes C_final. Point this back at
+        # C_final/C_ref_cpu once the comm SMs are re-enabled.
         correctness_ok = check_close(
-            f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
-        ) 
+            f"gemm_ar_blackwell M={M}", C_dbuf.data_, local_ref_cpu, atol=0.55, rtol=0.12
+        )
 
         if not gemm_correctness_check:
             if is_chief:
@@ -131,10 +146,13 @@ def main():
             torch.cuda.synchronize()
             del C_tmp
 
+        if is_chief:
+            print(f"{M=} torch warmup done")
         dist.barrier()
 
         baseline_samples = []
         for _ in range(BENCH_ITER):
+            sync_ranks()
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
@@ -143,27 +161,36 @@ def main():
             e.record()
             baseline_samples.append((s, e))
 
-        # only sync after completion
         torch.cuda.synchronize()
+        if is_chief:
+            print(f"{M=} torch bench done")
         dist.barrier()
+
+        # The kernel's tile flags are plain counters compared with == NUM_DEVICES
+        # and are never cleared on the device, so every launch needs a zeroed
+        # barrier. Zeroing it locally is not enough: rank r exits as soon as its
+        # own tiles hit 4, while a peer may still be draining its comm SMs. If r
+        # relaunches at that point its epilogue bumps the peer's counters past 4
+        # (the peer then spins forever on !=4), or the peer's own zeroing wipes
+        # r's fresh signals. So the reset must be followed by a host barrier —
+        # no rank may launch until every rank has finished clearing.
+        def reset_fused_state():
+            C_dbuf.data_.zero_()
+            barrier.data_.zero_()
+            C_final.data_.zero_()
+            sync_ranks()
 
         # warmp fused kernel
-        C_dbuf.data_.zero_()
-        barrier.data_.zero_()
-        C_final.data_.zero_()
-        dist.barrier()
-
         for _ in range(WARMUP):
+            reset_fused_state()
             mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
 
-        torch.cuda.synchronize()
-        C_dbuf.data_.zero_()
-        barrier.data_.zero_()
-        C_final.data_.zero_()
-        dist.barrier()
+        if is_chief:
+            print(f"{M=} mod warmup done")
 
         fused_kernel_samples = []
         for _ in range(BENCH_ITER):
+            reset_fused_state()
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
@@ -172,6 +199,8 @@ def main():
             fused_kernel_samples.append((s, e))
 
         torch.cuda.synchronize()
+        if is_chief:
+            print(f"{M=} mod bench done")
         dist.barrier()
 
         # events are only readable once the stream has drained

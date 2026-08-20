@@ -209,7 +209,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // these warpgroups are not going to get in the way of instruction issue
             warpgroup::sync(2);
 
-            // currently, we assign in a round-robin fashion?
+            // // currently, we assign in a round-robin fashion?
             const int device_to_signal = tile_id % config::NUM_DEVICES;
             if (warpgroup::laneid() == 0) {
                 dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);
@@ -247,24 +247,27 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 
         // TODO: pipeline the multimem loads without clobbering
         // multimem load shared across threads
-        for (int i = threadIdx.x; i < fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK / 2;
-             i += blockDim.x) {
-            const int start_idx_within_tile = i * 2;
-            const int subtile_row_idx = start_idx_within_tile / fused_globals::COL_BLOCK;
-            const int subtile_col_idx = start_idx_within_tile % fused_globals::COL_BLOCK;
+        if (threadIdx.x < 128) {
+            for (int i = threadIdx.x; i < fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK / 2;
+             i += 128) {
+                const int start_idx_within_tile = i * 2;
+                const int subtile_row_idx = start_idx_within_tile / fused_globals::COL_BLOCK;
+                const int subtile_col_idx = start_idx_within_tile % fused_globals::COL_BLOCK;
 
-            comm::bf16_2* mc_ld = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
-                {row_base + subtile_row_idx, col_base + subtile_col_idx}));
+                comm::bf16_2* mc_ld = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at(
+                    {row_base + subtile_row_idx, col_base + subtile_col_idx}));
 
-            comm::bf16_2 tmp;
-            comm::multimem<comm::bf16_2>::ld_reduce<comm::reduce_op::ADD, comm::memory_model::WEAK>(
-                tmp, mc_ld);
+                comm::bf16_2 tmp;
+                comm::multimem<comm::bf16_2>::ld_reduce<comm::reduce_op::ADD, comm::memory_model::WEAK>(
+                    tmp, mc_ld);
 
-            // multimem store
-            comm::bf16_2* mc_st = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at(
-                {row_base + subtile_row_idx, col_base + subtile_col_idx}));
-            comm::multimem<comm::bf16_2>::st(mc_st, tmp);
+                // multimem store
+                comm::bf16_2* mc_st = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at(
+                    {row_base + subtile_row_idx, col_base + subtile_col_idx}));
+                comm::multimem<comm::bf16_2>::st(mc_st, tmp);
+            }
         }
+        
     }
 }
 
@@ -292,8 +295,16 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     const int num_threads = config::NUM_THREADS;
     const int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
-    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-        gemm_ar_fused_kernel_stub, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    // smem_size is built from compile-time constants, so this only has to be
+    // set once — doing it per launch puts a host API call inside the caller's
+    // timing window.
+    static const bool smem_configured = [&] {
+        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+            gemm_ar_fused_kernel_stub, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        return true;
+    }();
+    (void)smem_configured;
+
     gemm_ar_fused_kernel_stub<<<grid, num_threads, smem_size, stream>>>(G);
 }
 
