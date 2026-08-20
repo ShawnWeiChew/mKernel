@@ -154,6 +154,36 @@ endif
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+# === In-kernel timing profile build ===
+#
+# The timing ring (include/operators/gemm_ar/timings.cuh) is opt-in at compile
+# time and gets its own .so rather than a flag on the shipping one, so the two
+# live side by side: libgemm_ar_blackwell.so has zero profiling instructions in
+# its SASS and allocates no ring, libgemm_ar_blackwell_profile.so carries the
+# emit path. Same sources, same defines otherwise. Building them under one
+# target name would also mean `make PROFILE=1` after a plain `make` sees an
+# up-to-date .so and silently hands back the uninstrumented one.
+#
+#   make gemm_ar_blackwell_profile
+#   make EVENTS_PER_BLOCK=131072 gemm_ar_blackwell_profile   # deeper ring
+#
+# EVENTS_PER_BLOCK is the per-CTA cap; a CTA that overruns it drops the tail of
+# its timeline (bounds-checked, never a write into a neighbour). HBM cost is
+# NUM_BLOCKS * EVENTS_PER_BLOCK * 16 B, ~155 MB at the default.
+EVENTS_PER_BLOCK ?= 65536
+PROFILE_DEFINES := -DPROFILE_TIMINGS -DPROFILE_EVENTS_PER_BLOCK=$(EVENTS_PER_BLOCK)
+
+gemm_ar_blackwell_profile : $(BUILD)/libgemm_ar_blackwell_profile.so
+
+$(BUILD)/libgemm_ar_blackwell_profile.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) $(PROFILE_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell_profile $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+run_gemm_ar_blackwell_profile : gemm_ar_blackwell_profile
+	python bench/gemm_ar_blackwell_profile.py --shape 4096 --out traces/gemm_ar_blackwell.npz
+
+.PHONY: gemm_ar_blackwell_profile run_gemm_ar_blackwell_profile
 # === Standalone single-GPU GEMM comparison ===
 #
 # Three-way: cuBLAS (both B layouts), ThunderKittens bf16_b200, and the mKernel

@@ -32,7 +32,7 @@
 #include "memory/tk_ops_thread_util_tma.cuh"
 #include "memory/tk_ops_thread_util_util.cuh"
 #include "operators/gemm_ar/gemm_ar_blackwell.cuh"
-#include "operators/gemm_ar/profiler.h"
+#include "operators/gemm_ar/timings.cuh"
 
 using namespace kittens;
 
@@ -53,23 +53,132 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
+// ============================================================================
+// In-kernel timing events
+// ============================================================================
+//
+// Append-only. These integers are the ABI of every .npz already on disk: the
+// renderer looks phases up by name, but a trace saved before an id moved will
+// decode to the wrong phase. Add at the end, never renumber.
+//
+// The kernel runs six warps per CTA in three roles, and the interesting
+// question is always which of them is waiting on which, so each role gets a
+// chain of milestones rather than isolated begin/end pairs: consecutive
+// milestones of one loop iteration share a payload, and the phase table on the
+// host pairs (m[i], m[i+1]) into a span. That is one emit per boundary instead
+// of two.
+enum TimingEvent : uint32_t {
+    // every warp, once: kernel entry -> after the cluster-wide barrier
+    EV_SETUP_BEGIN = 0,
+    EV_SETUP_DONE = 1,
+
+    // producer warp (warp 4), once per K step
+    EV_LOAD_STEP_BEGIN = 2,   // about to wait for the stage's MMA to drain
+    EV_LOAD_MMA_FREE = 3,     // stage is free; about to issue the TMA loads
+    EV_LOAD_TMA_ISSUED = 4,   // both load_async issued
+
+    // MMA warp (warp 5 of cta_rank 0), once per output tile
+    EV_MMA_TILE_BEGIN = 5,    // about to wait for the epilogue to free tmem
+    EV_MMA_TMEM_FREE = 6,     // tmem accumulator is ours
+    // ...and once per K step
+    EV_MMA_STEP_BEGIN = 7,    // about to wait for this stage's TMA arrival
+    EV_MMA_INPUTS_READY = 8,  // A/B are in smem; about to issue the MMA
+    EV_MMA_ISSUED = 9,        // mm2_AB / mma2_AB issued
+
+    // epilogue warps (0-3), once per output tile
+    EV_EPI_TILE_BEGIN = 10,    // about to wait for the mainloop's commit
+    EV_EPI_MMA_DONE = 11,      // accumulator is complete
+    EV_EPI_TMEM_READ = 12,     // tmem -> registers done (tmem released here)
+    EV_EPI_SMEM_WRITTEN = 13,  // registers -> smem done, warpgroup synced
+    EV_EPI_TMA_ISSUED = 14,    // TMA store to C issued
+};
+
+// Exported to Python at module init so a .npz is self-describing and can be
+// re-rendered long after this enum has grown. Keep in sync with the enum.
+inline constexpr struct {
+    const char* name;
+    uint32_t id;
+} TIMING_EVENT_TABLE[] = {
+    {"SETUP_BEGIN", EV_SETUP_BEGIN},
+    {"SETUP_DONE", EV_SETUP_DONE},
+    {"LOAD_STEP_BEGIN", EV_LOAD_STEP_BEGIN},
+    {"LOAD_MMA_FREE", EV_LOAD_MMA_FREE},
+    {"LOAD_TMA_ISSUED", EV_LOAD_TMA_ISSUED},
+    {"MMA_TILE_BEGIN", EV_MMA_TILE_BEGIN},
+    {"MMA_TMEM_FREE", EV_MMA_TMEM_FREE},
+    {"MMA_STEP_BEGIN", EV_MMA_STEP_BEGIN},
+    {"MMA_INPUTS_READY", EV_MMA_INPUTS_READY},
+    {"MMA_ISSUED", EV_MMA_ISSUED},
+    {"EPI_TILE_BEGIN", EV_EPI_TILE_BEGIN},
+    {"EPI_MMA_DONE", EV_EPI_MMA_DONE},
+    {"EPI_TMEM_READ", EV_EPI_TMEM_READ},
+    {"EPI_SMEM_WRITTEN", EV_EPI_SMEM_WRITTEN},
+    {"EPI_TMA_ISSUED", EV_EPI_TMA_ISSUED},
+};
+
+// Emit helpers for fused_comp_sm. Both pull `G`, `s_timing_head`, `warp_id`,
+// `timing_seq` and `DO_PROFILE` out of the enclosing scope, so they are only
+// usable inside that function (and its lambdas) and are #undef'd right after.
+//
+// TIMING_MARK assumes the caller is already down to a single lane -- the
+// producer and MMA warps run their entire body inside one elect_warp_leader().
+// TIMING_MARK_LEADER elects a lane itself and is for the epilogue warps, where
+// all 32 lanes are converged. Never nest them: elect.sync with a full member
+// mask, issued by a lane that is already the sole survivor of an earlier
+// elect, is not a converged execution.
+//
+// TIMING_NEXT_SEQ closes an iteration's pairing key. Every mark of one loop
+// iteration must be emitted before it, and every iteration must call it, or
+// two iterations share a key and the pairer matches across them.
+#ifdef PROFILE_TIMINGS
+#define TIMING_MARK(eid)                                                       \
+    do {                                                                       \
+        if constexpr (DO_PROFILE) {                                            \
+            EMIT(G.timings,                                                    \
+                 &s_timing_head,                                               \
+                 (eid),                                                        \
+                 ::mkernel_timings::pack_payload(warp_id, timing_seq));        \
+        }                                                                      \
+    } while (0)
+#define TIMING_MARK_LEADER(eid)                                                \
+    do {                                                                       \
+        if constexpr (DO_PROFILE) {                                            \
+            if (elect_warp_leader()) TIMING_MARK(eid);                         \
+        }                                                                      \
+    } while (0)
+#define TIMING_NEXT_SEQ()                                                      \
+    do {                                                                       \
+        if constexpr (DO_PROFILE) ++timing_seq;                                \
+    } while (0)
+#else
+#define TIMING_MARK(eid) ((void)0)
+#define TIMING_MARK_LEADER(eid) ((void)0)
+#define TIMING_NEXT_SEQ() ((void)0)
+#endif
+
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
-    Profiler prof;
 
+#ifdef PROFILE_TIMINGS
+    // One head for the whole CTA, in shared memory. All six warps write into
+    // this CTA's slice of the ring and the atomicAdd hands out dense,
+    // non-aliasing indices across them; a head per warp would restart at 0 in
+    // every warp and stack six timelines on top of each other.
+    __shared__ uint32_t s_timing_head;
+    // Pairing key for the current loop iteration; the warp id packed into its
+    // top bits is what keeps warps sharing the head from colliding.
+    uint32_t timing_seq = 0;
     if constexpr (DO_PROFILE) {
-        if (elect_warp_leader()) {
-            // One slot per WARP, not per block: the six warps here play
-            // different roles (0-3 epilogue, 4 producer, 5 consumer) and each
-            // records its own timeline. Keying on blockIdx.x alone would have
-            // all six interleave writes into one row and clobber each other's
-            // counters.
-            prof.init(G.num_entries, G.data_ptr, blockIdx.x * config::NUM_WARPS + warp_id);
-            prof.start(ProfilerTag::Setup);
-        }
+        if (threadIdx.x == 0) s_timing_head = 0;
+        // Nothing has diverged yet at kernel entry, so this is safe here and
+        // only here -- it must land before any warp's first emit.
+        __syncthreads();
     }
+#endif
+
+    TIMING_MARK_LEADER(EV_SETUP_BEGIN);
 
     if (warp_id == 0 && elect_warp_leader()) {
         G.A.prefetch_tma<fused_globals::A_tile>();
@@ -130,11 +239,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
     everyone::tma::cluster::sync();
-    if constexpr (DO_PROFILE) {
-        if (elect_warp_leader()) {
-            prof.stop();
-        }
-    }
+
+    TIMING_MARK_LEADER(EV_SETUP_DONE);
+    TIMING_NEXT_SEQ();
 
     // tile_row_idx is this CTA's A row tile (ROW_BLOCK units, already rank
     // adjusted); tile_col_idx is the cluster's C column tile (COL_BLOCK units).
@@ -143,17 +250,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::WaitMMA);
-            }
+            TIMING_MARK(EV_LOAD_STEP_BEGIN);
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
-
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::IssueTMA);
-            }
+            TIMING_MARK(EV_LOAD_MMA_FREE);
 
             tma::cluster::expect_bytes(
                 tma_load[input_stage_id],
@@ -176,9 +275,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
+            TIMING_MARK(EV_LOAD_TMA_ISSUED);
+            TIMING_NEXT_SEQ();
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -189,33 +287,23 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     // each only handles 16
     auto consume = [&](int& input_stage_id, int& epilogue_stage_id) {
-        if constexpr (DO_PROFILE) {
-            prof.start(ProfilerTag::WaitEpilogue);
-        }
+        TIMING_MARK(EV_MMA_TILE_BEGIN);
         wait(epilogue_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
-        if constexpr (DO_PROFILE) {
-            prof.stop();
-        }
+        TIMING_MARK(EV_MMA_TMEM_FREE);
+        TIMING_NEXT_SEQ();
 
         {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::WaitTMA);
-            }
+            TIMING_MARK(EV_MMA_STEP_BEGIN);
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
+            TIMING_MARK(EV_MMA_INPUTS_READY);
 
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::IssueMMA);
-            }
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
+
+            TIMING_MARK(EV_MMA_ISSUED);
+            TIMING_NEXT_SEQ();
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
 
@@ -228,21 +316,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::WaitTMA);
-            }
+            TIMING_MARK(EV_MMA_STEP_BEGIN);
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
+            TIMING_MARK(EV_MMA_INPUTS_READY);
 
-            if constexpr (DO_PROFILE) {
-                prof.start(ProfilerTag::IssueMMA);
-            }
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
-            if constexpr (DO_PROFILE) {
-                prof.stop();
-            }
+
+            TIMING_MARK(EV_MMA_ISSUED);
+            TIMING_NEXT_SEQ();
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -259,27 +340,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     };
 
     auto epilogue = [&](int tile_row_idx, int tile_col_idx, int& epilogue_stage_id) {
-        if constexpr (DO_PROFILE) {
-            if (elect_warp_leader()) {
-                prof.start(ProfilerTag::WaitMainloop);
-            }
-        }
+        TIMING_MARK_LEADER(EV_EPI_TILE_BEGIN);
         wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
-        if constexpr (DO_PROFILE) {
-            if (elect_warp_leader()) {
-                prof.stop();
-            }
-        }
+        TIMING_MARK_LEADER(EV_EPI_MMA_DONE);
         tensor_after_thread_sync();
 
-        if constexpr (DO_PROFILE) {
-            if (elect_warp_leader()) {
-                prof.start(ProfilerTag::Epilogue);
-            }
-        }
         rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
         warpgroup::load_async(c_reg, tmem[epilogue_stage_id]);
         tensor_load_wait();
+        TIMING_MARK_LEADER(EV_EPI_TMEM_READ);
 
         // signal tmem empty
         if (elect_warp_leader()) {
@@ -290,18 +359,24 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         // this already does the swizzle inside it
         warpgroup::store(C_smem, c_reg);
         warpgroup::sync(1);
+        TIMING_MARK_LEADER(EV_EPI_SMEM_WRITTEN);
 
         if (warpgroup::laneid() == 0) {
             dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                 G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
             // This definitely is not needed for GEMM, since nothing depends on it
             // dist::tma::store_async_wait();
+
+            // Closed inside the same predicate that issues the store, and so
+            // only by warp 0. Marking it from all four epilogue warps would
+            // give the other three a span covering nothing but the emit
+            // itself, labelled as if they had issued a store. The cost is that
+            // warps 1-3 end their iteration at EPI_SMEM_WRITTEN with no
+            // matching end -- deliberate, so "epi: issue store" legitimately
+            // counts a quarter of what "epi: reg->smem" does.
+            TIMING_MARK(EV_EPI_TMA_ISSUED);
         }
-        if constexpr (DO_PROFILE) {
-            if (elect_warp_leader()) {
-                prof.stop();
-            }
-        }
+        TIMING_NEXT_SEQ();
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fused_globals::EPILOGUE_STAGES;
         if (epilogue_stage_id == 0) {
@@ -352,14 +427,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
 
-    // Publish the event count. Nothing reads a warp's slot until this lands, so
-    // without it every row reports zero events no matter what was recorded.
-    if constexpr (DO_PROFILE) {
-        if (elect_warp_leader()) {
-            prof.flush();
-        }
-    }
+    // No flush: the ring is zero-initialized by the host and %globaltimer never
+    // reads back as 0, so the host recovers each CTA's event count as the index
+    // of the first zero timestamp in its slot. Nothing has to be published.
 }
+
+#undef TIMING_MARK
+#undef TIMING_MARK_LEADER
+#undef TIMING_NEXT_SEQ
 
 // ============================================================================
 // Pipelined intra-node all-reduce tile helper

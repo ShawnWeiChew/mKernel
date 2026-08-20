@@ -23,18 +23,22 @@
 #include "dist/local_tensor.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "operators/gemm_ar/timings.cuh"
 
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-// Compile-time profiler toggle. The instrumentation costs %globaltimer reads
-// and global stores on the critical path, so it stays out of the SASS unless
-// this is on. Build with -DGEMM_AR_BLACKWELL_PROFILE=1 to turn it on without
-// touching the source.
-#ifndef GEMM_AR_BLACKWELL_PROFILE
-#define GEMM_AR_BLACKWELL_PROFILE 0
-#endif
-inline constexpr bool PROFILE_ENABLED = GEMM_AR_BLACKWELL_PROFILE;
+// The shipping entrypoint never instruments. Timing lives in a second
+// template instantiation reached only through entrypoint_profile, and the emit
+// path itself is compiled away unless the build passes -DPROFILE_TIMINGS
+// (make gemm_ar_blackwell_profile), so a default build carries none at all.
+inline constexpr bool PROFILE_ENABLED = false;
+
+// Ring geometry, re-exported so the host allocator and the pybind layer do not
+// have to reach into mkernel_timings.
+using mkernel_timings::EVENTS_PER_BLOCK;
+using mkernel_timings::TimingRecord;
+using mkernel_timings::TIMINGS_COMPILED;
 
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
@@ -122,10 +126,16 @@ struct fused_globals {
         C_tile C;
     };
 
-    // Profiling variables
-    int num_entries;
-    int64_t* data_ptr;
+    // In-kernel timing ring: NUM_BLOCKS * EVENTS_PER_BLOCK records, CTA b
+    // owning [b * EVENTS_PER_BLOCK, +EVENTS_PER_BLOCK). Null outside a profile
+    // run -- the emit path short-circuits on it, so nothing has to be
+    // recompiled to turn recording off.
+    TimingRecord* timings = nullptr;
 };
+
+// Bytes the host must allocate for `timings`.
+inline constexpr size_t TIMINGS_BYTES =
+    (size_t)config::NUM_BLOCKS * EVENTS_PER_BLOCK * sizeof(TimingRecord);
 
 __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A,
                                                              const at::Tensor& B,
@@ -281,47 +291,45 @@ void entrypoint(const at::Tensor& A,
 }
 
 // Profiling variant of `entrypoint`. Always launches the DO_PROFILE=true
-// instantiation, independent of the PROFILE_ENABLED build toggle, so a single
-// .so carries both the fast kernel and the instrumented one.
+// instantiation, independent of PROFILE_ENABLED, so one .so carries both the
+// fast kernel and the instrumented one.
 //
-// `profiler` is int64 [config::NUM_BLOCKS * config::NUM_WARPS, 1 + num_entries * 4],
-// one row per warp. Row layout: [count, (sm_id, tag, start_ns, duration_ns) * count].
-// Zero it before the run you intend to keep -- the kernel only writes the
-// entries it records, and never clears stale ones.
+// `timings` is an int64 CUDA tensor of exactly TIMINGS_BYTES / 8 elements --
+// two int64s per 16-byte TimingRecord. It must be **zeroed** before the run
+// being kept: the host recovers each CTA's event count as the index of the
+// first zero timestamp in its slot, and a stale record from a previous launch
+// reads as a live one.
 void entrypoint_profile(const at::Tensor& A,
                         const at::Tensor& B,
                         dist::ParallelBuffer& C,
                         dist::ParallelBuffer& barrier,
                         dist::ParallelBuffer& C_final,
-                        at::Tensor& profiler,
-                        int64_t num_entries) {
+                        at::Tensor& timings) {
+    TORCH_CHECK(TIMINGS_COMPILED,
+                "this .so was built without -DPROFILE_TIMINGS; rebuild with "
+                "`make gemm_ar_blackwell_profile` to record timings");
+
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    constexpr int64_t ROWS = (int64_t)config::NUM_BLOCKS * config::NUM_WARPS;
-    TORCH_CHECK(profiler.scalar_type() == at::kLong, "profiler must be int64");
-    TORCH_CHECK(profiler.is_cuda() && profiler.is_contiguous(),
-                "profiler must be a contiguous CUDA tensor");
-    TORCH_CHECK(profiler.dim() == 2 && profiler.size(0) >= ROWS,
-                "profiler must be 2-D with at least ",
-                ROWS,
-                " rows (NUM_BLOCKS * NUM_WARPS), got ",
-                profiler.sizes());
-    // Exact, not >=: Profiler::init strides by (1 + num_entries*4), so a wider
-    // row would put every warp's slot at the wrong offset.
-    TORCH_CHECK(profiler.size(1) == 1 + num_entries * 4,
-                "profiler row must hold exactly 1 + num_entries*4 = ",
-                1 + num_entries * 4,
+    constexpr int64_t NUMEL = (int64_t)(TIMINGS_BYTES / sizeof(int64_t));
+    TORCH_CHECK(timings.scalar_type() == at::kLong, "timings must be int64");
+    TORCH_CHECK(timings.is_cuda() && timings.is_contiguous(),
+                "timings must be a contiguous CUDA tensor");
+    // Exact, not >=: the kernel indexes by blockIdx.x * EVENTS_PER_BLOCK, so a
+    // buffer built against a different cap puts every CTA at the wrong offset.
+    TORCH_CHECK(timings.numel() == NUMEL,
+                "timings must hold exactly NUM_BLOCKS * EVENTS_PER_BLOCK * 2 = ",
+                NUMEL,
                 " int64s, got ",
-                profiler.size(1));
+                timings.numel());
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
     // Copy: the cached globals are shared across launches and must not be
-    // mutated, and these two fields are per-run.
+    // mutated, and this field is per-run.
     fused_globals G = detail::cached_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
-    G.num_entries = (int)num_entries;
-    G.data_ptr = profiler.data_ptr<int64_t>();
+    G.timings = reinterpret_cast<TimingRecord*>(timings.data_ptr<int64_t>());
 
     if (M <= 4096) {
         launch_fused_gemm_ar_blackwell<4, true>(G);

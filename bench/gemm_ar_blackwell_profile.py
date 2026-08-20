@@ -1,178 +1,86 @@
-"""In-kernel profile of gemm_ar_blackwell at a single shape, on one GPU.
+"""In-kernel timing profile of gemm_ar_blackwell at a single shape, on one GPU.
 
 Unlike gemm_ar_blackwell_bench.py this measures *inside* the kernel: every warp
-records (tag, start, duration) around the points instrumented in
-src/gemm_ar_blackwell.cu, so the output answers "which wait is eating the
-launch" rather than "how long did the launch take".
+stamps a (timestamp, event, payload) record at each phase boundary instrumented
+in src/gemm_ar_blackwell.cu, and the result is a per-warp Gantt chart. It
+answers "who is waiting on whom" rather than "how long did the launch take" --
+a question neither Nsight Systems nor Nsight Compute can answer, since both see
+one launch as one bar and cannot separate concurrent warp roles inside it.
+
+Needs the instrumented .so, which is a separate build so the shipping one keeps
+zero profiling instructions in its SASS:
+
+    make gemm_ar_blackwell_profile
+    python bench/gemm_ar_blackwell_profile.py --shape 4096 --out traces/4096.npz
+
+Then re-render offline as often as you like, without a GPU:
+
+    python python/timings.py traces/4096.npz --blocks 0-7
 
 Single process, single device. With config::NUM_COMP_SM == NUM_BLOCKS there are
 no comm SMs, so the kernel is a plain local GEMM and needs no peers -- build
 with INTRA_NUM_DEVICES=1 and the DistBuffers below are just local allocations.
-
-Usage:
-    python bench/gemm_ar_blackwell_profile.py --shape 2048 --out trace.json
-
-Requires a .so built from a tree that binds entrypoint_profile. The profiled
-kernel is a separate template instantiation and is always compiled in, so no
-special build flag is needed.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-
-# Must match ProfilerTag in include/operators/gemm_ar/profiler.h, in order.
-TAGS = [
-    "SETUP",
-    "ISSUE_TMA",
-    "ISSUE_MMA",
-    "WAIT_TMA",
-    "WAIT_MMA",
-    "WAIT_MAINLOOP",
-    "WAIT_EPILOGUE",
-    "EPILOGUE",
-]
-
-# Must match config:: in include/operators/gemm_ar/gemm_ar_blackwell.cuh.
-NUM_BLOCKS = 148
-NUM_WARPS = 6  # 4 epilogue + 1 producer + 1 consumer
+import timings  # noqa: E402
 
 WARMUP = 5
-
-
-def warp_role(warp: int) -> str:
-    if warp < 4:
-        return "epilogue"
-    return "producer" if warp == 4 else "consumer"
-
-
-def decode(profiler: torch.Tensor, num_entries: int):
-    """Profiler buffer -> (events, truncated_rows).
-
-    Row layout is [count, (sm_id, tag, start_ns, duration_ns) * count], one row
-    per warp, laid out as blockIdx.x * NUM_WARPS + warp_id.
-    """
-    rows = profiler.cpu().tolist()
-    events = []
-    truncated = 0
-
-    for row_id, data in enumerate(rows):
-        count = data[0]
-        if count <= 0:
-            continue
-        if count >= num_entries:
-            # The kernel does not bound-check cnt_, so a row at the cap means
-            # entries were dropped and neighbouring rows may be corrupt.
-            truncated += 1
-            count = num_entries
-
-        block, warp = divmod(row_id, NUM_WARPS)
-        role = warp_role(warp)
-        for i in range(count):
-            sm_id, tag, start, duration = data[1 + i * 4 : 1 + (i + 1) * 4]
-            events.append(
-                dict(
-                    name=TAGS[tag],
-                    cat=role,
-                    ph="X",
-                    # %globaltimer is ns; the trace format wants microseconds.
-                    ts=start / 1000.0,
-                    dur=duration / 1000.0,
-                    pid=sm_id,
-                    tid=row_id,
-                    args=dict(block=block, warp=warp, role=role, sm=sm_id),
-                )
-            )
-
-    return events, truncated
-
-
-def to_trace(events):
-    """Zero the clock and attach readable process/thread names."""
-    if not events:
-        return dict(traceEvents=[], displayTimeUnit="ns")
-
-    offset = min(e["ts"] for e in events)
-    for e in events:
-        e["ts"] -= offset
-
-    meta = []
-    for pid in sorted({e["pid"] for e in events}):
-        meta.append(
-            dict(name="process_name", ph="M", pid=pid, tid=0, args=dict(name=f"SM {pid}"))
-        )
-    seen = {}
-    for e in events:
-        seen.setdefault((e["pid"], e["tid"]), e["args"])
-    for (pid, tid), a in sorted(seen.items()):
-        meta.append(
-            dict(
-                name="thread_name",
-                ph="M",
-                pid=pid,
-                tid=tid,
-                args=dict(name=f"blk{a['block']} w{a['warp']} {a['role']}"),
-            )
-        )
-
-    return dict(traceEvents=meta + events, displayTimeUnit="ns")
-
-
-def summarize(events):
-    """Total/mean ns per (role, tag), sorted by total time. This is the table
-    that actually says where the kernel is spending itself."""
-    agg = {}
-    for e in events:
-        key = (e["cat"], e["name"])
-        tot, n = agg.get(key, (0.0, 0))
-        agg[key] = (tot + e["dur"] * 1000.0, n + 1)
-
-    lines = [f"  {'role':<9} {'tag':<15} {'count':>7} {'total us':>11} {'mean ns':>10}"]
-    for (role, tag), (total_ns, n) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
-        lines.append(
-            f"  {role:<9} {tag:<15} {n:>7} {total_ns / 1000.0:>11.1f} {total_ns / n:>10.1f}"
-        )
-    return "\n".join(lines)
-
-
-def span_us(events):
-    """Wall span of the instrumented region, max over SMs -- a sanity check
-    against the kernel time the bench reports."""
-    if not events:
-        return 0.0
-    return max(e["ts"] + e["dur"] for e in events) - min(e["ts"] for e in events)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shape", type=int, default=2048, help="square M=N=K")
     ap.add_argument("--k", type=int, default=0, help="override K (default: = shape)")
-    ap.add_argument("--entries", type=int, default=1000, help="max events recorded per warp")
     ap.add_argument("--device", type=int, default=0)
-    ap.add_argument("--out", type=str, default="", help="write the trace JSON here")
+    ap.add_argument(
+        "--out", type=str, default="traces/gemm_ar_blackwell.npz", help="trace .npz path"
+    )
+    ap.add_argument("--pdf", type=str, default="", help="Gantt PDF (default: <out>.pdf)")
+    ap.add_argument(
+        "--blocks",
+        type=str,
+        default="",
+        help="only draw these CTAs, e.g. '0-7'. The .npz always keeps them all.",
+    )
+    ap.add_argument("--no-plot", action="store_true", help="dump the .npz only")
     args = ap.parse_args()
 
     torch.cuda.set_device(args.device)
-    mod = load_module.load("gemm_ar_blackwell")
-    if not hasattr(mod, "gemm_ar_intranode_blackwell_profile"):
+    mod = load_module.load("gemm_ar_blackwell_profile")
+    # The design's load-time probe: these attributes exist only in a build that
+    # passed -DPROFILE_TIMINGS.
+    if not hasattr(mod, "EVENTS_PER_BLOCK"):
         print(
-            "ERROR: the .so has no gemm_ar_intranode_blackwell_profile binding; "
-            "rebuild after adding entrypoint_profile.",
+            "ERROR: this .so was built without -DPROFILE_TIMINGS. "
+            "Run `make gemm_ar_blackwell_profile`.",
             flush=True,
         )
         return 1
 
+    num_blocks = mod.TIMING_NUM_BLOCKS
+    num_warps = mod.TIMING_NUM_WARPS
+    cap = mod.EVENTS_PER_BLOCK
+    event_map = dict(mod.TIMING_EVENTS)
+
     M = N = args.shape
     K = args.k or args.shape
-    print(f"profiling M={M} K={K} N={N}, {args.entries} entries/warp", flush=True)
+    ring_mb = num_blocks * cap * mod.TIMING_RECORD_SIZE / 1e6
+    print(
+        f"profiling M={M} K={K} N={N}; ring = {num_blocks} blocks x {cap} events "
+        f"({ring_mb:.0f} MB)",
+        flush=True,
+    )
 
     torch.manual_seed(42)
     A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K**0.25)
@@ -205,9 +113,10 @@ def main():
     barrier = dbuf((2, 1024, 1024), torch.int, multicast)
     C_final = dbuf((M, N), torch.bfloat16, multicast)
 
-    profiler = torch.zeros(
-        NUM_BLOCKS * NUM_WARPS, 1 + args.entries * 4, dtype=torch.int64, device="cuda"
-    )
+    # Two int64s per 16-byte record -- a shape torch round-trips cheaply. Zeroed,
+    # which is what makes timestamp == 0 the "never written" sentinel and lets
+    # the host recover each CTA's event count without a head array.
+    ring = torch.zeros(num_blocks * cap * 2, dtype=torch.int64, device="cuda")
 
     def reset():
         C_dbuf.data_.zero_()
@@ -216,7 +125,7 @@ def main():
         torch.cuda.synchronize()
 
     run = lambda: mod.gemm_ar_intranode_blackwell_profile(  # noqa: E731
-        A, B, C_dbuf, barrier, C_final, profiler, args.entries
+        A, B, C_dbuf, barrier, C_final, ring
     )
 
     # Warm up on the instrumented kernel itself: it is a different cubin from
@@ -227,10 +136,10 @@ def main():
         run()
     torch.cuda.synchronize()
 
-    # The kernel only writes the entries it records and never clears stale
-    # ones, so the buffer has to be zeroed for the run being kept.
+    # Exactly one iteration into a freshly zeroed ring. Several iterations would
+    # reuse payload values within a CTA slot and collide in the pairing key.
     reset()
-    profiler.zero_()
+    ring.zero_()
     torch.cuda.synchronize()
 
     run()
@@ -242,27 +151,52 @@ def main():
     err = (C_dbuf.data_.float() - ref.float()).abs().max().item()
     print(f"max |C - A@B| = {err:.4f}", flush=True)
 
-    events, truncated = decode(profiler, args.entries)
-    if truncated:
+    records, heads = timings.unpack(ring.cpu().numpy(), num_blocks, cap)
+    overflowed = int((heads >= cap).sum())
+    if overflowed:
         print(
-            f"WARNING: {truncated} warp row(s) hit the {args.entries}-entry cap; "
-            f"raise --entries (the kernel does not bound-check, so those rows "
-            f"overran into their neighbour)",
+            f"WARNING: {overflowed} CTA(s) filled all {cap} slots; their timelines "
+            f"are truncated at the same x-coordinate. Rebuild with "
+            f"`make EVENTS_PER_BLOCK={cap * 2} gemm_ar_blackwell_profile`.",
             flush=True,
         )
 
-    active_sms = len({e["pid"] for e in events})
-    print(f"\n{len(events)} events across {active_sms} SMs, "
-          f"instrumented span {span_us(events):.1f} us\n", flush=True)
-    print(summarize(events), flush=True)
+    print(
+        f"\n{records.shape[0]} events across {len(set(records[:, 0].tolist()))} CTAs, "
+        f"wall span {timings.wall_span_us(records):.1f} us\n",
+        flush=True,
+    )
+    print(timings.summarize(timings.spans_for_all_roles(records, event_map, num_warps)), flush=True)
 
-    if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(to_trace(events)))
-        print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB) "
-              f"-- open in chrome://tracing or ui.perfetto.dev", flush=True)
+    out = timings.save(
+        args.out,
+        records,
+        event_map,
+        num_blocks=num_blocks,
+        num_warps=num_warps,
+        events_per_block=cap,
+        overflowed_blocks=overflowed,
+        M=M,
+        N=N,
+        K=K,
+        rank=args.device,
+        title=f"gemm_ar_blackwell M={M} N={N} K={K}",
+    )
+    print(f"\nwrote {out} ({out.stat().st_size / 1e6:.1f} MB)", flush=True)
 
+    if args.no_plot:
+        return 0
+
+    blocks = timings.parse_blocks(args.blocks)
+    draw = records if blocks is None else records[np.isin(records[:, 0], sorted(blocks))]
+    pdf = Path(args.pdf) if args.pdf else Path(args.out).with_suffix(".pdf")
+    written = timings.plot(
+        draw, pdf, event_map, num_warps=num_warps, title=f"M={M} N={N} K={K}"
+    )
+    if written is None:
+        print("no spans paired -- nothing to draw", flush=True)
+        return 1
+    print(f"wrote {written} ({written.stat().st_size / 1e6:.1f} MB)", flush=True)
     return 0
 
 
