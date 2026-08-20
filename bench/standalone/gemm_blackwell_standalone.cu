@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -164,7 +165,7 @@ static CheckResult check(const bf16* obs, const bf16* ref, size_t n) {
     CUDA_OK(cudaFree(d_max)); CUDA_OK(cudaFree(d_abs)); CUDA_OK(cudaFree(d_ref));
 
     CheckResult c;
-    c.max_abs  = __uint_as_float(mb);
+    std::memcpy(&c.max_abs, &mb, sizeof(float));  // __uint_as_float is device-only
     c.mean_abs = sa / (double)n;
     c.ref_mean = sr / (double)n;
     // bf16 accumulation order differs between cuBLAS and the kernel; judge on
