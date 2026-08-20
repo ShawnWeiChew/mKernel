@@ -48,12 +48,14 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int tile_id,
 };
 
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
-    // TODO: prefetch tensormap
-    // if (elect_warp_leader()) {
-    // dist::tma::prefetch_tensormap(const TensorMapT *desc)
-    // }
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
+
+    if (warp_id == 0 && elect_warp_leader()) {
+        G.A.prefetch_tma<fused_globals::A_tile>();
+        G.B.prefetch_tma<fused_globals::B_tile>();
+        G.C_dist[G.dev_idx].prefetch_tma<fused_globals::C_tile>();
+    }
 
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
     const int num_tiles_total = G.M * G.N / (fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK);
@@ -131,17 +133,21 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     auto consume = [&](int& input_stage_id, int& epilogue_stage_id) {
         wait(epilogue_finished[epilogue_stage_id],
              get_phasebit<1>(epilogue_phasebit, epilogue_stage_id));
-
-        for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
+        {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id)); 
+            mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            update_phasebit<0>(inputs_phasebit, input_stage_id);
+            input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
+        }
+
+        for (int i = 1; i < G.K / fused_globals::RED_BLOCK; i++) {
+            fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id));
-            if (i == 0) {
-                mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
-            } else {
-                mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
-            }
+            mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             // TODO: can probably optimize this away later to be one phasebit per barrier
             update_phasebit<0>(inputs_phasebit, input_stage_id);
@@ -209,7 +215,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // these warpgroups are not going to get in the way of instruction issue
             warpgroup::sync(2);
 
-            // // currently, we assign in a round-robin fashion?
+            // // // currently, we assign in a round-robin fashion?
             const int device_to_signal = tile_id % config::NUM_DEVICES;
             if (warpgroup::laneid() == 0) {
                 dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);

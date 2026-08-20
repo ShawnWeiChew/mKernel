@@ -152,5 +152,5 @@ GEMM_AR_BLACKWELL_SANITIZE := -fdevice-sanitize=memcheck
 endif
 
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@

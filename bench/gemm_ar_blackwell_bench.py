@@ -146,8 +146,6 @@ def main():
             torch.cuda.synchronize()
             del C_tmp
 
-        if is_chief:
-            print(f"{M=} torch warmup done")
         dist.barrier()
 
         baseline_samples = []
@@ -162,8 +160,6 @@ def main():
             baseline_samples.append((s, e))
 
         torch.cuda.synchronize()
-        if is_chief:
-            print(f"{M=} torch bench done")
         dist.barrier()
 
         # The kernel's tile flags are plain counters compared with == NUM_DEVICES
@@ -185,8 +181,6 @@ def main():
             reset_fused_state()
             mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
 
-        if is_chief:
-            print(f"{M=} mod warmup done")
 
         fused_kernel_samples = []
         for _ in range(BENCH_ITER):
@@ -199,8 +193,6 @@ def main():
             fused_kernel_samples.append((s, e))
 
         torch.cuda.synchronize()
-        if is_chief:
-            print(f"{M=} mod bench done")
         dist.barrier()
 
         # events are only readable once the stream has drained
