@@ -154,3 +154,57 @@ endif
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+# === Standalone single-GPU GEMM comparison ===
+#
+# Three-way: cuBLAS (both B layouts), ThunderKittens bf16_b200, and the mKernel
+# fused kernel -- one process, one timing discipline, one set of buffers.
+#
+# TWO objects, deliberately. mKernel vendors ThunderKittens into namespace
+# kittens (include/common/tk_types_*.cuh), so the upstream kittens.cuh cannot be
+# included in the same TU without redefining every kittens:: type. tk_gemm_shim.cu
+# sees only upstream TK; gemm_blackwell_standalone.cu sees only the vendored
+# copy; they meet at an extern "C" boundary of raw pointers. No -rdc, so the two
+# device images never merge, and -fvisibility=hidden keeps the shim's host
+# symbols from colliding with the vendored ones.
+#
+# Requires NUM_COMP_SM == NUM_BLOCKS in gemm_ar_blackwell.cuh (static_assert
+# enforces it). Never build this with SANITIZE=1.
+#
+#   make gemm_blackwell_standalone            # cuBLAS + mKernel
+#   make WITH_TK=1 gemm_blackwell_standalone  # ...plus ThunderKittens
+#   make TK_ROOT=/path/to/ThunderKittens WITH_TK=1 gemm_blackwell_standalone
+
+TK_ROOT        ?= /home/uccl/shawn/ThunderKittens
+STANDALONE_DIR := bench/standalone
+STANDALONE_INC := -I$(STANDALONE_DIR)/stub_include
+STANDALONE_LD  := -lcuda -lcublas -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+                  -Xlinker -rpath -Xlinker $(TORCH_LIB)
+
+WITH_TK ?= 0
+ifeq ($(WITH_TK),1)
+STANDALONE_TK_DEF := -DWITH_TK
+STANDALONE_TK_OBJ := $(BUILD)/tk_gemm_shim.o
+endif
+
+gemm_blackwell_standalone : $(BUILD)/gemm_blackwell_standalone
+
+# TK-only TU: upstream kittens.cuh + the b200 kernel. -I$(TK_ROOT) is what makes
+# `#include "kernels/gemm/bf16_b200/bf16_b200_gemm.cu"` resolve.
+$(BUILD)/tk_gemm_shim.o : $(STANDALONE_DIR)/tk_gemm_shim.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(ARCH_DEFINES) -I$(TK_ROOT)/include -I$(TK_ROOT) \
+	    --compiler-options '-fvisibility=hidden' -c $< -o $@
+
+# mKernel TU + link. stub_include/ must precede include/ so the pybind session
+# header at the tail of src/gemm_ar_blackwell.cu is shadowed away.
+$(BUILD)/gemm_blackwell_standalone : $(STANDALONE_DIR)/gemm_blackwell_standalone.cu \
+                                     $(SRC)/gemm_ar_blackwell.cu $(STANDALONE_TK_OBJ) | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo $(COMMON_DEFINES) $(STANDALONE_TK_DEF) \
+	    -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell \
+	    $(STANDALONE_INC) $(COMMON_INC) -I$(TK_ROOT)/include \
+	    $(STANDALONE_LD) \
+	    $< $(STANDALONE_TK_OBJ) -o $@
+
+run_gemm_blackwell_standalone : gemm_blackwell_standalone
+	$(BUILD)/gemm_blackwell_standalone
+
+.PHONY: gemm_blackwell_standalone run_gemm_blackwell_standalone

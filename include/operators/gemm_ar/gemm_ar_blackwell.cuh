@@ -4,8 +4,13 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "comm/comm.cuh"
@@ -131,6 +136,85 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
         .K = K};
 }
 
+namespace detail {
+
+// Key for the fused_globals cache: every input cuTensorMapEncodeTiled bakes
+// into a descriptor. A descriptor is a pure function of (address, dims,
+// strides, tile shape), so two calls agreeing on all of these below produce
+// byte-identical descriptors. That makes a cache hit safe even if a buffer was
+// freed and something else was allocated at the same address with the same
+// shape -- the descriptor that would be rebuilt is the one already stored.
+struct globals_key {
+    static constexpr int ND = config::NUM_DEVICES;
+    // A, B, then (multicast + ND locals) for each of C_dist/barrier/C_final,
+    // then dev_idx, M, N, K.
+    static constexpr int WORDS = 2 + 3 * (1 + ND) + 4;
+    std::array<uint64_t, WORDS> w{};
+    bool operator==(const globals_key& o) const { return w == o.w; }
+};
+
+struct globals_key_hash {
+    size_t operator()(const globals_key& k) const {
+        size_t h = 1469598103934665603ull;  // FNV-1a
+        for (uint64_t v : k.w) {
+            h ^= (size_t)v;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+};
+
+inline globals_key make_globals_key(const at::Tensor& A,
+                                    const at::Tensor& B,
+                                    dist::ParallelBuffer& C,
+                                    dist::ParallelBuffer& barrier,
+                                    dist::ParallelBuffer& C_final,
+                                    int dev_idx,
+                                    int M,
+                                    int N,
+                                    int K) {
+    globals_key k;
+    int i = 0;
+    k.w[i++] = reinterpret_cast<uint64_t>(A.data_ptr());
+    k.w[i++] = reinterpret_cast<uint64_t>(B.data_ptr());
+    for (dist::ParallelBuffer* pb : {&C, &barrier, &C_final}) {
+        k.w[i++] = reinterpret_cast<uint64_t>(pb->multicast_ptr_);
+        for (int d = 0; d < globals_key::ND; ++d) {
+            void* raw = (d < (int)pb->raw_ptrs_.size()) ? pb->raw_ptrs_[d] : nullptr;
+            k.w[i++] = reinterpret_cast<uint64_t>(raw);
+        }
+    }
+    k.w[i++] = (uint64_t)dev_idx;
+    k.w[i++] = (uint64_t)M;
+    k.w[i++] = (uint64_t)N;
+    k.w[i++] = (uint64_t)K;
+    return k;
+}
+
+using globals_cache =
+    std::unordered_map<globals_key, std::unique_ptr<fused_globals>, globals_key_hash>;
+
+inline globals_cache& the_globals_cache() {
+    static globals_cache c;
+    return c;
+}
+
+inline std::mutex& the_globals_cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+}  // namespace detail
+
+// Drop every cached fused_globals. Not required for correctness -- a stale
+// entry can only be matched by a buffer at the same address with the same
+// shape, which needs the same descriptor anyway -- but useful to reclaim the
+// few KB per entry after a set of buffers is retired.
+inline void clear_globals_cache() {
+    std::lock_guard<std::mutex> lk(detail::the_globals_cache_mutex());
+    detail::the_globals_cache().clear();
+}
+
 void entrypoint(const at::Tensor& A,
                 const at::Tensor& B,
                 dist::ParallelBuffer& C,
@@ -141,9 +225,32 @@ void entrypoint(const at::Tensor& A,
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
-    fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
+    // gemm_ar_blackwell_make_globals runs cuTensorMapEncodeTiled once per
+    // local_tensor it builds: one for A, one for B, and one per device slot of
+    // both C_dist and C_final -- 2 + 2*NUM_DEVICES driver calls. Doing that on
+    // every launch put a flat ~13us of host time inside the caller's timing
+    // window, which at M=N=2048 was larger than the kernel itself, and cost the
+    // same in production. Build once per (pointers, shape) and reuse.
+    const detail::globals_key key =
+        detail::make_globals_key(A, B, C, barrier, C_final, dev_idx, M, N, K);
 
-    launch_fused_gemm_ar_blackwell(G);
+    const fused_globals* G;
+    {
+        std::lock_guard<std::mutex> lk(detail::the_globals_cache_mutex());
+        detail::globals_cache& cache = detail::the_globals_cache();
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            it = cache
+                     .emplace(key,
+                              std::make_unique<fused_globals>(gemm_ar_blackwell_make_globals(
+                                  A, B, C, barrier, C_final, dev_idx, M, N, K)))
+                     .first;
+        }
+        // unique_ptr, so the pointee survives a rehash by another thread.
+        G = it->second.get();
+    }
+
+    launch_fused_gemm_ar_blackwell(*G);
     // MKERNEL_CUDACHECK(cudaGetLastError());
     // NOTE: no device sync here — the launch stays async like every other
     // entrypoint in the repo. A sync here lands inside the caller's cuda-event
