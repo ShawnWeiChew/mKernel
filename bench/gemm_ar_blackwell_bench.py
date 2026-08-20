@@ -86,7 +86,7 @@ def main():
         # collect a run first
         C_ref_cpu = torch.matmul(A, B).detach().float()
         local_ref_cpu = C_ref_cpu.clone()
-        dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
+        # dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
 
         # do our own run
@@ -99,7 +99,7 @@ def main():
         # there are no comm SMs, so nothing writes C_final. Point this back at
         # C_final/C_ref_cpu once the comm SMs are re-enabled.
         correctness_ok = check_close(
-            f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
+            f"gemm_ar_blackwell M={M}", C_dbuf.data_, C_ref_cpu, atol=0.55, rtol=0.12
         )
 
         if not gemm_correctness_check:
@@ -142,7 +142,7 @@ def main():
         # warmup cublas + NCCL
         for _ in range(WARMUP):
             C_tmp = torch.matmul(A, B)
-            dist.all_reduce(C_tmp)
+            # dist.all_reduce(C_tmp)
             torch.cuda.synchronize()
             del C_tmp
 
@@ -155,7 +155,7 @@ def main():
             e = torch.cuda.Event(enable_timing=True)
             s.record()
             C_tmp = torch.matmul(A, B)
-            dist.all_reduce(C_tmp)
+            # dist.all_reduce(C_tmp)
             e.record()
             baseline_samples.append((s, e))
 

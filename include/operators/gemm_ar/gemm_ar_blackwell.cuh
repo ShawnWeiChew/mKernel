@@ -26,7 +26,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 struct config {
     static constexpr int NUM_BLOCKS = 152;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
-    static constexpr int NUM_COMP_SM = 128;
+    static constexpr int NUM_COMP_SM = 148;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
     // static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
     // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
