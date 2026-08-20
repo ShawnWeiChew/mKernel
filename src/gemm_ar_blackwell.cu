@@ -137,7 +137,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id)); 
+            wait(tma_load[input_stage_id], get_phasebit<0>(inputs_phasebit, input_stage_id));
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
             update_phasebit<0>(inputs_phasebit, input_stage_id);
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
@@ -213,13 +213,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // wait for the entire warpgroup, so that everything will be in HBM
             // TODO: I dont think this will be very different from using an atomic counter, since
             // these warpgroups are not going to get in the way of instruction issue
-            warpgroup::sync(2);
+            // warpgroup::sync(2);
 
             // // // currently, we assign in a round-robin fashion?
-            const int device_to_signal = tile_id % config::NUM_DEVICES;
-            if (warpgroup::laneid() == 0) {
-                dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);
-            }
+
+            // const int device_to_signal = tile_id % config::NUM_DEVICES;
+            // if (warpgroup::laneid() == 0) {
+            //     dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal,
+            //     1);
+            // }
         }
     }
 }
@@ -250,8 +252,8 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base) {
     // bf16_2 units — one 4-byte multimem access each.
-    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;                 // 128
-    constexpr int TOTAL_UNITS = fused_globals::ROW_BLOCK * UNITS_PER_ROW;       // 16384
+    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;            // 128
+    constexpr int TOTAL_UNITS = fused_globals::ROW_BLOCK * UNITS_PER_ROW;  // 16384
     constexpr int NT = config::NUM_THREADS;
     constexpr int BATCH = AR_UNROLL * NT;
 
@@ -325,11 +327,11 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 }
 
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm(G);
-    } else {
-        fused_intranode_sm(G);
-    }
+    fused_comp_sm(G);
+    // if (blockIdx.x < config::NUM_COMP_SM) {
+    // } else {
+    //     fused_intranode_sm(G);
+    // }
 }
 
 __global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(

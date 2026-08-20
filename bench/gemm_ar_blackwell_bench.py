@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -138,13 +139,15 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_final.data_.zero_()
 
+        C_tmp = symm_mem.empty(M, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}")
+        symm_mem.rendezvous(C_tmp, group=dist.group.WORLD)
+
         dist.barrier()
         # warmup cublas + NCCL
         for _ in range(WARMUP):
-            C_tmp = torch.matmul(A, B)
+            torch.matmul(A, B, out=C_tmp)
             # dist.all_reduce(C_tmp)
             torch.cuda.synchronize()
-            del C_tmp
 
         dist.barrier()
 
@@ -154,7 +157,7 @@ def main():
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
-            C_tmp = torch.matmul(A, B)
+            torch.matmul(A, B, out=C_tmp)
             # dist.all_reduce(C_tmp)
             e.record()
             baseline_samples.append((s, e))
