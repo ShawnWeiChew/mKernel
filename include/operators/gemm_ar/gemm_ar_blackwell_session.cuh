@@ -11,6 +11,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("C"),
           pybind11::arg("barrier"),
           pybind11::arg("C_final"));
+    m.def("gemm_ar_intranode_blackwell_profile",
+          &gemm_ar_intranode_blackwell::entrypoint_profile,
+          pybind11::arg("A"),
+          pybind11::arg("B"),
+          pybind11::arg("C"),
+          pybind11::arg("barrier"),
+          pybind11::arg("C_final"),
+          pybind11::arg("profiler"),
+          pybind11::arg("num_entries"));
     // Optional. The cache is keyed on (pointers, shape), so a stale entry can
     // never be matched by a buffer that would need a different descriptor;
     // this just reclaims the few KB per entry after buffers are retired.

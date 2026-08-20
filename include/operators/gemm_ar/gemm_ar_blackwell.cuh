@@ -27,7 +27,16 @@
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH>
+// Compile-time profiler toggle. The instrumentation costs %globaltimer reads
+// and global stores on the critical path, so it stays out of the SASS unless
+// this is on. Build with -DGEMM_AR_BLACKWELL_PROFILE=1 to turn it on without
+// touching the source.
+#ifndef GEMM_AR_BLACKWELL_PROFILE
+#define GEMM_AR_BLACKWELL_PROFILE 0
+#endif
+inline constexpr bool PROFILE_ENABLED = GEMM_AR_BLACKWELL_PROFILE;
+
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
@@ -112,6 +121,10 @@ struct fused_globals {
     struct pipeline_outputs {
         C_tile C;
     };
+
+    // Profiling variables
+    int num_entries;
+    int64_t* data_ptr;
 };
 
 __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A,
@@ -206,6 +219,37 @@ inline std::mutex& the_globals_cache_mutex() {
     return m;
 }
 
+// gemm_ar_blackwell_make_globals runs cuTensorMapEncodeTiled once per
+// local_tensor it builds: one for A, one for B, and one per device slot of
+// both C_dist and C_final -- 2 + 2*NUM_DEVICES driver calls. Doing that on
+// every launch put a flat ~13us of host time inside the caller's timing
+// window, which at M=N=2048 was larger than the kernel itself, and cost the
+// same in production. Build once per (pointers, shape) and reuse.
+inline const fused_globals& cached_globals(const at::Tensor& A,
+                                           const at::Tensor& B,
+                                           dist::ParallelBuffer& C,
+                                           dist::ParallelBuffer& barrier,
+                                           dist::ParallelBuffer& C_final,
+                                           int dev_idx,
+                                           int M,
+                                           int N,
+                                           int K) {
+    const globals_key key = make_globals_key(A, B, C, barrier, C_final, dev_idx, M, N, K);
+
+    std::lock_guard<std::mutex> lk(the_globals_cache_mutex());
+    globals_cache& cache = the_globals_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        it = cache
+                 .emplace(key,
+                          std::make_unique<fused_globals>(gemm_ar_blackwell_make_globals(
+                              A, B, C, barrier, C_final, dev_idx, M, N, K)))
+                 .first;
+    }
+    // unique_ptr, so the pointee survives a rehash by another thread.
+    return *it->second;
+}
+
 }  // namespace detail
 
 // Drop every cached fused_globals. Not required for correctness -- a stale
@@ -227,35 +271,62 @@ void entrypoint(const at::Tensor& A,
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
-    // gemm_ar_blackwell_make_globals runs cuTensorMapEncodeTiled once per
-    // local_tensor it builds: one for A, one for B, and one per device slot of
-    // both C_dist and C_final -- 2 + 2*NUM_DEVICES driver calls. Doing that on
-    // every launch put a flat ~13us of host time inside the caller's timing
-    // window, which at M=N=2048 was larger than the kernel itself, and cost the
-    // same in production. Build once per (pointers, shape) and reuse.
-    const detail::globals_key key =
-        detail::make_globals_key(A, B, C, barrier, C_final, dev_idx, M, N, K);
+    const fused_globals& G = detail::cached_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
 
-    const fused_globals* G;
-    {
-        std::lock_guard<std::mutex> lk(detail::the_globals_cache_mutex());
-        detail::globals_cache& cache = detail::the_globals_cache();
-        auto it = cache.find(key);
-        if (it == cache.end()) {
-            it = cache
-                     .emplace(key,
-                              std::make_unique<fused_globals>(gemm_ar_blackwell_make_globals(
-                                  A, B, C, barrier, C_final, dev_idx, M, N, K)))
-                     .first;
-        }
-        // unique_ptr, so the pointee survives a rehash by another thread.
-        G = it->second.get();
-    }
-
-    if (M == 2048) {
-        launch_fused_gemm_ar_blackwell<4>(*G);
+    if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, PROFILE_ENABLED>(G);
     } else {
-        launch_fused_gemm_ar_blackwell<8>(*G);
+        launch_fused_gemm_ar_blackwell<8, PROFILE_ENABLED>(G);
+    }
+}
+
+// Profiling variant of `entrypoint`. Always launches the DO_PROFILE=true
+// instantiation, independent of the PROFILE_ENABLED build toggle, so a single
+// .so carries both the fast kernel and the instrumented one.
+//
+// `profiler` is int64 [config::NUM_BLOCKS * config::NUM_WARPS, 1 + num_entries * 4],
+// one row per warp. Row layout: [count, (sm_id, tag, start_ns, duration_ns) * count].
+// Zero it before the run you intend to keep -- the kernel only writes the
+// entries it records, and never clears stale ones.
+void entrypoint_profile(const at::Tensor& A,
+                        const at::Tensor& B,
+                        dist::ParallelBuffer& C,
+                        dist::ParallelBuffer& barrier,
+                        dist::ParallelBuffer& C_final,
+                        at::Tensor& profiler,
+                        int64_t num_entries) {
+    const int dev_idx = C.local_rank_;
+    c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    constexpr int64_t ROWS = (int64_t)config::NUM_BLOCKS * config::NUM_WARPS;
+    TORCH_CHECK(profiler.scalar_type() == at::kLong, "profiler must be int64");
+    TORCH_CHECK(profiler.is_cuda() && profiler.is_contiguous(),
+                "profiler must be a contiguous CUDA tensor");
+    TORCH_CHECK(profiler.dim() == 2 && profiler.size(0) >= ROWS,
+                "profiler must be 2-D with at least ",
+                ROWS,
+                " rows (NUM_BLOCKS * NUM_WARPS), got ",
+                profiler.sizes());
+    // Exact, not >=: Profiler::init strides by (1 + num_entries*4), so a wider
+    // row would put every warp's slot at the wrong offset.
+    TORCH_CHECK(profiler.size(1) == 1 + num_entries * 4,
+                "profiler row must hold exactly 1 + num_entries*4 = ",
+                1 + num_entries * 4,
+                " int64s, got ",
+                profiler.size(1));
+
+    const int M = A.size(0), K = A.size(1), N = B.size(1);
+
+    // Copy: the cached globals are shared across launches and must not be
+    // mutated, and these two fields are per-run.
+    fused_globals G = detail::cached_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
+    G.num_entries = (int)num_entries;
+    G.data_ptr = profiler.data_ptr<int64_t>();
+
+    if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, true>(G);
+    } else {
+        launch_fused_gemm_ar_blackwell<8, true>(G);
     }
 }
 

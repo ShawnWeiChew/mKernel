@@ -32,6 +32,7 @@
 #include "memory/tk_ops_thread_util_tma.cuh"
 #include "memory/tk_ops_thread_util_util.cuh"
 #include "operators/gemm_ar/gemm_ar_blackwell.cuh"
+#include "operators/gemm_ar/profiler.h"
 
 using namespace kittens;
 
@@ -52,10 +53,23 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
+    Profiler prof;
+
+    if constexpr (DO_PROFILE) {
+        if (elect_warp_leader()) {
+            // One slot per WARP, not per block: the six warps here play
+            // different roles (0-3 epilogue, 4 producer, 5 consumer) and each
+            // records its own timeline. Keying on blockIdx.x alone would have
+            // all six interleave writes into one row and clobber each other's
+            // counters.
+            prof.init(G.num_entries, G.data_ptr, blockIdx.x * config::NUM_WARPS + warp_id);
+            prof.start(ProfilerTag::Setup);
+        }
+    }
 
     if (warp_id == 0 && elect_warp_leader()) {
         G.A.prefetch_tma<fused_globals::A_tile>();
@@ -116,6 +130,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
     everyone::tma::cluster::sync();
+    if constexpr (DO_PROFILE) {
+        if (elect_warp_leader()) {
+            prof.stop();
+        }
+    }
 
     // tile_row_idx is this CTA's A row tile (ROW_BLOCK units, already rank
     // adjusted); tile_col_idx is the cluster's C column tile (COL_BLOCK units).
@@ -124,7 +143,17 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::WaitMMA);
+            }
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
+
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::IssueTMA);
+            }
 
             tma::cluster::expect_bytes(
                 tma_load[input_stage_id],
@@ -147,6 +176,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
+
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= 1;
@@ -156,13 +189,33 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     // each only handles 16
     auto consume = [&](int& input_stage_id, int& epilogue_stage_id) {
+        if constexpr (DO_PROFILE) {
+            prof.start(ProfilerTag::WaitEpilogue);
+        }
         wait(epilogue_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
+        if constexpr (DO_PROFILE) {
+            prof.stop();
+        }
+
         {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::WaitTMA);
+            }
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
+
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::IssueMMA);
+            }
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
 
@@ -174,8 +227,22 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         for (int i = 1; i < G.K / fused_globals::RED_BLOCK; i++) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A;
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
+
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::WaitTMA);
+            }
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
+
+            if constexpr (DO_PROFILE) {
+                prof.start(ProfilerTag::IssueMMA);
+            }
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            if constexpr (DO_PROFILE) {
+                prof.stop();
+            }
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -192,9 +259,24 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     };
 
     auto epilogue = [&](int tile_row_idx, int tile_col_idx, int& epilogue_stage_id) {
+        if constexpr (DO_PROFILE) {
+            if (elect_warp_leader()) {
+                prof.start(ProfilerTag::WaitMainloop);
+            }
+        }
         wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
+        if constexpr (DO_PROFILE) {
+            if (elect_warp_leader()) {
+                prof.stop();
+            }
+        }
         tensor_after_thread_sync();
 
+        if constexpr (DO_PROFILE) {
+            if (elect_warp_leader()) {
+                prof.start(ProfilerTag::Epilogue);
+            }
+        }
         rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
         warpgroup::load_async(c_reg, tmem[epilogue_stage_id]);
         tensor_load_wait();
@@ -214,6 +296,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
             // This definitely is not needed for GEMM, since nothing depends on it
             // dist::tma::store_async_wait();
+        }
+        if constexpr (DO_PROFILE) {
+            if (elect_warp_leader()) {
+                prof.stop();
+            }
         }
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fused_globals::EPILOGUE_STAGES;
@@ -262,6 +349,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             //     dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal,
             //     1);
             // }
+        }
+    }
+
+    // Publish the event count. Nothing reads a warp's slot until this lands, so
+    // without it every row reports zero events no matter what was recorded.
+    if constexpr (DO_PROFILE) {
+        if (elect_warp_leader()) {
+            prof.flush();
         }
     }
 }
@@ -333,7 +428,7 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     // TODO: figure out how the per-device split should look like?
     const int num_tiles_total = G.M * G.N / (fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK);
@@ -367,22 +462,22 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     }
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    fused_comp_sm<SUPERGROUP_WIDTH>(G);
+    fused_comp_sm<SUPERGROUP_WIDTH, DO_PROFILE>(G);
     // if (blockIdx.x < config::NUM_COMP_SM) {
     // } else {
     //     fused_intranode_sm(G);
     // }
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(
     config::NUM_THREADS) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH>(G);
+    fused_kernel<SUPERGROUP_WIDTH, DO_PROFILE>(G);
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -397,7 +492,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
     // timing window.
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, DO_PROFILE>;
     static const bool smem_configured = [&] {
         MKERNEL_CUDACHECK(cudaFuncSetAttribute(
             this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

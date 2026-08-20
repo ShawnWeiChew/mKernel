@@ -251,10 +251,10 @@ static void launch_mkernel(const gab::fused_globals& G, cudaStream_t s) {
     const int smem = mkernel_smem_bytes();
 
     if (G.M == 2048) {
-        gab::gemm_ar_fused_kernel_stub<4>
+        gab::gemm_ar_fused_kernel_stub<4, false>
             <<<gab::config::NUM_BLOCKS, gab::config::NUM_THREADS, smem, s>>>(G);
     } else {
-        gab::gemm_ar_fused_kernel_stub<8>
+        gab::gemm_ar_fused_kernel_stub<8, false>
             <<<gab::config::NUM_BLOCKS, gab::config::NUM_THREADS, smem, s>>>(G);
     }
 }
@@ -442,11 +442,11 @@ static void run_shape(int M, int N, int K, int warmup, int iters) {
     CUDA_OK(cudaStreamSynchronize(s));
 
     if (M == 2048) {
-        CUDA_OK(cudaFuncSetAttribute(gab::gemm_ar_fused_kernel_stub<4>,
+        CUDA_OK(cudaFuncSetAttribute(gab::gemm_ar_fused_kernel_stub<4, false>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      mkernel_smem_bytes()));
     } else {
-        CUDA_OK(cudaFuncSetAttribute(gab::gemm_ar_fused_kernel_stub<8>,
+        CUDA_OK(cudaFuncSetAttribute(gab::gemm_ar_fused_kernel_stub<8, false>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      mkernel_smem_bytes()));
     }
