@@ -49,6 +49,10 @@
 // The real kernel. stub_include/ must precede include/ on the -I line.
 #include "../../src/gemm_ar_blackwell.cu"
 
+#ifndef INTRA_NUM_DEVICES
+#define INTRA_NUM_DEVICES 8
+#endif
+
 namespace gab = gemm_ar_intranode_blackwell;
 using bf16 = __nv_bfloat16;
 
@@ -557,7 +561,7 @@ int main(int argc, char** argv) {
 
     // K = N/4 mirrors the 4-rank tensor-parallel slice the python bench uses.
     for (int n : {2048, 4096, 8192, 16384, 32768})
-        run_shape(n, n, n / 4, warmup, iters);
+        run_shape(n, n, n / INTRA_NUM_DEVICES, warmup, iters);
 
     // Square shapes, for direct comparison against published TK / cuBLAS numbers.
     if (argc > 1 && std::string(argv[1]) == "--square")

@@ -69,7 +69,7 @@ struct fused_globals {
     // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
     // that NUM_C_TILES is larger at bigger tile sizes
     // the benefit of this is that we can save on SMEM budget to expand later
-    static constexpr int NUM_C_TILES = 4;
+    static constexpr int NUM_C_TILES = 8;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;

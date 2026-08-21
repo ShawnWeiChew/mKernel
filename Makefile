@@ -76,7 +76,7 @@ COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BA
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
-                   -Xlinker -rpath -Xlinker $(TORCH_LIB)
+                   -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib
 
 COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 
@@ -104,7 +104,6 @@ BUILD := build
 SRC   := src
 
 KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention dispatch_gemm_glu_combine
-
 all: $(addprefix $(BUILD)/lib,$(addsuffix .so,$(KERNELS)))
 
 $(BUILD)/lib%.so: $(SRC)/%.cu | $(BUILD)
@@ -178,8 +177,7 @@ TK_ROOT        ?= /home/uccl/shawn/ThunderKittens
 STANDALONE_DIR := bench/standalone
 STANDALONE_INC := -I$(STANDALONE_DIR)/stub_include
 STANDALONE_LD  := -lcuda -lcublas -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
-                  -Xlinker -rpath -Xlinker $(TORCH_LIB)
-
+                  -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib
 WITH_TK ?= 0
 ifeq ($(WITH_TK),1)
 STANDALONE_TK_DEF := -DWITH_TK
