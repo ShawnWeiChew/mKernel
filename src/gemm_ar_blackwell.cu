@@ -214,8 +214,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         warpgroup::sync(1);
 
         if (warpgroup::laneid() == 0) {
-            dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
+            dist::tma::store_async(G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
         }
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fused_globals::EPILOGUE_STAGES;
@@ -261,9 +260,23 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // these warpgroups are not going to get in the way of instruction issue
             warpgroup::sync(2);
 
-            const int device_to_signal = tile_id % config::NUM_DEVICES;
+            // The barrier is keyed on CTA tiles (ROW_BLOCK rows), not cluster
+            // tiles, so signal the row this CTA actually stored to above — the
+            // cluster row would leave every odd row unsignalled and double-count
+            // every even one.
+            //
+            // comm_tile_id is the comm side's linear tile id for that same tile.
+            // Both sides have to agree on it, because the comm loop claims tiles
+            // by `id % NUM_DEVICES == dev_idx`; fused_intranode_sm inverts this
+            // to recover the coordinate. Note it does not depend on dev_idx, so
+            // every device picks the same owner for a given tile.
+            const int c_row = tile_row_id * config::NUM_CLUSTERS + cta_rank;
+            const int comm_tile_id = tile_id * config::NUM_CLUSTERS + cta_rank;
             if (warpgroup::laneid() == 0) {
-                dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);
+                dist::signal(G.comp_comm_barrier,
+                             {c_row, tile_col_id},
+                             comm_tile_id % config::NUM_DEVICES,
+                             1);
             }
         }
     }
@@ -342,14 +355,26 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
     const int num_tiles_total = G.M * G.N / (fused_globals::ROW_BLOCK * fused_globals::COL_BLOCK);
     const int comm_block_idx = blockIdx.x - config::NUM_COMP_SM;
-    const int num_row_tiles = G.M / fused_globals::ROW_BLOCK;
+    // Cluster rows, matching fused_comp_sm's walk — see the decode below.
+    const int num_cluster_row_tiles = G.M / (fused_globals::ROW_BLOCK * config::NUM_CLUSTERS);
 
     const int tile_id_stride = config::NUM_DEVICES * config::NUM_COMM_SM;
     for (int tile_id = G.dev_idx + comm_block_idx * config::NUM_DEVICES; tile_id < num_tiles_total;
          tile_id += tile_id_stride) {
-        // wait for local device signal
-        auto [tile_row_idx, tile_col_idx] =
-            calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_tiles_per_row, tile_id);
+        // Decode through the *cluster* tile walk rather than running a second,
+        // independent snake over CTA rows. fused_comp_sm computes one cluster
+        // tile per iteration and emits two CTA tiles from it (one per cta_rank),
+        // so tile_id == cluster_tile_id * NUM_CLUSTERS + cta_rank is exactly the
+        // id the epilogue signals with, and this is its inverse. Keeping the two
+        // sides on one formula is the point: the previous version walked its own
+        // snake over G.M / ROW_BLOCK rows, which put comp and comm in different
+        // tile-id spaces and left half the barrier slots waiting on a signal
+        // that never came.
+        const int cluster_tile_id = tile_id / config::NUM_CLUSTERS;
+        const int sub_row = tile_id % config::NUM_CLUSTERS;
+        auto [cluster_row_idx, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
+            num_cluster_row_tiles, num_tiles_per_row, cluster_tile_id);
+        const int tile_row_idx = cluster_row_idx * config::NUM_CLUSTERS + sub_row;
 
         // we can use a relaxed wait here, since every operation after this is multimem, which does
         // not go through the L1 cache + signal from before is a release add operation
