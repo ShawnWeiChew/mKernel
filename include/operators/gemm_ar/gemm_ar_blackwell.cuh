@@ -62,10 +62,13 @@ struct config {
 struct fused_globals {
     // TODO: tune
     static constexpr int PIPELINE_STAGES = 5;
+    // Accumulator stages in TMEM. Each C_tt_tile is COL_BLOCK float columns
+    // wide and TMEM only has MAX_TENSOR_COLS of them, so with COL_BLOCK == 256
+    // exactly two accumulators fit. This is what epilogue_stage_id rings over.
+    static constexpr int EPILOGUE_STAGES = 2;
     // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
-    // that EPILOGUE_STAGES is larger at bigger tile sizes
+    // that NUM_C_TILES is larger at bigger tile sizes
     // the benefit of this is that we can save on SMEM budget to expand later
-    static constexpr int EPILOGUE_STAGES = 4;
     static constexpr int NUM_C_TILES = 4;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
@@ -80,7 +83,13 @@ struct fused_globals {
     // compared to just writing to GMEM
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
-    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / EPILOGUE_STAGES>;
+    static_assert(EPILOGUE_STAGES * C_tt_tile::cols <= kittens::MAX_TENSOR_COLS,
+                  "The TMEM accumulators for all epilogue stages must fit in tensor memory");
+
+    // The epilogue splits one COL_BLOCK-wide accumulator into NUM_C_TILES column
+    // chunks and pushes them out through NUM_C_TILES shared staging buffers.
+    static_assert(COL_BLOCK % NUM_C_TILES == 0, "COL_BLOCK should be divisible");
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / NUM_C_TILES>;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;

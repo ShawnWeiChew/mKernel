@@ -280,20 +280,16 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 prof.start(ProfilerTag::Epilogue);
             }
         }
-        rt_bf<fused_globals::ROW_BLOCK / 4,
-              fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES>
-            c_reg[fused_globals::EPILOGUE_STAGES];
+        constexpr int C_CHUNK_COLS = fused_globals::COL_BLOCK / fused_globals::NUM_C_TILES;
+        rt_bf<fused_globals::ROW_BLOCK / 4, C_CHUNK_COLS> c_reg[fused_globals::NUM_C_TILES];
 
 #pragma unroll
-        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+        for (int i = 0; i < fused_globals::NUM_C_TILES; i++) {
             warpgroup::load_async(
                 c_reg[i],
                 tmem[epilogue_stage_id]
-                    .template subtile<
-                        tt<float,
-                           fused_globals::ROW_BLOCK,
-                           fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES>>(
-                        i * fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES));
+                    .template subtile<tt<float, fused_globals::ROW_BLOCK, C_CHUNK_COLS>>(
+                        i * C_CHUNK_COLS));
         }
         tensor_load_wait();
 
@@ -304,7 +300,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
 
 #pragma unroll
-        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+        for (int i = 0; i < fused_globals::NUM_C_TILES; i++) {
+            // C_smem[i] is still being read by the store issued NUM_C_TILES
+            // chunks ago; retire it before overwriting the buffer. The sync
+            // right after extends that wait (only lane 0 tracks the groups) to
+            // the whole warpgroup.
             dist::tma::store_async_read_wait<fused_globals::NUM_C_TILES - 1>();
             warpgroup::sync(1);
             // this already does the swizzle inside it
@@ -312,8 +312,12 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             warpgroup::sync(1);
 
             if (warpgroup::laneid() == 0) {
+                // C_tile is only COL_BLOCK / NUM_C_TILES wide, so the TMA
+                // column coordinate counts chunks, not COL_BLOCK tiles.
                 dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                    G.C_dist[G.dev_idx], C_smem[i], {tile_row_idx, tile_col_idx});
+                    G.C_dist[G.dev_idx],
+                    C_smem[i],
+                    {tile_row_idx, tile_col_idx * fused_globals::NUM_C_TILES + i});
             }
         }
 
@@ -343,9 +347,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else if (warp_id == 5) {
         if (cta_rank == 0 && elect_warp_leader()) {
-            fused_globals::C_tt_tile tmem[2] = {
-                tm_alloc.allocate<fused_globals::C_tt_tile>(0),
-                tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
+            fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES];
+#pragma unroll
+            for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+                tmem[i] = tm_alloc.allocate<fused_globals::C_tt_tile>(i * fused_globals::COL_BLOCK);
+            }
 
             int input_stage_id = 0;
             int epilogue_stage_id = 0;
@@ -355,9 +361,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else if (warp_id >= 0 && warp_id < 4) {
         int epilogue_stage_id = 0;
-        fused_globals::C_tt_tile tmem[2] = {
-            tm_alloc.allocate<fused_globals::C_tt_tile>(0),
-            tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
+        fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES];
+#pragma unroll
+        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+            tmem[i] = tm_alloc.allocate<fused_globals::C_tt_tile>(i * fused_globals::COL_BLOCK);
+        }
 
         for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             auto [tile_row_id, tile_col_id] =
@@ -498,7 +506,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     const int smem_size =
         ((G.ROW_BLOCK * G.RED_BLOCK + G.COL_BLOCK / config::NUM_CLUSTERS * G.RED_BLOCK) *
          sizeof(comm::bf16) * fused_globals::PIPELINE_STAGES) +
-        ((G.ROW_BLOCK * G.COL_BLOCK) * sizeof(comm::bf16)) +
+        (sizeof(fused_globals::C_tile) * fused_globals::NUM_C_TILES) +
         1024;  // NOTE: must add 1024 so this can be aligned by TK
     const int num_threads = config::NUM_THREADS;
     const int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
