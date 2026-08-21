@@ -36,7 +36,7 @@ GPU ?= hopper
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
     ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
-    DEFAULT_CUDA_HOME := /usr/local/cuda-13.1
+    DEFAULT_CUDA_HOME := /usr/local/cuda-13.2
     # conda forces a host compiler through NVCC_PREPEND_FLAGS/CXX on some boxes,
     # which makes nvcc miss system headers; pin the system g++.
     CCBIN             := -ccbin /usr/bin/g++

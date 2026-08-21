@@ -53,13 +53,8 @@ struct config {
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = 4;
     static constexpr int NUM_CLUSTERS = 2;
-    // TODO: get a number for this
-    // static constexpr int INTRANODE_COMM_WARPS = ???;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
-
-    static constexpr int PRODUCER_REGISTERS = 40;
-    static constexpr int CONSUMER_REGISTERS = 232;
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
@@ -67,9 +62,11 @@ struct config {
 struct fused_globals {
     // TODO: tune
     static constexpr int PIPELINE_STAGES = 5;
-    // TODO: the amount of smem used by this configuration is too big -> see what I can do about it
-    // later
-    static constexpr int EPILOGUE_STAGES = 2;
+    // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
+    // that EPILOGUE_STAGES is larger at bigger tile sizes
+    // the benefit of this is that we can save on SMEM budget to expand later
+    static constexpr int EPILOGUE_STAGES = 4;
+    static constexpr int NUM_C_TILES = 4;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
@@ -83,7 +80,7 @@ struct fused_globals {
     // compared to just writing to GMEM
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
-    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK>;
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / EPILOGUE_STAGES>;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;

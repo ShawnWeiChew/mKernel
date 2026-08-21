@@ -96,7 +96,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     fused_globals::pipeline_inputs(&inputs_smem)[fused_globals::PIPELINE_STAGES] =
         smem_allocator.allocate<fused_globals::pipeline_inputs, fused_globals::PIPELINE_STAGES>();
-    fused_globals::C_tile& C_smem = smem_allocator.allocate<fused_globals::C_tile>();
+    fused_globals::C_tile(&C_smem)[fused_globals::NUM_C_TILES] =
+        smem_allocator.allocate<fused_globals::C_tile, fused_globals::NUM_C_TILES>();
 
     __shared__ semaphore tma_load[fused_globals::PIPELINE_STAGES];
     __shared__ semaphore mma_finish[fused_globals::PIPELINE_STAGES];
@@ -112,9 +113,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     // bit 1: tma_load          - starts at 0
     // bit 0: mma_finish        - starts at 1
     uint32_t phasebits = 0b0101;
-    fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES] = {
-        tm_alloc.allocate<fused_globals::C_tt_tile>(0),
-        tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
 
     if (warp_id == 0 && elect_warp_leader()) {
 #pragma unroll
@@ -188,7 +186,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     };
 
     // each only handles 16
-    auto consume = [&](int& input_stage_id, int& epilogue_stage_id) {
+    auto consume = [&](int& input_stage_id,
+                       int& epilogue_stage_id,
+                       fused_globals::C_tt_tile* tmem) {
         if constexpr (DO_PROFILE) {
             prof.start(ProfilerTag::WaitEpilogue);
         }
@@ -258,7 +258,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     };
 
-    auto epilogue = [&](int tile_row_idx, int tile_col_idx, int& epilogue_stage_id) {
+    auto epilogue = [&](int tile_row_idx,
+                        int tile_col_idx,
+                        int& epilogue_stage_id,
+                        fused_globals::C_tt_tile* tmem) {
         if constexpr (DO_PROFILE) {
             if (elect_warp_leader()) {
                 prof.start(ProfilerTag::WaitMainloop);
@@ -277,8 +280,21 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 prof.start(ProfilerTag::Epilogue);
             }
         }
-        rt_bf<fused_globals::ROW_BLOCK / 4, fused_globals::COL_BLOCK> c_reg;
-        warpgroup::load_async(c_reg, tmem[epilogue_stage_id]);
+        rt_bf<fused_globals::ROW_BLOCK / 4,
+              fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES>
+            c_reg[fused_globals::EPILOGUE_STAGES];
+
+#pragma unroll
+        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+            warpgroup::load_async(
+                c_reg[i],
+                tmem[epilogue_stage_id]
+                    .template subtile<
+                        tt<float,
+                           fused_globals::ROW_BLOCK,
+                           fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES>>(
+                        i * fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES));
+        }
         tensor_load_wait();
 
         // signal tmem empty
@@ -286,17 +302,21 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // TODO: move this into dist namespace
             tma::cluster::arrive(epilogue_finished[epilogue_stage_id], 0);
         }
-        warpgroup::sync(1);
-        // this already does the swizzle inside it
-        warpgroup::store(C_smem, c_reg);
-        warpgroup::sync(1);
 
-        if (warpgroup::laneid() == 0) {
-            dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                G.C_dist[G.dev_idx], C_smem, {tile_row_idx, tile_col_idx});
-            // This definitely is not needed for GEMM, since nothing depends on it
-            // dist::tma::store_async_wait();
+#pragma unroll
+        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+            dist::tma::store_async_read_wait<fused_globals::NUM_C_TILES - 1>();
+            warpgroup::sync(1);
+            // this already does the swizzle inside it
+            warpgroup::store(C_smem[i], c_reg[i]);
+            warpgroup::sync(1);
+
+            if (warpgroup::laneid() == 0) {
+                dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                    G.C_dist[G.dev_idx], C_smem[i], {tile_row_idx, tile_col_idx});
+            }
         }
+
         if constexpr (DO_PROFILE) {
             if (elect_warp_leader()) {
                 prof.stop();
@@ -323,32 +343,30 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else if (warp_id == 5) {
         if (cta_rank == 0 && elect_warp_leader()) {
+            fused_globals::C_tt_tile tmem[2] = {
+                tm_alloc.allocate<fused_globals::C_tt_tile>(0),
+                tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
+
             int input_stage_id = 0;
             int epilogue_stage_id = 0;
             for (int iter = cluster_idx; iter < num_tiles_total; iter += num_comp_clusters) {
-                consume(input_stage_id, epilogue_stage_id);
+                consume(input_stage_id, epilogue_stage_id, tmem);
             }
         }
     } else if (warp_id >= 0 && warp_id < 4) {
         int epilogue_stage_id = 0;
+        fused_globals::C_tt_tile tmem[2] = {
+            tm_alloc.allocate<fused_globals::C_tt_tile>(0),
+            tm_alloc.allocate<fused_globals::C_tt_tile>(fused_globals::COL_BLOCK)};
+
         for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             auto [tile_row_id, tile_col_id] =
                 calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
             // This CTA holds the 128 output rows fed by its own half of A.
-            epilogue(tile_row_id * config::NUM_CLUSTERS + cta_rank, tile_col_id, epilogue_stage_id);
-
-            // wait for the entire warpgroup, so that everything will be in HBM
-            // TODO: I dont think this will be very different from using an atomic counter, since
-            // these warpgroups are not going to get in the way of instruction issue
-            // warpgroup::sync(2);
-
-            // // // currently, we assign in a round-robin fashion?
-
-            // const int device_to_signal = tile_id % config::NUM_DEVICES;
-            // if (warpgroup::laneid() == 0) {
-            //     dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal,
-            //     1);
-            // }
+            epilogue(tile_row_id * config::NUM_CLUSTERS + cta_rank,
+                     tile_col_id,
+                     epilogue_stage_id,
+                     tmem);
         }
     }
 
@@ -465,10 +483,6 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     fused_comp_sm<SUPERGROUP_WIDTH, DO_PROFILE>(G);
-    // if (blockIdx.x < config::NUM_COMP_SM) {
-    // } else {
-    //     fused_intranode_sm(G);
-    // }
 }
 
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
