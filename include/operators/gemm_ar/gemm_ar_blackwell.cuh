@@ -21,6 +21,8 @@
 
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
+
+template <int SUPERGROUP_WIDTH>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
@@ -28,31 +30,20 @@ struct config {
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int NUM_COMP_SM = 128;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
-    // static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
-    // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
-    // Maybe I can also save some SMs just for all-reduce?
-    // I need to have a regular epilogue, and then do the all reduce -- maybe I can save SMs just
-    // for this
+
     static constexpr int CONSUMER_WARPS = 1;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = 4;
     static constexpr int NUM_CLUSTERS = 2;
-    // TODO: get a number for this
-    // static constexpr int INTRANODE_COMM_WARPS = ???;
+
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
-
-    static constexpr int PRODUCER_REGISTERS = 40;
-    static constexpr int CONSUMER_REGISTERS = 232;
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
 
 struct fused_globals {
-    // TODO: tune
     static constexpr int PIPELINE_STAGES = 5;
-    // TODO: the amount of smem used by this configuration is too big -> see what I can do about it
-    // later
     static constexpr int EPILOGUE_STAGES = 2;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
@@ -60,11 +51,8 @@ struct fused_globals {
 
     using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
 
-    // NOTE: I am storing it as BT
     static_assert(COL_BLOCK % config::NUM_CLUSTERS == 0, "COL_BLOCK should be divisible");
     using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / config::NUM_CLUSTERS>;
-    // TODO: benchmark against writing to SMEM and then to GMEM,
-    // compared to just writing to GMEM
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
     using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK>;
@@ -72,8 +60,6 @@ struct fused_globals {
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
 
-    // I assume that this gives me a pointer to global memory, not sure
-    // this part is so sketchy help
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
     using C_distributed_tensor =
         dist::distributed_tensor<C_local_tensor, config::NUM_DEVICES, true>;
@@ -88,8 +74,6 @@ struct fused_globals {
     C_distributed_tensor C_dist;
 
     // barriers
-
-    // TODO: scope it to a tile later, start with global barrier
     barrier_distributed_tensor comp_comm_barrier;
 
     int dev_idx;
@@ -143,11 +127,11 @@ void entrypoint(const at::Tensor& A,
 
     fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
 
-    launch_fused_gemm_ar_blackwell(G);
-    // MKERNEL_CUDACHECK(cudaGetLastError());
-    // NOTE: no device sync here — the launch stays async like every other
-    // entrypoint in the repo. A sync here lands inside the caller's cuda-event
-    // window and charges the kernel for the host round-trip.
+    if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4>(G);
+    } else {
+        launch_fused_gemm_ar_blackwell<8>(G);
+    }
 }
 
 };  // namespace gemm_ar_intranode_blackwell
