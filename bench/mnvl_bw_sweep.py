@@ -59,7 +59,7 @@ DEFAULT_SHAPES = [4096, 8192, 16384, 32768]
 DEFAULT_SUBTILE_M = [128, 256]
 DEFAULT_SUBTILE_N = [16, 32, 64, 128, 256]
 DEFAULT_COMM_SMS = [12, 16, 20, 24, 28, 32]
-DEFAULT_AR_UNROLL = [4, 8, 16, 32]
+DEFAULT_AR_UNROLL = [4, 8, 16, 32, 64, 128]
 DEFAULT_SUPERGROUP = [4, 8]
 
 # Correctness pattern: value(i, j) = ((i + j) % period + 1) * (rank + 1), so the
@@ -417,10 +417,10 @@ def main() -> int:
                                  supergroup_width=supergroup, repeats=repeats,
                                  ms=round(ms, 5), ar_gbps=round(ar_gbps, 2),
                                  nvl_gbps=round(nvl_gbps, 2)))
-                if is_chief:
-                    print(f"{subtile_m:>6} {subtile_n:>6} {comm_sms:>4} {ar_unroll:>7} "
-                          f"{supergroup:>3} {ms:>9.4f} {ar_gbps:>10.1f} {nvl_gbps:>10.1f}",
-                          flush=True)
+                # if is_chief:
+                #     print(f"{subtile_m:>6} {subtile_n:>6} {comm_sms:>4} {ar_unroll:>7} "
+                #           f"{supergroup:>3} {ms:>9.4f} {ar_gbps:>10.1f} {nvl_gbps:>10.1f}",
+                #           flush=True)
 
             if is_chief:
                 shape_rows = sorted((r for r in rows if r["M"] == M and r["kind"] == "mnvl"),

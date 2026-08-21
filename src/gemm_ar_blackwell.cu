@@ -469,6 +469,94 @@ namespace mnvl_bw_test {
 
 static constexpr int NUM_THREADS = 384;
 
+namespace ar_detail {
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int NT>
+__device__ __forceinline__ void ar_unroll_no_cache(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(
+                    tmps[u], reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c})));
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
+                    reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c})), tmps[u]);
+            }
+        }
+    }
+}
+
+// AR_UNROLL != 32: cache both load and store addresses up front.
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int NT>
+__device__ __forceinline__ void ar_unroll_cached_st(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+            }
+        }
+    }
+}
+
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int NT = NUM_THREADS>
 __device__ __forceinline__ void experimental_ar_unroll(
     const fused_globals::C_distributed_tensor& C_dist,
@@ -500,19 +588,46 @@ __device__ __forceinline__ void experimental_ar_unroll(
         // All loads before any store — this is the whole point of the helper.
 #pragma unroll
         for (int u = 0; u < AR_UNROLL; u++) {
-            if (base + u * NT < TOTAL_UNITS) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
                 comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
                                                                                  ld_ptrs[u]);
             }
         }
 
+        const ptrdiff_t st_delta = C_final.mc_ptr - C_dist.mc_ptr;  // outside the loop
 #pragma unroll
         for (int u = 0; u < AR_UNROLL; u++) {
             if (base + u * NT < TOTAL_UNITS) {
                 comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
-                    ld_ptrs[u] + (C_final.mc_ptr - C_dist.mc_ptr), tmps[u]);
+                    reinterpret_cast<comm::bf16_2*>(reinterpret_cast<comm::bf16*>(ld_ptrs[u]) +
+                                                    st_delta),
+                    tmps[u]);
             }
         }
+    }
+}
+
+}  // namespace ar_detail
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int NT = NUM_THREADS>
+__device__ __forceinline__ void experimental_ar_unroll(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    // bf16_2 units — one 4-byte multimem access each.
+    static_assert(SUBTILE_N % 2 == 0, "SUBTILE_N must be even (bf16_2 units)");
+
+    if constexpr (AR_UNROLL >= 128) {
+        ar_detail::ar_unroll_no_cache<AR_UNROLL, SUBTILE_M, SUBTILE_N, NT>(
+            C_dist, C_final, row_base, col_base);
+    } else if (AR_UNROLL >= 32) {
+        ar_detail::experimental_ar_unroll<AR_UNROLL, SUBTILE_M, SUBTILE_N, NT>(
+            C_dist, C_final, row_base, col_base);
+    } else {
+        ar_detail::ar_unroll_cached_st<AR_UNROLL, SUBTILE_M, SUBTILE_N, NT>(
+            C_dist, C_final, row_base, col_base);
     }
 }
 
@@ -598,6 +713,10 @@ void launch_bw_test(const fused_globals::C_distributed_tensor& C_dist,
             return launch_bw_test<SG, SM, SN, 16>(MNVL_LAUNCH_ARGS);               \
         case 32:                                                                   \
             return launch_bw_test<SG, SM, SN, 32>(MNVL_LAUNCH_ARGS);               \
+        case 64:                                                                   \
+            return launch_bw_test<SG, SM, SN, 64>(MNVL_LAUNCH_ARGS);               \
+        case 128:                                                                  \
+            return launch_bw_test<SG, SM, SN, 128>(MNVL_LAUNCH_ARGS);              \
         default:                                                                   \
             TORCH_CHECK(false, "mnvl_bw_test: unsupported ar_unroll=", ar_unroll); \
     }
