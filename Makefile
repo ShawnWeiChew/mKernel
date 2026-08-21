@@ -133,12 +133,23 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots
+.PHONY: all clean bench check test-slot-math plots run_mnvl_bw_sweep
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
 
 gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
+
+# NVLink bandwidth sweep over the comm-tile config (bench/mnvl_bw_sweep.py).
+# Narrow the grid with SWEEP_ARGS, e.g.
+#   make SWEEP_ARGS="--shapes 8192 --ar-unroll 8" run_mnvl_bw_sweep
+SWEEP_ARGS ?=
+run_mnvl_bw_sweep : gemm_ar_blackwell
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/mnvl_bw_sweep.py $(SWEEP_ARGS)
+
+# ThunderKittens checkout used by the blackwell path. Override per box:
+#   make TK_INC=/path/to/ThunderKittens/include gemm_ar_blackwell
+TK_INC ?= /home/uccl/shawn/ThunderKittens/include
 
 # -fdevice-sanitize=memcheck instruments EVERY device memory access. That is
 # fine for the tcgen05/TMA compute path but ruinous for the multimem all-reduce
@@ -152,5 +163,5 @@ GEMM_AR_BLACKWELL_SANITIZE := -fdevice-sanitize=memcheck
 endif
 
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I/home/uccl/shawn/ThunderKittens/include \
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) -I$(TK_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@

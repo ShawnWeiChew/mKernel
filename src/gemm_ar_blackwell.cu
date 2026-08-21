@@ -438,6 +438,263 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
 }
 
+// ============================================================================
+// NVSwitch / NVLink bandwidth probe (mnvl_bw_test)
+// ============================================================================
+//
+// Standalone sweep harness: no GEMM, no barrier, no compute SMs — just the
+// multimem all-reduce loop from pipelined_ar_tile, parameterised over the tile
+// shape, the comm-SM count and the unroll depth. The question it answers is
+// "given an M x N output block, what is the smallest tile a comm CTA can be
+// handed before the NVSwitch, and not the tile walk, is the bottleneck?".
+//
+// Sweep axes (driven by bench/mnvl_bw_sweep.py):
+//   problem shape     4096, 8192, 16384, 32768
+//   NUM_COMM_SM       12, 16, 20, 24, 28, 32
+//   SUBTILE_M         128, 256   (the whole CLUSTER drives one output tile)
+//   SUBTILE_N         16, 32, 64, 128, 256
+//   AR_UNROLL         4, 8, 16
+//   SUPERGROUP_WIDTH  4, 8       (snake walk, same as the fused kernel)
+//
+// NUM_THREADS is pinned at 384 — the config the fused kernel is expected to
+// adopt. Only the axes that *must* be compile time are template parameters:
+// NUM_COMM_SM rides in on gridDim.x, which keeps the instantiation count at
+// 2*2*5*3 = 60 kernels instead of 360.
+//
+// Work split: device d owns the tile ids congruent to d mod NUM_DEVICES, so
+// the node as a whole covers every tile exactly once. That makes the output
+// checkable — see bench/mnvl_bw_sweep.py's --check mode — which matters,
+// because an index bug that silently skips tiles looks like a *faster* kernel.
+namespace mnvl_bw_test {
+
+static constexpr int NUM_THREADS = 384;
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int NT = NUM_THREADS>
+__device__ __forceinline__ void experimental_ar_unroll(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    // bf16_2 units — one 4-byte multimem access each.
+    static_assert(SUBTILE_N % 2 == 0, "SUBTILE_N must be even (bf16_2 units)");
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * NT;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * NT < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+            }
+        }
+    }
+}
+
+// __grid_constant__ is only legal on a __global__ function's parameters, so
+// the descriptors are taken by const reference here and the kernel stub below
+// is what actually owns the grid-constant copies.
+template <int SUPERGROUP_WIDTH,
+          int SUBTILE_M,
+          int SUBTILE_N,
+          int AR_UNROLL,
+          int NUM_DEVICES = config::NUM_DEVICES>
+__device__ __forceinline__ void fused_intranode_sm(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int M,
+    int N,
+    int dev_idx,
+    int num_repeats) {
+    const int num_comm_sm = gridDim.x;
+    const int comm_block_idx = blockIdx.x;
+    const int num_rows = M / SUBTILE_M;
+    const int num_cols = N / SUBTILE_N;
+    const int num_tiles_total = num_rows * num_cols;
+    const int tile_id_stride = NUM_DEVICES * num_comm_sm;
+
+    // Nothing in the loop mutates C_dist and multimem.st is a plain store, so
+    // replaying the walk is idempotent — it just amortises launch overhead at
+    // the small shapes, where a single pass is only a few microseconds.
+    for (int rep = 0; rep < num_repeats; rep++) {
+        for (int tile_id = dev_idx + comm_block_idx * NUM_DEVICES; tile_id < num_tiles_total;
+             tile_id += tile_id_stride) {
+            auto [tile_row_idx, tile_col_idx] =
+                calculate_tile_idx<SUPERGROUP_WIDTH>(num_rows, num_cols, tile_id);
+
+            const int row_base = tile_row_idx * SUBTILE_M;
+            const int col_base = tile_col_idx * SUBTILE_N;
+
+            experimental_ar_unroll<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+                C_dist, C_final, row_base, col_base);
+        }
+    }
+}
+
+template <int SUPERGROUP_WIDTH, int SUBTILE_M, int SUBTILE_N, int AR_UNROLL>
+__global__ __launch_bounds__(NUM_THREADS) void bw_test_kernel_stub(
+    // NOTE: by value, not by reference — a __grid_constant__ parameter is the
+    // link between the host-side descriptor and the kernel, so it has to be a
+    // copy living in the kernel's parameter space.
+    const __grid_constant__ fused_globals::C_distributed_tensor C_dist,
+    const __grid_constant__ fused_globals::C_final_tensor C_final,
+    int M,
+    int N,
+    int dev_idx,
+    int num_repeats) {
+    fused_intranode_sm<SUPERGROUP_WIDTH, SUBTILE_M, SUBTILE_N, AR_UNROLL>(
+        C_dist, C_final, M, N, dev_idx, num_repeats);
+}
+
+template <int SUPERGROUP_WIDTH, int SUBTILE_M, int SUBTILE_N, int AR_UNROLL>
+void launch_bw_test(const fused_globals::C_distributed_tensor& C_dist,
+                    const fused_globals::C_final_tensor& C_final,
+                    int M,
+                    int N,
+                    int dev_idx,
+                    int num_comm_sm,
+                    int num_repeats) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bw_test_kernel_stub<SUPERGROUP_WIDTH, SUBTILE_M, SUBTILE_N, AR_UNROLL>
+        <<<num_comm_sm, NUM_THREADS, 0, stream>>>(C_dist, C_final, M, N, dev_idx, num_repeats);
+}
+
+// Runtime -> compile-time dispatch. Nested so the axes stay readable; adding a
+// value to a sweep axis is a one-line change in the matching macro.
+#define MNVL_LAUNCH_ARGS C_dist, C_final, M, N, dev_idx, num_comm_sm, num_repeats
+
+#define MNVL_DISPATCH_UNROLL(SG, SM, SN)                                           \
+    switch (ar_unroll) {                                                           \
+        case 4:                                                                    \
+            return launch_bw_test<SG, SM, SN, 4>(MNVL_LAUNCH_ARGS);                \
+        case 8:                                                                    \
+            return launch_bw_test<SG, SM, SN, 8>(MNVL_LAUNCH_ARGS);                \
+        case 16:                                                                   \
+            return launch_bw_test<SG, SM, SN, 16>(MNVL_LAUNCH_ARGS);               \
+        default:                                                                   \
+            TORCH_CHECK(false, "mnvl_bw_test: unsupported ar_unroll=", ar_unroll); \
+    }
+
+#define MNVL_DISPATCH_SUBTILE_N(SG, SM)                                            \
+    switch (subtile_n) {                                                           \
+        case 16:                                                                   \
+            MNVL_DISPATCH_UNROLL(SG, SM, 16)                                       \
+        case 32:                                                                   \
+            MNVL_DISPATCH_UNROLL(SG, SM, 32)                                       \
+        case 64:                                                                   \
+            MNVL_DISPATCH_UNROLL(SG, SM, 64)                                       \
+        case 128:                                                                  \
+            MNVL_DISPATCH_UNROLL(SG, SM, 128)                                      \
+        case 256:                                                                  \
+            MNVL_DISPATCH_UNROLL(SG, SM, 256)                                      \
+        default:                                                                   \
+            TORCH_CHECK(false, "mnvl_bw_test: unsupported subtile_n=", subtile_n); \
+    }
+
+#define MNVL_DISPATCH_SUBTILE_M(SG)                                                \
+    switch (subtile_m) {                                                           \
+        case 128:                                                                  \
+            MNVL_DISPATCH_SUBTILE_N(SG, 128)                                       \
+        case 256:                                                                  \
+            MNVL_DISPATCH_SUBTILE_N(SG, 256)                                       \
+        default:                                                                   \
+            TORCH_CHECK(false, "mnvl_bw_test: unsupported subtile_m=", subtile_m); \
+    }
+
+// C and C_final are the two multicast buffers; M/N come from C's shape. The
+// tile shape, comm-SM count, unroll depth and supergroup width are the sweep
+// knobs, and num_repeats replays the tile walk inside one launch.
+void bw_test_entrypoint(dist::ParallelBuffer& C_buf,
+                        dist::ParallelBuffer& C_final_buf,
+                        int subtile_m,
+                        int subtile_n,
+                        int num_comm_sm,
+                        int ar_unroll,
+                        int supergroup_width,
+                        int num_repeats) {
+    const int dev_idx = C_buf.local_rank_;
+    c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    TORCH_CHECK(C_buf.data_.dim() == 2 && C_final_buf.data_.dim() == 2,
+                "mnvl_bw_test: expected 2D (M, N) buffers");
+    TORCH_CHECK(C_buf.data_.sizes() == C_final_buf.data_.sizes(),
+                "mnvl_bw_test: C and C_final must have the same shape");
+    TORCH_CHECK(C_buf.multicast_ && C_final_buf.multicast_,
+                "mnvl_bw_test: both buffers must be multicast-backed");
+
+    const int M = (int)C_buf.data_.size(0);
+    const int N = (int)C_buf.data_.size(1);
+
+    TORCH_CHECK(num_comm_sm > 0, "mnvl_bw_test: num_comm_sm must be positive");
+    TORCH_CHECK(num_repeats > 0, "mnvl_bw_test: num_repeats must be positive");
+    // The walk has no tail handling: a leftover partial tile is simply never
+    // all-reduced, which would quietly turn a correctness bug into a speedup.
+    TORCH_CHECK(subtile_m > 0 && M % subtile_m == 0,
+                "mnvl_bw_test: M=",
+                M,
+                " not divisible by subtile_m=",
+                subtile_m);
+    TORCH_CHECK(subtile_n > 0 && N % subtile_n == 0,
+                "mnvl_bw_test: N=",
+                N,
+                " not divisible by subtile_n=",
+                subtile_n);
+    // calculate_tile_idx is only a bijection when the column count fills whole
+    // supergroups; otherwise the last supergroup emits col_idx >= num_cols.
+    TORCH_CHECK((N / subtile_n) % supergroup_width == 0,
+                "mnvl_bw_test: num_cols=",
+                N / subtile_n,
+                " not divisible by supergroup_width=",
+                supergroup_width);
+
+    const auto C_dist =
+        ::dist::distributed_tensor_from_buffer<fused_globals::C_distributed_tensor>(C_buf);
+    const auto C_final =
+        ::dist::distributed_tensor_from_buffer<fused_globals::C_final_tensor>(C_final_buf);
+
+    switch (supergroup_width) {
+        case 4:
+            MNVL_DISPATCH_SUBTILE_M(4)
+        case 8:
+            MNVL_DISPATCH_SUBTILE_M(8)
+        default:
+            TORCH_CHECK(false, "mnvl_bw_test: unsupported supergroup_width=", supergroup_width);
+    }
+}
+
+#undef MNVL_DISPATCH_SUBTILE_M
+#undef MNVL_DISPATCH_SUBTILE_N
+#undef MNVL_DISPATCH_UNROLL
+#undef MNVL_LAUNCH_ARGS
+
+};  // namespace mnvl_bw_test
+
 };  // namespace gemm_ar_intranode_blackwell
 
 #include "operators/gemm_ar/gemm_ar_blackwell_session.cuh"
