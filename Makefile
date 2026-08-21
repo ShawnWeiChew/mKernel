@@ -76,7 +76,7 @@ COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BA
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
-                   -Xlinker -rpath -Xlinker $(TORCH_LIB)
+                   -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib
 
 COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 
@@ -136,7 +136,7 @@ plots:
 .PHONY: all clean bench check test-slot-math plots
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
-	python -m torch.distributed.run --standalone --nproc-per-node=4 bench/gemm_ar_blackwell_bench.py
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
 
 gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
 

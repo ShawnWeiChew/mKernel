@@ -26,7 +26,7 @@ template <int SUPERGROUP_WIDTH>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
-    static constexpr int NUM_BLOCKS = 152;
+    static constexpr int NUM_BLOCKS = 148;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int NUM_COMP_SM = 128;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
