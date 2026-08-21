@@ -453,13 +453,13 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
 //   NUM_COMM_SM       12, 16, 20, 24, 28, 32
 //   SUBTILE_M         128, 256   (the whole CLUSTER drives one output tile)
 //   SUBTILE_N         16, 32, 64, 128, 256
-//   AR_UNROLL         4, 8, 16
+//   AR_UNROLL         4, 8, 16, 32
 //   SUPERGROUP_WIDTH  4, 8       (snake walk, same as the fused kernel)
 //
 // NUM_THREADS is pinned at 384 — the config the fused kernel is expected to
 // adopt. Only the axes that *must* be compile time are template parameters:
 // NUM_COMM_SM rides in on gridDim.x, which keeps the instantiation count at
-// 2*2*5*3 = 60 kernels instead of 360.
+// 2*2*5*4 = 80 kernels instead of 480.
 //
 // Work split: device d owns the tile ids congruent to d mod NUM_DEVICES, so
 // the node as a whole covers every tile exactly once. That makes the output
@@ -483,7 +483,6 @@ __device__ __forceinline__ void experimental_ar_unroll(
 
     for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
         comm::bf16_2* ld_ptrs[AR_UNROLL];
-        comm::bf16_2* st_ptrs[AR_UNROLL];
         uint32_t tmps[AR_UNROLL];
 
         // Consecutive threads take consecutive bf16_2 units, so each warp's
@@ -495,7 +494,6 @@ __device__ __forceinline__ void experimental_ar_unroll(
                 const int r = row_base + j / UNITS_PER_ROW;
                 const int c = col_base + (j % UNITS_PER_ROW) * 2;
                 ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
-                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
             }
         }
 
@@ -511,7 +509,8 @@ __device__ __forceinline__ void experimental_ar_unroll(
 #pragma unroll
         for (int u = 0; u < AR_UNROLL; u++) {
             if (base + u * NT < TOTAL_UNITS) {
-                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
+                    ld_ptrs[u] + (C_final.mc_ptr - C_dist.mc_ptr), tmps[u]);
             }
         }
     }
@@ -597,6 +596,8 @@ void launch_bw_test(const fused_globals::C_distributed_tensor& C_dist,
             return launch_bw_test<SG, SM, SN, 8>(MNVL_LAUNCH_ARGS);                \
         case 16:                                                                   \
             return launch_bw_test<SG, SM, SN, 16>(MNVL_LAUNCH_ARGS);               \
+        case 32:                                                                   \
+            return launch_bw_test<SG, SM, SN, 32>(MNVL_LAUNCH_ARGS);               \
         default:                                                                   \
             TORCH_CHECK(false, "mnvl_bw_test: unsupported ar_unroll=", ar_unroll); \
     }

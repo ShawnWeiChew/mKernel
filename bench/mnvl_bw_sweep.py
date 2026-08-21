@@ -12,7 +12,7 @@ Launch (one process per GPU, single node):
     python -m torch.distributed.run --standalone --nproc-per-node=8 \
         bench/mnvl_bw_sweep.py
 
-The full default grid is 2*5*6*3*2 = 360 configs per shape. Narrow it while
+The full default grid is 2*5*6*4*2 = 480 configs per shape. Narrow it while
 exploring, e.g.:
 
     ... bench/mnvl_bw_sweep.py --shapes 8192 --subtile-m 128 \
@@ -59,7 +59,7 @@ DEFAULT_SHAPES = [4096, 8192, 16384, 32768]
 DEFAULT_SUBTILE_M = [128, 256]
 DEFAULT_SUBTILE_N = [16, 32, 64, 128, 256]
 DEFAULT_COMM_SMS = [12, 16, 20, 24, 28, 32]
-DEFAULT_AR_UNROLL = [4, 8, 16]
+DEFAULT_AR_UNROLL = [4, 8, 16, 32]
 DEFAULT_SUPERGROUP = [4, 8]
 
 # Correctness pattern: value(i, j) = ((i + j) % period + 1) * (rank + 1), so the
@@ -375,6 +375,15 @@ def main() -> int:
                 if is_chief:
                     print(f"  [ceiling] nccl all_reduce: {nccl_ms:.4f} ms  "
                           f"{nccl_ar:.1f} GB/s alg  {nccl_bus:.1f} GB/s bus", flush=True)
+                    if repeats > 1:
+                        # The sweep kernel replays the walk inside ONE launch;
+                        # NCCL cannot, so it pays a launch and a rendezvous per
+                        # repeat while the sweep pays one for all of them.
+                        print(f"  [ceiling] NOTE repeats={repeats}: the sweep amortises "
+                              f"launch + rendezvous over all {repeats} passes and NCCL "
+                              f"does not, so '% of nccl' flatters the sweep here. "
+                              f"Use --repeats 1, or read it off the large shapes.",
+                              flush=True)
                 dist.barrier()
 
             if is_chief:
