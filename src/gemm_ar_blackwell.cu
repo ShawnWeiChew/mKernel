@@ -357,12 +357,28 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // TODO: what if I have number of threads that is equal to the number of devices I
             // want to signal???
 
-            // Along a veritcal block, CTA0: 0, 1, CTA1: 2, 3
-            // signal at 128*256 granularity, using linear tile id
-            const int device_to_signal = tile_id % config::NUM_DEVICES;
-            dist::signal(G.comp_comm_barrier, {tile_row_id, tile_col_id}, device_to_signal, 1);
-            dist::signal(
-                G.comp_comm_barrier, {tile_row_id + 1, tile_col_id}, device_to_signal + 1, 1);
+            // Signal at 128*256 granularity: one signal per epilogue warpgroup,
+            // for the exact row tile that warpgroup just stored. The barrier is
+            // keyed in C_tile rows (ROW_BLOCK / CONSUMER_WARPS), the same space
+            // fused_intranode_sm decodes into, so the cluster row has to be
+            // scaled up the same way the epilogue coordinate was.
+            const int c_row_tile = tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
+                cta_row_tile_base + warpgroup_id;
+
+            // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
+            // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
+            // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
+            // cluster tile -- so the destination is the sub-row index itself,
+            // not a function of tile_id.
+            const int device_to_signal = cta_row_tile_base + warpgroup_id;
+
+            // One arrival per device per tile: the receiver waits for exactly
+            // NUM_DEVICES, so this must fire from a single thread -- and it has
+            // to be the same thread that issued the stores above, since
+            // store_async_wait only orders that thread's own TMA group.
+            if (warpgroup::laneid() == 0) {
+                dist::signal(G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
+            }
         }
     }
 }
@@ -476,7 +492,11 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 
 template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    fused_comp_sm<SUPERGROUP_WIDTH>(G);
+    if (blockIdx.x < config::NUM_COMP_SM) {
+        fused_comp_sm<SUPERGROUP_WIDTH>(G);
+    } else {
+        fused_intranode_sm<SUPERGROUP_WIDTH>(G);
+    }
 }
 
 template <int SUPERGROUP_WIDTH>
@@ -494,10 +514,24 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH>;
+
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
-    // timing window.
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH>;
+    // timing window. The attribute is per-device state though, so the guard has
+    // to be per-device: a single static flag would leave every device but the
+    // first one at the 48KB default.
+    constexpr int MAX_LOCAL_DEVICES = 8;
+    int dev = 0;
+    MKERNEL_CUDACHECK(cudaGetDevice(&dev));
+    static bool smem_configured[MAX_LOCAL_DEVICES] = {};
+    if (dev >= MAX_LOCAL_DEVICES || !smem_configured[dev]) {
+        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+            this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        if (dev < MAX_LOCAL_DEVICES) {
+            smem_configured[dev] = true;
+        }
+    }
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
