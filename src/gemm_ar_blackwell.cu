@@ -293,6 +293,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 prof.start(ProfilerTag::Epilogue);
             }
         }
+        // Bind the output descriptor once. G.C_dist[G.dev_idx] is a runtime
+        // index into the grid-constant bank, so leaving it in the store loop
+        // makes ptxas re-derive it (LDC with a register offset) every chunk.
+        const auto& C_out = G.C_dist[G.dev_idx];
         constexpr int C_CHUNK_COLS = fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES;
         // Only one wave's worth of chunks is live at a time. Holding all
         // EPILOGUE_STAGES costs 128 of this CTA's 168 registers and pushes the
@@ -338,7 +342,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                     // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
                     // column coordinate counts chunks, not COL_BLOCK tiles.
                     dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        G.C_dist[G.dev_idx],
+                        C_out,
                         C_smem[warpgroup_id][i % fused_globals::NUM_C_TILES],
                         {tile_row_idx, tile_col_idx * fused_globals::EPILOGUE_STAGES + i});
                 }
@@ -363,7 +367,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     // producer + consumers share the tail warpgroup(s)
     if (warpgroup_id >= config::EPILOGUE_WARPGROUPS) {
-        // warpgroup::decrease_registers<152>();
+        warpgroup::decrease_registers<config::MAINLOOP_REGISTERS>();
 
         if (warp_id == config::PRODUCER_WARP_ID) {
             if (elect_warp_leader()) {
@@ -398,6 +402,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             }
         }
     } else {
+        warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
+
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
         tmem[0] =

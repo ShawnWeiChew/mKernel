@@ -51,7 +51,9 @@ struct config {
     static constexpr int CONSUMER_WARPS = 2;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = 4 * CONSUMER_WARPS;
-    static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
+    // +1 padding warp: setmaxnreg is .sync.aligned over a whole warpgroup, so
+    // the producer/consumer tail has to be a complete one.
+    static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS + 1;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
     static constexpr int NUM_CLUSTERS = 2;
 
@@ -88,13 +90,23 @@ struct config {
     static_assert(ALLOC_WARPS * kittens::WARP_THREADS * REGISTER_CEILING <= 65536,
                   "Register request does not fit the per-SM register file");
 
-    // setmaxnreg is deliberately NOT used here. It only redistributes registers
-    // between warpgroups at runtime; ptxas still compiles the whole kernel to a
-    // single register count, so the epilogue can never NAME more registers than
-    // that and an `inc` above it buys nothing -- while an `inc` above the
-    // ceiling has nothing to draw from and hangs. Measured at 168: 20B/52B of
-    // spill with a 224/56 split, the same 20B/52B without it.
+    static constexpr int NUM_WARPGROUPS = NUM_WARPS / kittens::WARPGROUP_WARPS;
+    static constexpr int EPILOGUE_REGISTERS = 224;
+    static constexpr int MAINLOOP_REGISTERS = 56;
+    static_assert(EPILOGUE_REGISTERS * EPILOGUE_WARPGROUPS +
+                      MAINLOOP_REGISTERS * (NUM_WARPGROUPS - EPILOGUE_WARPGROUPS) <=
+                  REGISTER_CEILING * NUM_WARPGROUPS,
+                  "Register split over-subscribes the launch register pool");
 
+    // Measured on sm_103a, shipping kernel, EPILOGUE_WAVES=1:
+    //   no split (168/168) ... 60B/172B spill
+    //   224/56, 208/88, 192/120 ... 20B/52B spill (byte-identical)
+    // So the split is worth having, but its exact value is not sensitive -- any
+    // of them leaves the epilogue store loop completely clean (smem addresses
+    // stay in registers, no LDL between the STSMs). What is left is two scalars
+    // spilled in the common prologue and reloaded at each branch entry, because
+    // they have to survive the role dispatch. 224/56 matches TK's
+    // bf16_b200 non-overlap config, which has the same 12-warp shape.
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
 
@@ -120,7 +132,7 @@ struct fused_globals {
     // the hardware allows this CTA and leaves ptxas nothing for the swizzled
     // C_smem addresses -- it spills them and reloads on every unrolled store.
     // Splitting into waves trades a later TMEM release for those registers.
-    static constexpr int EPILOGUE_WAVES = 2;
+    static constexpr int EPILOGUE_WAVES = 1;
     static_assert(EPILOGUE_STAGES % EPILOGUE_WAVES == 0,
                   "The column split must divide evenly into epilogue waves");
     static constexpr int CHUNKS_PER_WAVE = EPILOGUE_STAGES / EPILOGUE_WAVES;
