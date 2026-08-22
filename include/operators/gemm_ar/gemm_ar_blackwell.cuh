@@ -44,14 +44,13 @@ struct config {
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int NUM_COMP_SM = 148;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
-    // static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
     // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
     // Maybe I can also save some SMs just for all-reduce?
     // I need to have a regular epilogue, and then do the all reduce -- maybe I can save SMs just
     // for this
-    static constexpr int CONSUMER_WARPS = 1;
+    static constexpr int CONSUMER_WARPS = 2;
     static constexpr int PRODUCER_WARPS = 1;
-    static constexpr int EPILOGUE_WARPS = 4;
+    static constexpr int EPILOGUE_WARPS = 4 * CONSUMER_WARPS;
     static constexpr int NUM_CLUSTERS = 2;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
@@ -60,21 +59,23 @@ struct config {
 };
 
 struct fused_globals {
-    // TODO: tune
-    static constexpr int PIPELINE_STAGES = 5;
+    static constexpr int PIPELINE_STAGES = 4;
     // Accumulator stages in TMEM. Each C_tt_tile is COL_BLOCK float columns
     // wide and TMEM only has MAX_TENSOR_COLS of them, so with COL_BLOCK == 256
     // exactly two accumulators fit. This is what epilogue_stage_id rings over.
-    static constexpr int EPILOGUE_STAGES = 2;
+
     // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
     // that NUM_C_TILES is larger at bigger tile sizes
     // the benefit of this is that we can save on SMEM budget to expand later
-    static constexpr int NUM_C_TILES = 8;
-    static constexpr int ROW_BLOCK = 128;
+    // EPILOGUE STAGES states how many times we split the epilogue loads
+    static constexpr int EPILOGUE_STAGES = 8;
+    // C tiles states how many C tiles can be in flight at any one time
+    static constexpr int NUM_C_TILES = 2;
+    static constexpr int ROW_BLOCK = 256;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
-    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
+    using A_tile = kittens::st_bf<ROW_BLOCK / config::CONSUMER_WARPS, RED_BLOCK>;
 
     // NOTE: I am storing it as BT
     static_assert(COL_BLOCK % config::NUM_CLUSTERS == 0, "COL_BLOCK should be divisible");
@@ -82,14 +83,15 @@ struct fused_globals {
     // TODO: benchmark against writing to SMEM and then to GMEM,
     // compared to just writing to GMEM
 
-    using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
+    using C_tt_tile =
+        kittens::tt<float, ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK / EPILOGUE_STAGES>;
     static_assert(EPILOGUE_STAGES * C_tt_tile::cols <= kittens::MAX_TENSOR_COLS,
                   "The TMEM accumulators for all epilogue stages must fit in tensor memory");
 
     // The epilogue splits one COL_BLOCK-wide accumulator into NUM_C_TILES column
     // chunks and pushes them out through NUM_C_TILES shared staging buffers.
     static_assert(COL_BLOCK % NUM_C_TILES == 0, "COL_BLOCK should be divisible");
-    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / NUM_C_TILES>;
+    using C_tile = kittens::st_bf<ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK / EPILOGUE_STAGES>;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
@@ -120,7 +122,7 @@ struct fused_globals {
     int K;
 
     struct pipeline_inputs {
-        A_tile A;
+        A_tile A[2];
         B_tile B;
     };
 
