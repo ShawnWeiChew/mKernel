@@ -242,6 +242,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         warpgroup::sync(epilogue_barrier);
 
         // signal tmem empty
+        // TODO: figure out where to put PDL
         if (elect_warp_leader()) {
             if (is_last_tile && warp_id == 0) {
                 pdl::arrive();
@@ -408,9 +409,15 @@ constexpr int AR_UNROLL = 8;
 __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base) {
+    // The comm side works in C_tile rows (ROW_BLOCK / CONSUMER_WARPS), which is
+    // the granularity the epilogue signals at and the granularity row_base is
+    // computed in. Walking a full ROW_BLOCK from it spills into the next row
+    // tile, and on the last one runs off the end of the M x N buffer.
+    constexpr int AR_ROWS = fused_globals::ROW_BLOCK / config::CONSUMER_WARPS;  // 128
+
     // bf16_2 units — one 4-byte multimem access each.
-    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;            // 128
-    constexpr int TOTAL_UNITS = fused_globals::ROW_BLOCK * UNITS_PER_ROW;  // 16384
+    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;  // 128
+    constexpr int TOTAL_UNITS = AR_ROWS * UNITS_PER_ROW;         // 16384
     constexpr int NT = config::NUM_THREADS;
     constexpr int BATCH = AR_UNROLL * NT;
 
