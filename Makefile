@@ -195,8 +195,9 @@ $(BUILD)/tk_gemm_shim.o : $(STANDALONE_DIR)/tk_gemm_shim.cu | $(BUILD)
 # mKernel TU + link. stub_include/ must precede include/ so the pybind session
 # header at the tail of src/gemm_ar_blackwell.cu is shadowed away.
 $(BUILD)/gemm_blackwell_standalone : $(STANDALONE_DIR)/gemm_blackwell_standalone.cu \
-                                     $(SRC)/gemm_ar_blackwell.cu $(STANDALONE_TK_OBJ) | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) -lineinfo $(COMMON_DEFINES) $(STANDALONE_TK_DEF) \
+                                     $(SRC)/gemm_ar_blackwell.cu $(SRC)/gemm_bf16_test.cu \
+                                     $(STANDALONE_TK_OBJ) | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) $(STANDALONE_TK_DEF) \
 	    -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell \
 	    $(STANDALONE_INC) $(COMMON_INC) -I$(TK_ROOT)/include \
 	    $(STANDALONE_LD) \

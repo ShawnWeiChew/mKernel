@@ -49,12 +49,14 @@
 
 // The real kernel. stub_include/ must precede include/ on the -I line.
 #include "../../src/gemm_ar_blackwell.cu"
+#include "../../src/gemm_bf16_test.cu"
 
 #ifndef INTRA_NUM_DEVICES
 #define INTRA_NUM_DEVICES 8
 #endif
 
 namespace gab = gemm_ar_intranode_blackwell;
+namespace gbt = gemm_bf16_test;
 using bf16 = __nv_bfloat16;
 
 #ifdef WITH_TK
@@ -261,6 +263,26 @@ static void launch_mkernel(const gab::fused_globals& G, cudaStream_t s) {
     }
 }
 
+// Experimental variant: B as N x K (mm2_ABt) into a plain global tensor.
+static gbt::test_globals make_test_globals(bf16* dA, bf16* dBt, bf16* dC, int M, int N, int K) {
+    using TG = gbt::test_globals;
+    return TG{
+        .A = TG::A_gl(dA, nullptr, nullptr, (size_t)M, (size_t)K),
+        .B = TG::B_gl(dBt, nullptr, nullptr, (size_t)N, (size_t)K),  // N x K
+        .C = TG::C_gl(dC, nullptr, nullptr, (size_t)M, (size_t)N),
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+}
+
+static void launch_mkernel_test(const gbt::test_globals& G, cudaStream_t s) {
+    if (G.M == 2048)
+        gbt::launch_gemm_bf16_test<4>(G, s);
+    else
+        gbt::launch_gemm_bf16_test<8>(G, s);
+}
+
 // ---------------------------------------------------------------------------
 // Timing protocol
 // ---------------------------------------------------------------------------
@@ -445,7 +467,9 @@ static void run_shape(int M, int N, int K, const BenchOpts& o) {
     std::vector<bf16*> A(groups), B(groups), Bt(groups), C(groups);
     std::vector<int*> Bar(groups);
     std::vector<gab::fused_globals> G;
+    std::vector<gbt::test_globals> Gt;
     G.reserve(groups);
+    Gt.reserve(groups);
 
     for (int i = 0; i < groups; ++i) {
         CUDA_OK(cudaMalloc(&A[i], nA * sizeof(bf16)));
@@ -462,6 +486,7 @@ static void run_shape(int M, int N, int K, const BenchOpts& o) {
         transpose_kn_to_nk<<<tg, tb>>>(B[i], Bt[i], K, N);
 
         G.push_back(make_globals(A[i], B[i], C[i], Bar[i], M, N, K));
+        Gt.push_back(make_test_globals(A[i], Bt[i], C[i], M, N, K));
     }
 #ifdef WITH_TK
     // TK consumes B as N x K, so it gets Bt. Handles are created once, outside
@@ -589,6 +614,8 @@ static void run_shape(int M, int N, int K, const BenchOpts& o) {
     }
 #endif
     arms.push_back({"mkernel    (B is KxN)", [&](int g) { launch_mkernel(G[g], s); }, {}});
+    arms.push_back(
+        {"mkernel-t  (B is NxK)", [&](int g) { launch_mkernel_test(Gt[g], s); }, {}});
 
     std::vector<CheckResult> checks;
     for (Arm& a : arms) {
