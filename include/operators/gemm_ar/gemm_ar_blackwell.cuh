@@ -113,6 +113,17 @@ struct fused_globals {
     // store_async_read_wait below stops covering the buffer being overwritten.
     static_assert(EPILOGUE_STAGES % NUM_C_TILES == 0,
                   "The column split must be a whole number of staging-buffer rings");
+    // How many passes the epilogue makes over its accumulator. Every chunk it
+    // holds live costs (ROW_BLOCK / CONSUMER_WARPS) * (COL_BLOCK /
+    // EPILOGUE_STAGES) bf16 spread over a warpgroup = 16 registers per thread,
+    // so pulling all EPILOGUE_STAGES out at once costs 128 of the 168 registers
+    // the hardware allows this CTA and leaves ptxas nothing for the swizzled
+    // C_smem addresses -- it spills them and reloads on every unrolled store.
+    // Splitting into waves trades a later TMEM release for those registers.
+    static constexpr int EPILOGUE_WAVES = 2;
+    static_assert(EPILOGUE_STAGES % EPILOGUE_WAVES == 0,
+                  "The column split must divide evenly into epilogue waves");
+    static constexpr int CHUNKS_PER_WAVE = EPILOGUE_STAGES / EPILOGUE_WAVES;
     static constexpr int ROW_BLOCK = 256;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
