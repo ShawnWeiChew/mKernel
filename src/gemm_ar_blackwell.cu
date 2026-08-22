@@ -23,16 +23,17 @@
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
 #include "memory/tk_ops_group_group.cuh"
-// clang-format off
-// this has to go under tk_ops_group_group
-#include "dist/tma.cuh"
-// clang-format on
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_util_sync.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
 #include "memory/tk_ops_thread_util_util.cuh"
 #include "operators/gemm_ar/gemm_ar_blackwell.cuh"
 #include "operators/gemm_ar/profiler.h"
+// clang-format off
+// this has to go under tk_ops_group_group
+#include "dist/tma.cuh"
+#include "memory/tk_ops_group_util_util.cuh"
+// clang-format on
 
 using namespace kittens;
 
@@ -137,7 +138,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
 
-    everyone::tma::cluster::sync();
+    // normally, it has to be a full sync(), but since we are waiting on the PDL launch later in the
+    // code, we can just arrive here, then wait later
+    everyone::tma::cluster::arrive_aligned();
     if constexpr (DO_PROFILE) {
         if (elect_warp_leader()) {
             prof.stop();
@@ -274,7 +277,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     auto epilogue = [&](int tile_row_idx,
                         int tile_col_idx,
                         fused_globals::C_tt_tile* tmem,
-                        const int warpgroup_id) {
+                        const int warpgroup_id,
+                        bool is_last_tile) {
         if constexpr (DO_PROFILE) {
             if (elect_warp_leader()) {
                 prof.start(ProfilerTag::WaitMainloop);
@@ -286,7 +290,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 prof.stop();
             }
         }
-        tensor_after_thread_sync();
 
         if constexpr (DO_PROFILE) {
             if (elect_warp_leader()) {
@@ -313,9 +316,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                         i * C_CHUNK_COLS));
         }
         tensor_load_wait();
+        warpgroup::sync(epilogue_barrier);
 
         // signal tmem empty
         if (elect_warp_leader()) {
+            if (is_last_tile && warp_id == 0) {
+                pdl::arrive();
+            }
             // TODO: move this into dist namespace
             tma::cluster::arrive(epilogue_finished[warpgroup_id], 0);
         }
@@ -361,6 +368,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         if (warp_id == config::PRODUCER_WARP_ID) {
             if (elect_warp_leader()) {
+                pdl::wait();
+                // NOTE: This splits up the arrive at the top and interleaves the work in between
+                everyone::tma::cluster::wait();
                 int input_stage_id = 0;
                 for (int tile_id = cluster_idx; tile_id < num_tiles_total;
                      tile_id += num_comp_clusters) {
@@ -378,6 +388,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if (cta_rank == 0 && elect_warp_leader()) {
                 // consumer_id pairs this warp with epilogue warpgroup
                 // consumer_id: same A tile, same accumulator, same semaphores.
+                everyone::tma::cluster::wait();
                 const int consumer_id = warp_id - config::FIRST_CONSUMER_WARP_ID;
 
                 // give each warp its own view of tmem
@@ -409,7 +420,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                          cta_row_tile_base + warpgroup_id,
                      tile_col_id,
                      tmem,
-                     warpgroup_id);
+                     warpgroup_id,
+                     tile_id + num_comp_clusters >= num_tiles_total);
         }
     }
 
@@ -530,8 +542,8 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
 
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
-    __launch_bounds__(config::NUM_THREADS, 1) void gemm_ar_fused_kernel_stub(
-        const __grid_constant__ fused_globals G) {
+    __launch_bounds__(config::NUM_THREADS,
+                      1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
     fused_kernel<SUPERGROUP_WIDTH, DO_PROFILE>(G);
 }
 
@@ -547,14 +559,20 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     // set once — doing it per launch puts a host API call inside the caller's
     // timing window.
     auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, DO_PROFILE>;
-    static const bool smem_configured = [&] {
-        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-            this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        return true;
-    }();
-    (void)smem_configured;
 
-    this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = grid;
+    launch_config.blockDim = num_threads;
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+
+    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 }
 
 };  // namespace gemm_ar_intranode_blackwell
