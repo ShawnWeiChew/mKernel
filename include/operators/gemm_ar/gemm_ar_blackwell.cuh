@@ -51,19 +51,53 @@ struct config {
     static constexpr int CONSUMER_WARPS = 2;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = 4 * CONSUMER_WARPS;
-    static constexpr int NUM_CLUSTERS = 2;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+    static constexpr int NUM_CLUSTERS = 2;
+
+    // Warp layout, low to high: EPILOGUE_WARPS epilogue warps, one producer,
+    // then CONSUMER_WARPS consumers.
+    static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
+    static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
+
+    // The epilogue dispatches per warpgroup (it uses warpgroup:: collectives and
+    // one named barrier per warpgroup), so its warps have to fill whole ones and
+    // the producer/consumer warps must sit above them. Those tail warps only
+    // ever run warp-scoped code, so they are free to be a partial warpgroup.
+    static constexpr int EPILOGUE_WARPGROUPS = EPILOGUE_WARPS / kittens::WARPGROUP_WARPS;
+    static_assert(EPILOGUE_WARPS % kittens::WARPGROUP_WARPS == 0,
+                  "The epilogue warps must form whole warpgroups");
+    static_assert(FIRST_CONSUMER_WARP_ID / kittens::WARPGROUP_WARPS >= EPILOGUE_WARPGROUPS,
+                  "Producer/consumer warps must not share a warpgroup with the epilogue");
+
+    // Register budget. The kernel is pinned with __maxnreg__ rather than
+    // __launch_bounds__ (they are mutually exclusive) because ptxas derives the
+    // launch-bounds cap from the block rounded up to a 128-thread occupancy
+    // bucket: at 352 threads it budgets for 384 and caps at 65536/384 -> 168,
+    // which is below the ~185 this kernel actually wants and costs ~20B of
+    // spill. __maxnreg__ lets us ask for the real per-thread share of the 64K
+    // register file instead. Keep it <= 65536/NUM_THREADS or the launch fails
+    // with "too many resources requested".
+    //
+    // setmaxnreg is deliberately NOT used here. It only redistributes registers
+    // between warpgroups at runtime; ptxas still compiles the whole kernel to
+    // one register count, so the epilogue can never name more registers than
+    // that and an `inc` above it buys nothing. Measured: 12 warps + a 224/56
+    // split gave 168 registers and 20B/52B of spill, this gives 184 and 4B/12B
+    // (all of it cold prologue code, none in the epilogue loop).
+    static constexpr int MAX_REGISTERS_PER_THREAD = 248;  // hardware cap, rounded to 8
+    static constexpr int LAUNCH_REGISTERS =
+        (65536 / NUM_THREADS / 8) * 8 < MAX_REGISTERS_PER_THREAD
+            ? (65536 / NUM_THREADS / 8) * 8
+            : MAX_REGISTERS_PER_THREAD;
+    static_assert(NUM_THREADS * LAUNCH_REGISTERS <= 65536,
+                  "Register request does not fit the per-SM register file");
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
 
 struct fused_globals {
     static constexpr int PIPELINE_STAGES = 4;
-    // Accumulator stages in TMEM. Each C_tt_tile is COL_BLOCK float columns
-    // wide and TMEM only has MAX_TENSOR_COLS of them, so with COL_BLOCK == 256
-    // exactly two accumulators fit. This is what epilogue_stage_id rings over.
-
     // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
     // that NUM_C_TILES is larger at bigger tile sizes
     // the benefit of this is that we can save on SMEM budget to expand later
@@ -71,6 +105,12 @@ struct fused_globals {
     static constexpr int EPILOGUE_STAGES = 8;
     // C tiles states how many C tiles can be in flight at any one time
     static constexpr int NUM_C_TILES = 2;
+    // The staging buffers are indexed `chunk % NUM_C_TILES`, and the chunk
+    // counter restarts at 0 on every output tile -- if the split does not
+    // divide evenly the ring skips a buffer at the seam and the
+    // store_async_read_wait below stops covering the buffer being overwritten.
+    static_assert(EPILOGUE_STAGES % NUM_C_TILES == 0,
+                  "The column split must be a whole number of staging-buffer rings");
     static constexpr int ROW_BLOCK = 256;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
@@ -83,14 +123,16 @@ struct fused_globals {
     // TODO: benchmark against writing to SMEM and then to GMEM,
     // compared to just writing to GMEM
 
-    using C_tt_tile =
-        kittens::tt<float, ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK / EPILOGUE_STAGES>;
-    static_assert(EPILOGUE_STAGES * C_tt_tile::cols <= kittens::MAX_TENSOR_COLS,
-                  "The TMEM accumulators for all epilogue stages must fit in tensor memory");
+    // One accumulator per consumer -- each consumer runs its own cta_group::2
+    // MMA over its own half of the CTA's rows, so they cannot share TMEM.
+    using C_tt_tile = kittens::tt<float, ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK>;
+    static_assert(config::CONSUMER_WARPS * C_tt_tile::cols <= kittens::MAX_TENSOR_COLS,
+                  "The TMEM accumulators for all consumers must fit in tensor memory");
 
-    // The epilogue splits one COL_BLOCK-wide accumulator into NUM_C_TILES column
-    // chunks and pushes them out through NUM_C_TILES shared staging buffers.
-    static_assert(COL_BLOCK % NUM_C_TILES == 0, "COL_BLOCK should be divisible");
+    // The epilogue splits one COL_BLOCK-wide accumulator into EPILOGUE_STAGES
+    // column chunks and pushes them out through NUM_C_TILES shared staging
+    // buffers, so a C_tile is one chunk wide.
+    static_assert(COL_BLOCK % EPILOGUE_STAGES == 0, "COL_BLOCK should be divisible");
     using C_tile = kittens::st_bf<ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK / EPILOGUE_STAGES>;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
@@ -122,7 +164,8 @@ struct fused_globals {
     int K;
 
     struct pipeline_inputs {
-        A_tile A[2];
+        // One A tile per consumer (its own row half); B is shared by both.
+        A_tile A[config::CONSUMER_WARPS];
         B_tile B;
     };
 

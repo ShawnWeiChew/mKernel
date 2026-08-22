@@ -42,16 +42,26 @@ TAGS = [
 ]
 
 # Must match config:: in include/operators/gemm_ar/gemm_ar_blackwell.cuh.
+# The kernel keys its profiler slot on blockIdx.x * NUM_WARPS + warp_id, so an
+# undersized NUM_WARPS here is an out-of-bounds write, not just a bad decode.
 NUM_BLOCKS = 148
-NUM_WARPS = 6  # 4 epilogue + 1 producer + 1 consumer
+EPILOGUE_WARPS = 8
+PRODUCER_WARPS = 1
+CONSUMER_WARPS = 2
+# +1 padding warp, so the CTA is whole warpgroups for setmaxnreg.
+NUM_WARPS = EPILOGUE_WARPS + PRODUCER_WARPS + CONSUMER_WARPS + 1
 
 WARMUP = 5
 
 
 def warp_role(warp: int) -> str:
-    if warp < 4:
+    if warp < EPILOGUE_WARPS:
         return "epilogue"
-    return "producer" if warp == 4 else "consumer"
+    if warp < EPILOGUE_WARPS + PRODUCER_WARPS:
+        return "producer"
+    if warp < EPILOGUE_WARPS + PRODUCER_WARPS + CONSUMER_WARPS:
+        return "consumer"
+    return "padding"
 
 
 def decode(profiler: torch.Tensor, num_entries: int):

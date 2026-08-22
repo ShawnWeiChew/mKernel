@@ -62,11 +62,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     if constexpr (DO_PROFILE) {
         if (elect_warp_leader()) {
-            // One slot per WARP, not per block: the six warps here play
-            // different roles (0-3 epilogue, 4 producer, 5 consumer) and each
-            // records its own timeline. Keying on blockIdx.x alone would have
-            // all six interleave writes into one row and clobber each other's
-            // counters.
+            // One slot per WARP, not per block: the warps here play different
+            // roles (see the config::*_WARP_ID layout) and each records its own
+            // timeline. Keying on blockIdx.x alone would have them all
+            // interleave writes into one row and clobber each other's counters.
+            // The host buffer must have config::NUM_WARPS rows per block.
             prof.init(G.num_entries, G.data_ptr, blockIdx.x * config::NUM_WARPS + warp_id);
             prof.start(ProfilerTag::Setup);
         }
@@ -108,8 +108,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
 
-    // combined phasebits, one bit per barrier array (each flips once per full
-    // ring traversal, so the bit is toggled when the stage index wraps to 0):
+    // combined phasebits, one bit per barrier array. A bit is toggled once per
+    // full ring traversal of its array, i.e. when the stage index wraps to 0 --
+    // the epilogue rings hold a single barrier per consumer, so their bits flip
+    // on every iteration.
     // bit 4-5: epilogue_ready (consumer 0 & consumer 1)   - starts at 0
     // bit 2-3: epilogue_finished (consumer 0 & consumer 1) - starts at 1
     // these two stay the same since the mma and tma are
@@ -142,8 +144,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     }
 
-    // tile_row_idx is this CTA's A row tile (ROW_BLOCK units, already rank
-    // adjusted); tile_col_idx is the cluster's C column tile (COL_BLOCK units).
+    // tile_row_idx is this CTA's FIRST A row tile, in A_tile units
+    // (ROW_BLOCK / CONSUMER_WARPS rows, already rank adjusted) -- consumer c
+    // takes the tile c further along, which is the same row tile its epilogue
+    // warpgroup stores back. tile_col_idx is the cluster's C column tile
+    // (COL_BLOCK units).
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
@@ -167,13 +172,12 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
 #pragma unroll
             for (int c = 0; c < config::CONSUMER_WARPS; c++) {
-                tma::cluster::load_async(
-                    inputs_smem[input_stage_id].A[c],
-                    G.A,
-                    {tile_row_idx + (c * fused_globals::ROW_BLOCK / config::CONSUMER_WARPS), i},
-                    tma_load[input_stage_id],
-                    (uint16_t)(1 << cta_rank),
-                    0);
+                tma::cluster::load_async(inputs_smem[input_stage_id].A[c],
+                                         G.A,
+                                         {tile_row_idx + c, i},
+                                         tma_load[input_stage_id],
+                                         (uint16_t)(1 << cta_rank),
+                                         0);
             }
 
             tma::cluster::load_async(B_smem,
@@ -198,14 +202,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     };
 
     // each only handles 16
-    auto consume = [&](int& input_stage_id,
-                       int& epilogue_stage_id,
-                       fused_globals::C_tt_tile* tmem,
-                       const int consumer_id) {
+    auto consume = [&](int& input_stage_id, fused_globals::C_tt_tile* tmem, const int consumer_id) {
         if constexpr (DO_PROFILE) {
             prof.start(ProfilerTag::WaitEpilogue);
         }
-        wait(epilogue_finished[epilogue_stage_id], (phasebits >> (2 + consumer_id)) & 0b1);
+        wait(epilogue_finished[consumer_id], (phasebits >> (2 + consumer_id)) & 0b1);
         if constexpr (DO_PROFILE) {
             prof.stop();
         }
@@ -225,7 +226,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if constexpr (DO_PROFILE) {
                 prof.start(ProfilerTag::IssueMMA);
             }
-            mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mm2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
             if constexpr (DO_PROFILE) {
                 prof.stop();
             }
@@ -252,7 +253,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if constexpr (DO_PROFILE) {
                 prof.start(ProfilerTag::IssueMMA);
             }
-            mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mma2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
             if constexpr (DO_PROFILE) {
                 prof.stop();
             }
@@ -265,15 +266,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         kittens::detail::tcgen05::commit<config::NUM_CLUSTERS>(epilogue_ready[consumer_id]);
 
-        epilogue_stage_id = (epilogue_stage_id + 1) % config::CONSUMER_WARPS;
-        if (epilogue_stage_id == 0) {
-            phasebits ^= (1 << (2 + consumer_id));
-        }
+        // This consumer owns exactly one accumulator, so epilogue_finished
+        // completes once per output tile and its phase flips every iteration.
+        phasebits ^= (1 << (2 + consumer_id));
     };
 
     auto epilogue = [&](int tile_row_idx,
                         int tile_col_idx,
-                        int& epilogue_stage_id,
                         fused_globals::C_tt_tile* tmem,
                         const int warpgroup_id) {
         if constexpr (DO_PROFILE) {
@@ -302,7 +301,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
             warpgroup::load_async(
                 c_reg[i],
-                tmem[epilogue_stage_id]
+                tmem[0]
                     .template subtile<
                         tt<float, fused_globals::ROW_BLOCK / config::CONSUMER_WARPS, C_CHUNK_COLS>>(
                         i * C_CHUNK_COLS));
@@ -326,7 +325,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             warpgroup::sync(warpgroup_id + 1);
 
             if (warpgroup::laneid() == 0) {
-                // C_tile is only COL_BLOCK / NUM_C_TILES wide, so the TMA
+                // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
                 // column coordinate counts chunks, not COL_BLOCK tiles.
                 dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                     G.C_dist[G.dev_idx],
@@ -341,62 +340,68 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             }
         }
 
-        epilogue_stage_id = (epilogue_stage_id + 1) % config::CONSUMER_WARPS;
-        if (epilogue_stage_id == 0) {
-            phasebits ^= (1 << (4 + warpgroup_id));
-        }
+        // Same single-accumulator ring as the consumer side: epilogue_ready
+        // completes once per output tile, so this flips every iteration.
+        phasebits ^= (1 << (4 + warpgroup_id));
     };
 
-    // producer
-    if (warp_id == 8) {
-        if (elect_warp_leader()) {
-            int input_stage_id = 0;
-            for (int tile_id = cluster_idx; tile_id < num_tiles_total;
-                 tile_id += num_comp_clusters) {
-                auto [tile_row_id, tile_col_id] =
-                    calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
-                // This specifies the 256 * 256 chunk that has to be loaded
-                load(tile_row_id * config::NUM_CLUSTERS + cta_rank, tile_col_id, input_stage_id);
+    // Row tiles are A_tile/C_tile sized (ROW_BLOCK / CONSUMER_WARPS rows), so a
+    // cluster block spans NUM_CLUSTERS * CONSUMER_WARPS of them: this CTA owns
+    // the CONSUMER_WARPS tiles starting here, one per consumer.
+    const int cta_row_tile_base = cta_rank * config::CONSUMER_WARPS;
+
+    // producer + consumers share the tail warpgroup(s)
+    if (warpgroup_id >= config::EPILOGUE_WARPGROUPS) {
+        // warpgroup::decrease_registers<152>();
+
+        if (warp_id == config::PRODUCER_WARP_ID) {
+            if (elect_warp_leader()) {
+                int input_stage_id = 0;
+                for (int tile_id = cluster_idx; tile_id < num_tiles_total;
+                     tile_id += num_comp_clusters) {
+                    auto [tile_row_id, tile_col_id] =
+                        calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
+                    // This specifies the 256 * 256 chunk that has to be loaded
+                    load(tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
+                             cta_row_tile_base,
+                         tile_col_id,
+                         input_stage_id);
+                }
+            }
+        } else if (warp_id >= config::FIRST_CONSUMER_WARP_ID &&
+                   warp_id < config::FIRST_CONSUMER_WARP_ID + config::CONSUMER_WARPS) {
+            if (cta_rank == 0 && elect_warp_leader()) {
+                // consumer_id pairs this warp with epilogue warpgroup
+                // consumer_id: same A tile, same accumulator, same semaphores.
+                const int consumer_id = warp_id - config::FIRST_CONSUMER_WARP_ID;
+
+                // give each warp its own view of tmem
+                fused_globals::C_tt_tile tmem[1];
+                tmem[0] = tm_alloc.allocate<fused_globals::C_tt_tile>(consumer_id *
+                                                                      fused_globals::COL_BLOCK);
+
+                int input_stage_id = 0;
+                for (int iter = cluster_idx; iter < num_tiles_total; iter += num_comp_clusters) {
+                    consume(input_stage_id, tmem, consumer_id);
+                }
             }
         }
-    } else if (warp_id == 9 || warp_id == 10) {
-        if (cta_rank == 0 && elect_warp_leader()) {
-            // give each warp its own view of tmem
-            fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES / config::CONSUMER_WARPS];
-            const int consumer_id = warp_id % config::CONSUMER_WARPS;
-#pragma unroll
-            for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
-                tmem[i] = tm_alloc.allocate<fused_globals::C_tt_tile>(
-                    i * fused_globals::COL_BLOCK + consumer_id * fused_globals::COL_BLOCK);
-            }
-
-            int input_stage_id = 0;
-            int epilogue_stage_id = 0;
-            for (int iter = cluster_idx; iter < num_tiles_total; iter += num_comp_clusters) {
-                consume(input_stage_id, epilogue_stage_id, tmem, consumer_id);
-            }
-        }
-    } else if (warpgroup_id == 0 || warpgroup_id == 1) {
-        // TODO: update epilogue indexing based on warpgroup
-        int epilogue_stage_id = 0;
-
+    } else {
+        warpgroup::increase_registers<184>();
         // give each warpgroup its own view of tmem
-        fused_globals::C_tt_tile tmem[fused_globals::EPILOGUE_STAGES / config::CONSUMER_WARPS];
-#pragma unroll
-        for (int i = 0; i < fused_globals::EPILOGUE_STAGES / config::CONSUMER_WARPS; i++) {
-            tmem[i] = tm_alloc.allocate<fused_globals::C_tt_tile>(
-                i * fused_globals::COL_BLOCK + warpgroup_id * fused_globals::COL_BLOCK);
-        }
+        fused_globals::C_tt_tile tmem[1];
+        tmem[0] =
+            tm_alloc.allocate<fused_globals::C_tt_tile>(warpgroup_id * fused_globals::COL_BLOCK);
 
         for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             // this returns an index in the 512 * 256 tile
             auto [tile_row_id, tile_col_id] =
                 calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
-            // This specifies the 128 * 256 tile that should be epilogu-ed
+            // This specifies the 128 * 256 tile that should be epilogu-ed --
+            // the same row tile the producer loaded into A[warpgroup_id].
             epilogue(tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
-                         cta_rank * config::CONSUMER_WARPS + warpgroup_id,
+                         cta_row_tile_base + warpgroup_id,
                      tile_col_id,
-                     epilogue_stage_id,
                      tmem,
                      warpgroup_id);
         }
@@ -518,8 +523,9 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
 }
 
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
-__global__ __cluster_dims__(config::NUM_CLUSTERS) __launch_bounds__(
-    config::NUM_THREADS) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
+__global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
+    __maxnreg__(config::LAUNCH_REGISTERS) void gemm_ar_fused_kernel_stub(
+        const __grid_constant__ fused_globals G) {
     fused_kernel<SUPERGROUP_WIDTH, DO_PROFILE>(G);
 }
 
