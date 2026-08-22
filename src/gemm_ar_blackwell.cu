@@ -298,54 +298,44 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         // makes ptxas re-derive it (LDC with a register offset) every chunk.
         const auto& C_out = G.C_dist[G.dev_idx];
         constexpr int C_CHUNK_COLS = fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES;
-        // Only one wave's worth of chunks is live at a time. Holding all
-        // EPILOGUE_STAGES costs 128 of this CTA's 168 registers and pushes the
-        // swizzled C_smem addresses out to local memory, which then get
-        // reloaded inside every unrolled store.
         rt_bf<fused_globals::ROW_BLOCK / (4 * config::CONSUMER_WARPS), C_CHUNK_COLS>
-            c_reg[fused_globals::CHUNKS_PER_WAVE];
+            c_reg[fused_globals::EPILOGUE_STAGES];
         // + 1 because __syncthreads makes use of id = 0
         const int epilogue_barrier = warpgroup_id + 1;
 
 #pragma unroll
-        for (int w = 0; w < fused_globals::EPILOGUE_WAVES; w++) {
-#pragma unroll
-            for (int j = 0; j < fused_globals::CHUNKS_PER_WAVE; j++) {
-                warpgroup::load_async(
-                    c_reg[j],
-                    tmem[0]
-                        .template subtile<tt<float,
-                                             fused_globals::ROW_BLOCK / config::CONSUMER_WARPS,
-                                             C_CHUNK_COLS>>(
-                            (w * fused_globals::CHUNKS_PER_WAVE + j) * C_CHUNK_COLS));
-            }
-            tensor_load_wait();
+        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+            warpgroup::load_async(
+                c_reg[i],
+                tmem[0]
+                    .template subtile<
+                        tt<float, fused_globals::ROW_BLOCK / config::CONSUMER_WARPS, C_CHUNK_COLS>>(
+                        i * C_CHUNK_COLS));
+        }
+        tensor_load_wait();
 
-            // signal tmem empty -- only once the LAST wave has been pulled out
-            // of it, since everything before that is still resident.
-            if (w == fused_globals::EPILOGUE_WAVES - 1 && elect_warp_leader()) {
-                // TODO: move this into dist namespace
-                tma::cluster::arrive(epilogue_finished[warpgroup_id], 0);
-            }
+        // signal tmem empty
+        if (elect_warp_leader()) {
+            // TODO: move this into dist namespace
+            tma::cluster::arrive(epilogue_finished[warpgroup_id], 0);
+        }
 
 #pragma unroll
-            for (int j = 0; j < fused_globals::CHUNKS_PER_WAVE; j++) {
-                const int i = w * fused_globals::CHUNKS_PER_WAVE + j;
-                // need to know that there is at least 1 slot of smem in C tile that is free
-                dist::tma::store_async_read_wait<fused_globals::NUM_C_TILES - 1>();
-                warpgroup::sync(epilogue_barrier);
-                // this already does the swizzle inside it
-                warpgroup::store(C_smem[warpgroup_id][i % fused_globals::NUM_C_TILES], c_reg[j]);
-                warpgroup::sync(epilogue_barrier);
+        for (int i = 0; i < fused_globals::EPILOGUE_STAGES; i++) {
+            // need to know that there is at least 1 slot of smem in C tile that is free
+            dist::tma::store_async_read_wait<fused_globals::NUM_C_TILES - 1>();
+            warpgroup::sync(epilogue_barrier);
+            // this already does the swizzle inside it
+            warpgroup::store(C_smem[warpgroup_id][i % fused_globals::NUM_C_TILES], c_reg[i]);
+            warpgroup::sync(epilogue_barrier);
 
-                if (warpgroup::laneid() == 0) {
-                    // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
-                    // column coordinate counts chunks, not COL_BLOCK tiles.
-                    dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        C_out,
-                        C_smem[warpgroup_id][i % fused_globals::NUM_C_TILES],
-                        {tile_row_idx, tile_col_idx * fused_globals::EPILOGUE_STAGES + i});
-                }
+            if (warpgroup::laneid() == 0) {
+                // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
+                // column coordinate counts chunks, not COL_BLOCK tiles.
+                dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                    C_out,
+                    C_smem[warpgroup_id][i % fused_globals::NUM_C_TILES],
+                    {tile_row_idx, tile_col_idx * fused_globals::EPILOGUE_STAGES + i});
             }
         }
 
