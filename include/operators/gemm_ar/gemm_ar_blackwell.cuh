@@ -135,6 +135,17 @@ struct fused_globals {
     static_assert(COL_BLOCK % EPILOGUE_STAGES == 0, "COL_BLOCK should be divisible");
     using C_tile = kittens::st_bf<ROW_BLOCK / config::CONSUMER_WARPS, COL_BLOCK / EPILOGUE_STAGES>;
 
+    // Dynamic shared memory footprint: PIPELINE_STAGES input stages (one A tile
+    // per consumer plus the shared B tile) and one staging ring of C tiles per
+    // consumer. Both the launcher and the standalone bench need this number --
+    // deriving it separately in each is how it last went stale and made
+    // cudaFuncSetAttribute fail with "invalid argument".
+    static constexpr int DYNAMIC_SHARED_MEMORY =
+        ((sizeof(A_tile) * config::CONSUMER_WARPS + sizeof(B_tile)) * PIPELINE_STAGES) +
+        (sizeof(C_tile) * NUM_C_TILES * config::CONSUMER_WARPS) +
+        1024;  // NOTE: must add 1024 so this can be aligned by TK
+    static_assert(DYNAMIC_SHARED_MEMORY <= 227 * 1024, "SMEM allocation too large");
+
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
 

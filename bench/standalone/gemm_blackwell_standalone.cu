@@ -244,11 +244,8 @@ static gab::fused_globals make_globals(
 }
 
 static int mkernel_smem_bytes() {
-    using FG = gab::fused_globals;
-    return ((FG::ROW_BLOCK * FG::RED_BLOCK +
-             FG::COL_BLOCK / gab::config::NUM_CLUSTERS * FG::RED_BLOCK) *
-            (int)sizeof(bf16) * FG::PIPELINE_STAGES) +
-        ((FG::ROW_BLOCK * FG::COL_BLOCK) * (int)sizeof(bf16)) + 1024;
+    // Shared with launch_fused_gemm_ar_blackwell -- do not re-derive it here.
+    return gab::fused_globals::DYNAMIC_SHARED_MEMORY;
 }
 
 static void launch_mkernel(const gab::fused_globals& G, cudaStream_t s) {

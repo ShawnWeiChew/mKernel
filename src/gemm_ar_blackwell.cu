@@ -387,7 +387,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             }
         }
     } else {
-        warpgroup::increase_registers<184>();
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
         tmem[0] =
@@ -533,13 +532,7 @@ template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // TODO: adjust this number later
-    constexpr int smem_size =
-        ((sizeof(fused_globals::A_tile) * config::CONSUMER_WARPS + sizeof(fused_globals::B_tile)) *
-         fused_globals::PIPELINE_STAGES) +
-        (sizeof(fused_globals::C_tile) * fused_globals::NUM_C_TILES * config::CONSUMER_WARPS) +
-        1024;  // NOTE: must add 1024 so this can be aligned by TK
-    static_assert(smem_size <= 227 * 1024, "SMEM allocation too large");
+    constexpr int smem_size = fused_globals::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
