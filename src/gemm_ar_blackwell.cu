@@ -523,7 +523,7 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
 
 template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
-    __maxnreg__(config::LAUNCH_REGISTERS) void gemm_ar_fused_kernel_stub(
+    __launch_bounds__(config::NUM_THREADS, 1) void gemm_ar_fused_kernel_stub(
         const __grid_constant__ fused_globals G) {
     fused_kernel<SUPERGROUP_WIDTH, DO_PROFILE>(G);
 }

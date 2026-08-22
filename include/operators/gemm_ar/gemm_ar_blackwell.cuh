@@ -70,28 +70,30 @@ struct config {
     static_assert(FIRST_CONSUMER_WARP_ID / kittens::WARPGROUP_WARPS >= EPILOGUE_WARPGROUPS,
                   "Producer/consumer warps must not share a warpgroup with the epilogue");
 
-    // Register budget. The kernel is pinned with __maxnreg__ rather than
-    // __launch_bounds__ (they are mutually exclusive) because ptxas derives the
-    // launch-bounds cap from the block rounded up to a 128-thread occupancy
-    // bucket: at 352 threads it budgets for 384 and caps at 65536/384 -> 168,
-    // which is below the ~185 this kernel actually wants and costs ~20B of
-    // spill. __maxnreg__ lets us ask for the real per-thread share of the 64K
-    // register file instead. Keep it <= 65536/NUM_THREADS or the launch fails
-    // with "too many resources requested".
+    // Register budget. The hardware charges a CTA's registers against its warp
+    // count ROUNDED UP to a multiple of WARPGROUP_WARPS, so 11 warps costs the
+    // same as 12: the ceiling is 65536 / (12 * 32) = 170 -> 168 per thread, not
+    // 65536 / 352 = 186. Asking for the un-rounded number compiles fine and then
+    // fails the launch with "too many resources requested". This is also why
+    // dropping a warp to get under a bucket boundary only pays off at 8 warps
+    // and below.
     //
-    // setmaxnreg is deliberately NOT used here. It only redistributes registers
-    // between warpgroups at runtime; ptxas still compiles the whole kernel to
-    // one register count, so the epilogue can never name more registers than
-    // that and an `inc` above it buys nothing. Measured: 12 warps + a 224/56
-    // split gave 168 registers and 20B/52B of spill, this gives 184 and 4B/12B
-    // (all of it cold prologue code, none in the epilogue loop).
-    static constexpr int MAX_REGISTERS_PER_THREAD = 248;  // hardware cap, rounded to 8
-    static constexpr int LAUNCH_REGISTERS =
-        (65536 / NUM_THREADS / 8) * 8 < MAX_REGISTERS_PER_THREAD
-            ? (65536 / NUM_THREADS / 8) * 8
-            : MAX_REGISTERS_PER_THREAD;
-    static_assert(NUM_THREADS * LAUNCH_REGISTERS <= 65536,
+    // __launch_bounds__ already derives exactly this number, so it is what the
+    // kernel uses; REGISTER_CEILING is here to document the rule and to keep the
+    // static_assert honest if the warp counts above ever change.
+    static constexpr int ALLOC_WARPS =
+        ((NUM_WARPS + kittens::WARPGROUP_WARPS - 1) / kittens::WARPGROUP_WARPS) *
+        kittens::WARPGROUP_WARPS;
+    static constexpr int REGISTER_CEILING = (65536 / (ALLOC_WARPS * kittens::WARP_THREADS) / 8) * 8;
+    static_assert(ALLOC_WARPS * kittens::WARP_THREADS * REGISTER_CEILING <= 65536,
                   "Register request does not fit the per-SM register file");
+
+    // setmaxnreg is deliberately NOT used here. It only redistributes registers
+    // between warpgroups at runtime; ptxas still compiles the whole kernel to a
+    // single register count, so the epilogue can never NAME more registers than
+    // that and an `inc` above it buys nothing -- while an `inc` above the
+    // ceiling has nothing to draw from and hangs. Measured at 168: 20B/52B of
+    // spill with a 224/56 split, the same 20B/52B without it.
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
