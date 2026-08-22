@@ -176,7 +176,7 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 TK_ROOT        ?= /home/uccl/shawn/ThunderKittens
 STANDALONE_DIR := bench/standalone
 STANDALONE_INC := -I$(STANDALONE_DIR)/stub_include
-STANDALONE_LD  := -lcuda -lcublas -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+STANDALONE_LD  := -lcuda -lcublas -lnvidia-ml -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
                   -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib
 WITH_TK ?= 0
 ifeq ($(WITH_TK),1)

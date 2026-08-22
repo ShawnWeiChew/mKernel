@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -261,12 +262,99 @@ static void launch_mkernel(const gab::fused_globals& G, cudaStream_t s) {
 }
 
 // ---------------------------------------------------------------------------
-// Timing: TK's discipline. One event pair around the whole loop, divide by
-// iters, rotate buffer groups so consecutive launches do not reuse a warm L2.
+// Timing protocol
 // ---------------------------------------------------------------------------
+// Every arm goes through a byte-identical sequence, so no arm can be favoured
+// by where it happens to sit in the schedule:
+//
+//   for each round:                       (BENCH_ROUNDS, default 5)
+//     for each arm, starting at round%n:  (rotated, so nobody is always first)
+//       cool down to the idle clock       (>= BENCH_COOLDOWN_S, then poll NVML)
+//       warmup launches, rotated inputs
+//       one event pair around BENCH_ITERS back-to-back launches, rotated inputs
+//       round mean = elapsed / iters
+//
+// Reported figure is the MEDIAN of the round means, with the min..max spread
+// printed alongside so a noisy run is visible rather than hidden.
+//
+// Input rotation: launch i uses buffer group i % groups, and `groups` is sized
+// to cover 3x L2, so a launch never re-reads its own previous inputs out of
+// cache. When one argument set already exceeds 3x L2 there is one group and the
+// rotation is a no-op -- L2 is thrashed by the problem itself at that point.
+
+#ifndef NO_NVML
+#include <nvml.h>
+static bool g_nvml_up = false;
+static nvmlDevice_t g_nvml_dev;
+static unsigned int g_idle_clock_mhz = 0;
+
+static unsigned int sm_clock_mhz() {
+    unsigned int c = 0;
+    if (!g_nvml_up || nvmlDeviceGetClockInfo(g_nvml_dev, NVML_CLOCK_SM, &c) != NVML_SUCCESS)
+        return 0;
+    return c;
+}
+
+// Baseline = lowest SM clock seen over a quiet second. Everything after this is
+// compared against it, so an already-hot GPU at startup does not poison the run.
+static void clock_monitor_init() {
+    if (nvmlInit_v2() != NVML_SUCCESS) return;
+    if (nvmlDeviceGetHandleByIndex_v2(0, &g_nvml_dev) != NVML_SUCCESS) return;
+    g_nvml_up = true;
+    unsigned int lo = ~0u;
+    for (int i = 0; i < 10; ++i) {
+        unsigned int c = sm_clock_mhz();
+        if (c && c < lo) lo = c;
+        sleep_ms(100);
+    }
+    g_idle_clock_mhz = (lo == ~0u) ? 0 : lo;
+    std::printf("clock monitor: idle SM clock = %u MHz\n", g_idle_clock_mhz);
+}
+static void clock_monitor_shutdown() {
+    if (g_nvml_up) nvmlShutdown();
+}
+#else
+static unsigned int sm_clock_mhz() { return 0; }
+static void clock_monitor_init() { std::printf("clock monitor: disabled (NO_NVML)\n"); }
+static void clock_monitor_shutdown() {}
+static unsigned int g_idle_clock_mhz = 0;
+#endif
+
+// Sleep the floor, then keep polling until the SM clock has actually settled
+// back to the idle baseline. Without the poll the floor is a guess; with it we
+// know the next arm starts from the same thermal/clock state as the last one.
+static void cooldown(double floor_s, double tolerance, double max_extra_s) {
+    CUDA_OK(cudaDeviceSynchronize());
+    sleep_ms((int)(floor_s * 1000.0));
+    if (!g_idle_clock_mhz) return;  // no NVML: the floor is all we have
+
+    const unsigned int target = (unsigned int)(g_idle_clock_mhz * (1.0 + tolerance));
+    double waited = 0.0;
+    while (waited < max_extra_s) {
+        unsigned int c = sm_clock_mhz();
+        if (!c || c <= target) return;
+        sleep_ms(250);
+        waited += 0.25;
+    }
+    std::printf("  [warn] SM clock still %u MHz (idle %u) after %.0fs extra cooldown\n",
+                sm_clock_mhz(),
+                g_idle_clock_mhz,
+                max_extra_s);
+}
+
+struct BenchOpts {
+    int warmup;
+    int iters;
+    int rounds;
+    double cooldown_s;
+    double cooldown_tol;
+    double cooldown_max_extra_s;
+};
+
+// One timed round: warmup, then a single event pair around `iters` launches.
 template <typename LaunchFn>
-static double bench_ms(LaunchFn&& launch, int groups, int warmup, int iters, cudaStream_t s) {
-    for (int i = 0; i < warmup; ++i)
+static double time_round(LaunchFn&& launch, int groups, const BenchOpts& o, cudaStream_t s) {
+    for (int i = 0; i < o.warmup; ++i)
         launch(i % groups);
     CUDA_OK(cudaStreamSynchronize(s));
 
@@ -274,7 +362,7 @@ static double bench_ms(LaunchFn&& launch, int groups, int warmup, int iters, cud
     CUDA_OK(cudaEventCreate(&start));
     CUDA_OK(cudaEventCreate(&stop));
     CUDA_OK(cudaEventRecord(start, s));
-    for (int i = 0; i < iters; ++i)
+    for (int i = 0; i < o.iters; ++i)
         launch(i % groups);
     CUDA_OK(cudaEventRecord(stop, s));
     CUDA_OK(cudaEventSynchronize(stop));
@@ -283,7 +371,42 @@ static double bench_ms(LaunchFn&& launch, int groups, int warmup, int iters, cud
     CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
     CUDA_OK(cudaEventDestroy(start));
     CUDA_OK(cudaEventDestroy(stop));
-    return (double)ms / iters;
+    return (double)ms / o.iters;
+}
+
+struct Arm {
+    const char* name;
+    std::function<void(int)> launch;  // launch(buffer group)
+    std::vector<double> round_ms;
+};
+
+struct Stat {
+    double median, lo, hi;
+};
+static Stat summarize(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    double med = (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    return {med, v.front(), v.back()};
+}
+
+// Runs every arm through the identical cooldown/warmup/measure sequence,
+// rotating the starting arm each round.
+static void run_protocol(std::vector<Arm>& arms,
+                         int groups,
+                         const BenchOpts& o,
+                         cudaStream_t s) {
+    const int n = (int)arms.size();
+    for (int round = 0; round < o.rounds; ++round) {
+        for (int k = 0; k < n; ++k) {
+            Arm& arm = arms[(round + k) % n];
+            cooldown(o.cooldown_s, o.cooldown_tol, o.cooldown_max_extra_s);
+            arm.round_ms.push_back(time_round(arm.launch, groups, o, s));
+            CUDA_OK(cudaGetLastError());
+        }
+        std::printf("  round %d/%d done\n", round + 1, o.rounds);
+        std::fflush(stdout);
+    }
 }
 
 static double tflops(int M, int N, int K, double ms) {
@@ -292,7 +415,7 @@ static double tflops(int M, int N, int K, double ms) {
 
 // ---------------------------------------------------------------------------
 
-static void run_shape(int M, int N, int K, int warmup, int iters) {
+static void run_shape(int M, int N, int K, const BenchOpts& o) {
     using FG = gab::fused_globals;
     if (M % FG::ROW_BLOCK || N % FG::COL_BLOCK || K % FG::RED_BLOCK) {
         std::printf("skip M=%d N=%d K=%d (needs M%%%d, N%%%d, K%%%d == 0)\n",
@@ -452,73 +575,61 @@ static void run_shape(int M, int N, int K, int warmup, int iters) {
                                      mkernel_smem_bytes()));
     }
 
-    struct Row {
-        const char* name;
-        double ms;
-        CheckResult chk;
-    };
-    std::vector<Row> rows;
-
-    // --- cuBLAS NN -----------------------------------------------------------
-    {
-        double ms = bench_ms(gemm_nn_g, groups, warmup, iters, s);
-        CUDA_OK(cudaMemsetAsync(C[0], 0, nC * sizeof(bf16), s));
-        gemm_nn_g(0);
-        CUDA_OK(cudaStreamSynchronize(s));
-        rows.push_back({"cublas-NN  (B is KxN)", ms, check(C[0], Cref, nC)});
-    }
-    sleep_ms(200);
-
-    // --- cuBLAS TN -----------------------------------------------------------
-    {
-        double ms = bench_ms(gemm_tn_g, groups, warmup, iters, s);
-        CUDA_OK(cudaMemsetAsync(C[0], 0, nC * sizeof(bf16), s));
-        gemm_tn_g(0);
-        CUDA_OK(cudaStreamSynchronize(s));
-        rows.push_back({"cublas-TN  (B is NxK)", ms, check(C[0], Cref, nC)});
-    }
-    sleep_ms(200);
-
+    // Build the arm list. Correctness is checked once per arm, before timing,
+    // so the checks cannot perturb the measured sequence.
+    std::vector<Arm> arms;
+    arms.push_back({"cublas-NN  (B is KxN)", [&](int g) { gemm_nn_g(g); }, {}});
+    arms.push_back({"cublas-TN  (B is NxK)", [&](int g) { gemm_tn_g(g); }, {}});
 #ifdef WITH_TK
-    // --- ThunderKittens bf16_b200 -------------------------------------------
     if (tk_ok) {
-        auto run = [&](int g) { tk_gemm_launch(tk[g], s); };
-        double ms = bench_ms(run, groups, warmup, iters, s);
-        CUDA_OK(cudaGetLastError());
-        CUDA_OK(cudaMemsetAsync(C[0], 0, nC * sizeof(bf16), s));
-        run(0);
-        CUDA_OK(cudaStreamSynchronize(s));
+        arms.push_back({"tk-b200    (B is NxK)", [&](int g) { tk_gemm_launch(tk[g], s); }, {}});
         std::printf("tk config: %s\n", tk_gemm_name(tk[0]));
-        rows.push_back({"tk-b200    (B is NxK)", ms, check(C[0], Cref, nC)});
     } else {
         std::printf("tk-b200: no config for N=%d, skipped\n", N);
     }
-    sleep_ms(200);
 #endif
+    arms.push_back({"mkernel    (B is KxN)", [&](int g) { launch_mkernel(G[g], s); }, {}});
 
-    // --- mKernel -------------------------------------------------------------
-    {
-        auto run = [&](int g) { launch_mkernel(G[g], s); };
-        double ms = bench_ms(run, groups, warmup, iters, s);
-        CUDA_OK(cudaGetLastError());
+    std::vector<CheckResult> checks;
+    for (Arm& a : arms) {
         CUDA_OK(cudaMemsetAsync(C[0], 0, nC * sizeof(bf16), s));
-        run(0);
+        a.launch(0);
         CUDA_OK(cudaStreamSynchronize(s));
-        rows.push_back({"mkernel    (B is KxN)", ms, check(C[0], Cref, nC)});
+        CUDA_OK(cudaGetLastError());
+        checks.push_back(check(C[0], Cref, nC));
     }
 
-    const double base = rows[0].ms;
-    std::printf("%-22s %10s %12s %9s   %s\n", "", "ms", "TFLOP/s", "vs NN", "correctness");
-    for (const Row& r : rows) {
-        std::printf("%-22s %10.4f %12.1f %8.3fx   %s (max_abs=%.4f mean_abs=%.5f ref_mean=%.4f)\n",
-                    r.name,
-                    r.ms,
-                    tflops(M, N, K, r.ms),
-                    base / r.ms,
-                    r.chk.ok ? "ok  " : "FAIL",
-                    r.chk.max_abs,
-                    r.chk.mean_abs,
-                    r.chk.ref_mean);
+    std::printf("protocol: %d rounds x %d iters (warmup %d), rotated arm order, "
+                ">=%.0fs cooldown per arm\n",
+                o.rounds,
+                o.iters,
+                o.warmup,
+                o.cooldown_s);
+    std::fflush(stdout);
+    run_protocol(arms, groups, o, s);
+
+    const Stat base = summarize(arms[0].round_ms);
+    std::printf("\n%-22s %10s %12s %9s %11s   %s\n",
+                "",
+                "ms",
+                "TFLOP/s",
+                "vs NN",
+                "spread",
+                "correctness");
+    for (size_t i = 0; i < arms.size(); ++i) {
+        const Stat st = summarize(arms[i].round_ms);
+        const CheckResult& c = checks[i];
+        std::printf("%-22s %10.4f %12.1f %8.3fx %10.1f%%   %s "
+                    "(max_abs=%.4f mean_abs=%.5f ref_mean=%.4f)\n",
+                    arms[i].name,
+                    st.median,
+                    tflops(M, N, K, st.median),
+                    base.median / st.median,
+                    100.0 * (st.hi - st.lo) / st.median,
+                    c.ok ? "ok  " : "FAIL",
+                    c.max_abs,
+                    c.mean_abs,
+                    c.ref_mean);
     }
 
 #ifdef WITH_TK
@@ -536,9 +647,23 @@ static void run_shape(int M, int N, int K, int warmup, int iters) {
     CUDA_OK(cudaFree(Cref));
 }
 
+static double env_d(const char* k, double dflt) {
+    const char* v = std::getenv(k);
+    return v ? std::atof(v) : dflt;
+}
+static int env_i(const char* k, int dflt) {
+    const char* v = std::getenv(k);
+    return v ? std::atoi(v) : dflt;
+}
+
 int main(int argc, char** argv) {
-    const int warmup = std::getenv("BENCH_WARMUP") ? std::atoi(std::getenv("BENCH_WARMUP")) : 30;
-    const int iters = std::getenv("BENCH_ITERS") ? std::atoi(std::getenv("BENCH_ITERS")) : 30;
+    BenchOpts o;
+    o.warmup = env_i("BENCH_WARMUP", 10);
+    o.iters = env_i("BENCH_ITERS", 25);
+    o.rounds = env_i("BENCH_ROUNDS", 5);
+    o.cooldown_s = env_d("BENCH_COOLDOWN_S", 8.0);
+    o.cooldown_tol = env_d("BENCH_COOLDOWN_TOL", 0.05);
+    o.cooldown_max_extra_s = env_d("BENCH_COOLDOWN_MAX_S", 60.0);
 
     static_assert(gab::config::NUM_COMM_SM == 0,
                   "This harness is single-GPU. Rebuild with NUM_COMP_SM == NUM_BLOCKS, "
@@ -553,16 +678,23 @@ int main(int argc, char** argv) {
                 gab::config::NUM_COMP_SM,
                 gab::config::NUM_THREADS,
                 mkernel_smem_bytes());
-    std::printf(
-        "timing: one event pair around %d back-to-back launches, warmup=%d\n", iters, warmup);
+    std::printf("timing: %d rounds x %d back-to-back launches (warmup %d), rotated arm order,\n"
+                "        >=%.0fs cooldown per timed arm, polled to within %.0f%% of idle SM clock\n",
+                o.rounds,
+                o.iters,
+                o.warmup,
+                o.cooldown_s,
+                100.0 * o.cooldown_tol);
+    clock_monitor_init();
 
     // K = N/4 mirrors the 4-rank tensor-parallel slice the python bench uses.
     for (int n : {2048, 4096, 8192, 16384, 32768})
-        run_shape(n, n, n / INTRA_NUM_DEVICES, warmup, iters);
+        run_shape(n, n, n / INTRA_NUM_DEVICES, o);
 
     // Square shapes, for direct comparison against published TK / cuBLAS numbers.
     if (argc > 1 && std::string(argv[1]) == "--square")
         for (int n : {2048, 4096, 8192, 16384})
-            run_shape(n, n, n, warmup, iters);
+            run_shape(n, n, n, o);
+    clock_monitor_shutdown();
     return 0;
 }

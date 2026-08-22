@@ -404,6 +404,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
+        everyone::tma::cluster::wait_aligned();
 
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
