@@ -130,7 +130,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     // normally, it has to be a full sync(), but since we are waiting on the PDL launch later in the
     // code, we can just arrive here, then wait later
-    everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::sync();
 
     // tile_row_idx is this CTA's FIRST A row tile, in A_tile units
     // (ROW_BLOCK / CONSUMER_WARPS rows, already rank adjusted) -- consumer c
@@ -244,9 +244,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         // signal tmem empty
         // TODO: figure out where to put PDL
         if (elect_warp_leader()) {
-            if (is_last_tile && warp_id == 0) {
-                pdl::arrive();
-            }
+            // if (is_last_tile && warp_id == 0) {
+            //     pdl::arrive();
+            // }
             // TODO: move this into dist namespace
             tma::cluster::arrive(epilogue_tmem_finished[warpgroup_id], 0);
         }
@@ -286,9 +286,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         if (warp_id == config::PRODUCER_WARP_ID) {
             if (elect_warp_leader()) {
-                pdl::wait();
+                // pdl::wait();
                 // NOTE: This splits up the arrive at the top and interleaves the work in between
-                everyone::tma::cluster::wait();
+                // everyone::tma::cluster::wait();
                 int input_stage_id = 0;
                 for (int tile_id = cluster_idx; tile_id < num_tiles_total;
                      tile_id += num_comp_clusters) {
@@ -306,7 +306,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if (cta_rank == 0 && elect_warp_leader()) {
                 // consumer_id pairs this warp with epilogue warpgroup
                 // consumer_id: same A tile, same accumulator, same semaphores.
-                everyone::tma::cluster::wait();
+                // everyone::tma::cluster::wait();
                 const int consumer_id = warp_id - config::FIRST_CONSUMER_WARP_ID;
 
                 // give each warp its own view of tmem
@@ -322,7 +322,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
-        everyone::tma::cluster::wait_aligned();
+        // everyone::tma::cluster::wait_aligned();
 
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
@@ -333,10 +333,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // this returns an index in the 512 * 256 tile
             auto [tile_row_id, tile_col_id] =
                 calculate_tile_idx<SUPERGROUP_WIDTH>(num_row_tiles, num_col_tiles, tile_id);
+            const int c_row_tile = tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
+                cta_row_tile_base + warpgroup_id;
             // This specifies the 128 * 256 tile that should be epilogu-ed --
             // the same row tile the producer loaded into A[warpgroup_id].
-            epilogue(tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
-                         cta_row_tile_base + warpgroup_id,
+            epilogue(cta_row_tile_base,
                      tile_col_id,
                      tmem,
                      warpgroup_id,
@@ -357,26 +358,17 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // TODO: not sure if there is an optimization where I can have a relaxed -> release
             // TODO: what if I have number of threads that is equal to the number of devices I
             // want to signal???
-
-            // Signal at 128*256 granularity: one signal per epilogue warpgroup,
-            // for the exact row tile that warpgroup just stored. The barrier is
-            // keyed in C_tile rows (ROW_BLOCK / CONSUMER_WARPS), the same space
-            // fused_intranode_sm decodes into, so the cluster row has to be
-            // scaled up the same way the epilogue coordinate was.
-            const int c_row_tile = tile_row_id * config::NUM_CLUSTERS * config::CONSUMER_WARPS +
-                cta_row_tile_base + warpgroup_id;
-
             // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
             // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
             // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
             // cluster tile -- so the destination is the sub-row index itself,
             // not a function of tile_id.
-            const int device_to_signal = cta_row_tile_base + warpgroup_id;
-
+            const int device_to_signal = (c_row_tile % 4) + (tile_col_id % 2) * 4;
             // One arrival per device per tile: the receiver waits for exactly
             // NUM_DEVICES, so this must fire from a single thread -- and it has
             // to be the same thread that issued the stores above, since
             // store_async_wait only orders that thread's own TMA group.
+            warpgroup::sync(warpgroup_id + 1);
             if (warpgroup::laneid() == 0) {
                 dist::signal(G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
             }
@@ -540,19 +532,20 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
         }
     }
 
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
+    // cudaLaunchAttribute attrs[1];
+    // attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    // attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    cudaLaunchConfig_t launch_config = {};
-    launch_config.gridDim = grid;
-    launch_config.blockDim = num_threads;
-    launch_config.dynamicSmemBytes = smem_size;
-    launch_config.stream = stream;
-    launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
+    // cudaLaunchConfig_t launch_config = {};
+    // launch_config.gridDim = grid;
+    // launch_config.blockDim = num_threads;
+    // launch_config.dynamicSmemBytes = smem_size;
+    // launch_config.stream = stream;
+    // // launch_config.attrs = attrs;
+    // launch_config.numAttrs = 1;
 
-    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
+    // MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 }
 
 };  // namespace gemm_ar_intranode_blackwell
