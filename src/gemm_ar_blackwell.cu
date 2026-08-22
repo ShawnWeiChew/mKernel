@@ -434,7 +434,7 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
@@ -474,19 +474,19 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     }
 }
 
-template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    fused_comp_sm<SUPERGROUP_WIDTH, DO_PROFILE>(G);
+    fused_comp_sm<SUPERGROUP_WIDTH>(G);
 }
 
-template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
+template <int SUPERGROUP_WIDTH>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, DO_PROFILE>(G);
+    fused_kernel<SUPERGROUP_WIDTH>(G);
 }
 
-template <int SUPERGROUP_WIDTH, bool DO_PROFILE>
+template <int SUPERGROUP_WIDTH>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -497,7 +497,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
     // timing window.
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, DO_PROFILE>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH>;
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

@@ -135,4 +135,47 @@ struct fused_globals {
         C_tile C;
     };
 };
+
+__host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A,
+                                                             const at::Tensor& B,
+                                                             dist::ParallelBuffer& C,
+                                                             dist::ParallelBuffer& barrier,
+                                                             dist::ParallelBuffer& C_final,
+                                                             int dev_idx,
+                                                             int M,
+                                                             int N,
+                                                             int K) {
+    return {
+        .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),
+        .B = ::dist::local_tensor_from_tensor<fused_globals::B_local_tensor>(B),
+        .C_final =
+            ::dist::distributed_tensor_from_buffer<fused_globals::C_distributed_tensor>(C_final),
+        .C_dist = ::dist::distributed_tensor_from_buffer<fused_globals::C_distributed_tensor>(C),
+        .comp_comm_barrier =
+            ::dist::distributed_tensor_from_buffer<fused_globals::barrier_distributed_tensor>(
+                barrier),
+        .dev_idx = dev_idx,
+        .M = M,
+        .N = N,
+        .K = K};
+}
+
+void entrypoint(const at::Tensor& A,
+                const at::Tensor& B,
+                dist::ParallelBuffer& C,
+                dist::ParallelBuffer& barrier,
+                dist::ParallelBuffer& C_final) {
+    const int dev_idx = C.local_rank_;
+    c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    const int M = A.size(0), K = A.size(1), N = B.size(1);
+
+    fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
+
+    if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4>(G);
+    } else {
+        launch_fused_gemm_ar_blackwell<8>(G);
+    }
+}
 };  // namespace gemm_ar_intranode_blackwell
