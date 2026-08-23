@@ -337,7 +337,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 cta_row_tile_base + warpgroup_id;
             // This specifies the 128 * 256 tile that should be epilogu-ed --
             // the same row tile the producer loaded into A[warpgroup_id].
-            epilogue(cta_row_tile_base,
+            epilogue(c_row_tile,
                      tile_col_id,
                      tmem,
                      warpgroup_id,

@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.distributed as dist
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -13,8 +14,6 @@ from common import check_close
 SHAPES= [2048, 4096, 8192, 16384, 32768]
 WARMUP = 20
 BENCH_ITER = 10
-NUM_DEVICES = 4
-K_DENOM = NUM_DEVICES
 
 def elapsed_ms(samples):
     """Drain (start, end) cuda event pairs into per-iter wall times (ms)."""
@@ -61,6 +60,10 @@ def main():
     dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     is_chief = local_rank == 0
     mod = load_module.load("gemm_ar_blackwell")
+
+    NUM_DEVICES = 8
+    if dist.is_initialized():
+        NUM_DEVICES = dist.get_world_size()
 
     for n in SHAPES:
         M, K, N = n, n // NUM_DEVICES, n
@@ -138,6 +141,7 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_final.data_.zero_()
 
+        time.sleep(5)
         dist.barrier()
         # warmup cublas + NCCL
         for _ in range(WARMUP):
@@ -146,6 +150,7 @@ def main():
             torch.cuda.synchronize()
             del C_tmp
 
+        time.sleep(5)
         dist.barrier()
 
         baseline_samples = []
@@ -158,6 +163,8 @@ def main():
             dist.all_reduce(C_tmp)
             e.record()
             baseline_samples.append((s, e))
+        time.sleep(5)
+        
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -180,6 +187,8 @@ def main():
         for _ in range(WARMUP):
             reset_fused_state()
             mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+        time.sleep(5)
+        dist.barrier()
 
 
         fused_kernel_samples = []
@@ -191,6 +200,7 @@ def main():
             mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
             e.record()
             fused_kernel_samples.append((s, e))
+        time.sleep(5)
 
         torch.cuda.synchronize()
         dist.barrier()
