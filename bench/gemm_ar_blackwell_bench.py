@@ -11,11 +11,14 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
+import cutlass_dgemm_ar  # noqa: E402
 from common import check_close
 
 SHAPES= [2048, 4096, 8192, 16384, 32768]
 WARMUP = 10
-BENCH_ITER = 30
+# Must be a multiple of factorial(#conditions) for exact counterbalancing.
+# 24 covers both 3 conditions (3! = 6) and 4 (4! = 24).
+BENCH_ITER = 24
 
 class GemmToArSignal(Enum):
     PUSH = 0
@@ -189,6 +192,32 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_final.data_.zero_()
 
+        # NVIDIA's CuTeDSL GEMM+AR example, as a second external reference next
+        # to cuBLAS+NCCL. It brings its own symmetric-memory buffers, so it is
+        # timed but not correctness-checked here -- the upstream example checks
+        # itself against the same dist.all_reduce reference we use.
+        #
+        # Every rank must agree on whether it is in, or the interleave would put
+        # one rank in a collective the others are not running. availability() is
+        # local, so the decision is all-reduced to a unanimous answer.
+        cutlass_ok, cutlass_why = cutlass_dgemm_ar.availability()
+        if cutlass_ok:
+            try:
+                cutlass_run = cutlass_dgemm_ar.build(
+                    M=M, N=N, K=K, rank=rank, world_size=world_size,
+                    device=local_rank)
+            except Exception as exc:
+                cutlass_ok, cutlass_why = False, f"{type(exc).__name__}: {exc}"
+        vote = torch.tensor([1 if cutlass_ok else 0], device="cuda")
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+        if not vote.item():
+            if cutlass_ok:
+                del cutlass_run
+            cutlass_ok = False
+            if is_chief:
+                print(f"  [skip] cutlass CuTeDSL GEMM+AR: {cutlass_why or 'peer opted out'}",
+                      flush=True)
+
         # Drain, line the ranks up, then soak. The sleep only resets temperature
         # if the GPU is already idle when it starts, so it has to come after the
         # synchronize -- otherwise the queue is still draining through it.
@@ -215,37 +244,41 @@ def main():
                     A, B, C_dbuf, barriers[strategy], C_final,
                     epochs[strategy], strategy.value)
 
+        if cutlass_ok:
+            for _ in range(WARMUP):
+                sync_ranks()
+                cutlass_run()
+
         torch.cuda.synchronize()
         dist.barrier()
         time.sleep(5)
 
         # Interleave the conditions rather than running each to completion.
         # Clock and thermal state drift monotonically across a run, so a fixed
-        # order (all baseline, then all PUSH, then all PULL) systematically
-        # favours whichever condition runs while the part is coolest. A
-        # PUSH-vs-PULL gap measured that way cannot be distinguished from drift.
-        # Shuffling the order within each iteration spreads the drift evenly
-        # over all three instead of aligning it with one.
+        # order (all baseline, then all PUSH, ...) systematically favours
+        # whichever condition runs while the part is coolest -- a gap measured
+        # that way cannot be distinguished from drift. Rotating the order within
+        # each iteration spreads the drift evenly over every condition instead.
         #
-        # Counterbalanced rather than randomised: cycling through all 3! = 6
-        # permutations puts every condition in every slot exactly the same
-        # number of times (BENCH_ITER / 6 each), and also balances which
-        # condition immediately precedes which. A shuffle only achieves that in
-        # expectation -- at BENCH_ITER=30 it still leaves visible skew, which is
-        # the very thing being controlled for.
+        # Counterbalanced rather than randomised: cycling through all
+        # factorial(#conditions) permutations puts every condition in every slot
+        # exactly BENCH_ITER / len(ORDERS) times, and balances which condition
+        # immediately precedes which. A shuffle only achieves that in
+        # expectation, and at these sample counts still leaves visible skew.
         #
         # The order is identical on every rank by construction, which it must
-        # be: all three conditions are collectives, so a rank running PUSH while
-        # a peer runs the NCCL baseline would deadlock.
+        # be: every condition is a collective, so a rank running PUSH while a
+        # peer runs the NCCL baseline would deadlock.
         BASELINE = "baseline"
-        ORDERS = list(permutations([BASELINE, *STRATEGIES]))
+        CUTLASS = "cutlass"
+        conditions = [BASELINE, *STRATEGIES] + ([CUTLASS] if cutlass_ok else [])
+        ORDERS = list(permutations(conditions))
         if is_chief and BENCH_ITER % len(ORDERS):
             print(f"  [warn] BENCH_ITER={BENCH_ITER} is not a multiple of "
                   f"{len(ORDERS)}; condition order is only partly balanced",
                   flush=True)
 
-        samples = {BASELINE: []}
-        samples.update({s: [] for s in STRATEGIES})
+        samples = {c: [] for c in conditions}
 
         for it in range(BENCH_ITER):
             for cond in ORDERS[it % len(ORDERS)]:
@@ -263,6 +296,10 @@ def main():
                     # The caching allocator is stream-ordered, so releasing it
                     # before the recorded work completes is safe.
                     del C_tmp
+                elif cond is CUTLASS:
+                    s.record()
+                    cutlass_run()
+                    e.record()
                 else:
                     epochs[cond] += 1
                     s.record()
@@ -287,6 +324,10 @@ def main():
                 elapsed_ms(samples[s]), label=f"fused[{s.name}]")
             for s in STRATEGIES
         }
+        cutlass_ms = (
+            median_then_max_cuda(elapsed_ms(samples[CUTLASS]), label="cutlass")
+            if cutlass_ok else None
+        )
 
         # 2*M*K*N per rank for the local GEMM slice
         flops = 2.0 * M * K * N
@@ -305,6 +346,23 @@ def main():
                     f"{speedup:6.3f}x vs cublas+nccl",
                     flush=True,
                 )
+            if cutlass_ms is not None:
+                speedup = baseline_ms / cutlass_ms if cutlass_ms > 0 else float("nan")
+                print(
+                    f"  cutlass       : {cutlass_ms:8.3f} ms  "
+                    f"({flops / (cutlass_ms * 1e9):7.1f} TFLOP/s)  "
+                    f"{speedup:6.3f}x vs cublas+nccl",
+                    flush=True,
+                )
+                for strategy in STRATEGIES:
+                    ms = fused_ms[strategy]
+                    if ms > 0:
+                        print(
+                            f"  cutlass/{strategy.name:<4}  : "
+                            f"{cutlass_ms / ms:8.3f}x "
+                            f"(>1 means fused[{strategy.name}] is faster)",
+                            flush=True,
+                        )
             push_ms = fused_ms[GemmToArSignal.PUSH]
             pull_ms = fused_ms[GemmToArSignal.PULL]
             if pull_ms > 0:
@@ -315,6 +373,8 @@ def main():
                 )
 
         del C_dbuf, barriers, C_final, A, B
+        if cutlass_ok:
+            del cutlass_run
         dist.barrier()
 
     dist.destroy_process_group()
