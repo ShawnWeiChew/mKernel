@@ -54,8 +54,11 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
+    // Only the comp/comm split varies; every other config constant is
+    // split-independent, so plain `config::` stays correct elsewhere.
+    using cfg = config_t<COMP_SM>;
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
@@ -77,7 +80,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int num_col_tiles = G.N / fused_globals::COL_BLOCK;
     const int num_tiles_total = num_row_tiles * num_col_tiles;
     const int cluster_idx = blockIdx.x / config::NUM_CLUSTERS;
-    const int num_comp_clusters = config::NUM_COMP_SM / config::NUM_CLUSTERS;
+    const int num_comp_clusters = cfg::NUM_COMP_SM / cfg::NUM_CLUSTERS;
 
     // allocate smem and tmem
     extern __shared__ int __shm[];
@@ -389,15 +392,16 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
+    using cfg = config_t<COMP_SM>;
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
     const int num_row_tiles = G.M / (fused_globals::ROW_BLOCK / config::CONSUMER_WARPS);
     const int num_tiles_total = num_row_tiles * num_tiles_per_row;
-    const int comm_block_idx = blockIdx.x - config::NUM_COMP_SM;
+    const int comm_block_idx = blockIdx.x - cfg::NUM_COMP_SM;
     constexpr int NUM_DEVICES_PER_TILE = 4;
 
     const int num_comm_row_tiles = num_row_tiles / (config::CONSUMER_WARPS * config::NUM_CLUSTERS);
@@ -405,7 +409,7 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     static_assert(config::NUM_DEVICES >= NUM_DEVICES_PER_TILE,
                   "Intranode design was not made for < 4 devices");
 
-    const int tile_id_stride = config::NUM_DEVICES * config::NUM_COMM_SM;
+    const int tile_id_stride = config::NUM_DEVICES * cfg::NUM_COMM_SM;
     for (int tile_id = G.dev_idx + comm_block_idx * config::NUM_DEVICES; tile_id < num_tiles_total;
          tile_id += tile_id_stride) {
         // 4 devices handle 1 comp tile, stacked vertically, since completions come in 512 * 256
@@ -487,23 +491,23 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+    if (blockIdx.x < config_t<COMP_SM>::NUM_COMP_SM) {
+        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -512,7 +516,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
     auto this_kernel =
-        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>;
+        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>;
 
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's

@@ -72,7 +72,20 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 # matches an 8-GPU-per-node deployment. Override to test emulated multinode
 # (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
 INTRA_NUM_DEVICES ?= 8
-COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
+
+# COMP_SM_SWEEP=1 compiles every comp/comm SM split in
+# GEMM_AR_FOR_EACH_COMP_SM instead of just the default. Each extra split is a
+# full set of kernel instantiations (x2 signal strategies x3 shape buckets), so
+# this multiplies gemm_ar_blackwell compile time by roughly the list length --
+# keep it off for normal iteration and turn it on to run the sweep.
+COMP_SM_SWEEP   ?= 0
+ifeq ($(COMP_SM_SWEEP),1)
+    SWEEP_DEFINES := -DGEMM_AR_COMP_SM_SWEEP
+else
+    SWEEP_DEFINES :=
+endif
+
+COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES) $(SWEEP_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
@@ -133,9 +146,15 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots
+.PHONY: all clean bench check test-slot-math plots sweep_gemm_ar_blackwell
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
+
+# Full comp/comm SM sweep. Rebuilds with every split compiled in; the bench
+# picks up whatever is available via compiled_comp_sm_splits().
+sweep_gemm_ar_blackwell :
+	$(MAKE) COMP_SM_SWEEP=1 $(BUILD)/libgemm_ar_blackwell.so
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
 
 gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so

@@ -5,7 +5,6 @@ import torch.distributed as dist
 import time
 from pathlib import Path
 from enum import Enum
-from itertools import permutations
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -15,10 +14,12 @@ import cutlass_dgemm_ar  # noqa: E402
 from common import check_close
 
 SHAPES= [2048, 4096, 8192, 16384, 32768]
+# Split the sweep is compared against; must be in GEMM_AR_FOR_EACH_COMP_SM.
+DEFAULT_COMP_SM = 128
 WARMUP = 10
 # Must be a multiple of factorial(#conditions) for exact counterbalancing.
 # 24 covers both 3 conditions (3! = 6) and 4 (4! = 24).
-BENCH_ITER = 24
+BENCH_ITER = 60
 
 class GemmToArSignal(Enum):
     PUSH = 0
@@ -46,6 +47,30 @@ def make_barrier(mod, local_rank, world_size):
         local_rank=local_rank, local_world_size=world_size, multicast=True)
     barrier.data_.zero_()
     return barrier
+
+
+def williams_orders(items):
+    """Balanced Latin square (Williams design) over `items`.
+
+    Returns len(items) orderings in which every condition occupies every
+    position exactly once and -- for an even count -- every ordered pair is
+    adjacent exactly once. Full permutations balance both as well, but
+    factorial(n) is unusable past about four conditions and the SM sweep pushes
+    the count into the twenties.
+
+    Construction: first row alternates from the ends (0, 1, n-1, 2, n-2, ...);
+    every later row shifts it by one modulo n. Because all rows are the same
+    row shifted, the order is identical on every rank, which it has to be --
+    every condition is a collective.
+    """
+    n = len(items)
+    first, lo, hi = [], 0, n - 1
+    while lo <= hi:
+        first.append(lo)
+        if lo != hi:
+            first.append(hi)
+        lo, hi = lo + 1, hi - 1
+    return [tuple(items[(v + r) % n] for v in first) for r in range(n)]
 
 
 def elapsed_ms(samples):
@@ -98,6 +123,17 @@ def main():
     if dist.is_initialized():
         NUM_DEVICES = dist.get_world_size()
 
+    # Sweep exactly the comp/comm SM splits this module was built with. A
+    # default build compiles one; `make COMP_SM_SWEEP=1 ...` compiles the list
+    # in GEMM_AR_FOR_EACH_COMP_SM. Reading it from the module keeps the bench
+    # from asking for a split that would TORCH_CHECK at launch.
+    COMP_SM_SPLITS = list(mod.compiled_comp_sm_splits())
+    NUM_BLOCKS = mod.num_blocks()
+    if is_chief:
+        print(f"comp/comm SM splits compiled in (of {NUM_BLOCKS} blocks): "
+              + ", ".join(f"{sm}/{NUM_BLOCKS - sm}" for sm in COMP_SM_SPLITS),
+              flush=True)
+
     for n in SHAPES:
         M, K, N = n, n // NUM_DEVICES, n
 
@@ -123,7 +159,14 @@ def main():
         dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
 
-        for strategy in STRATEGIES:
+        # Every (strategy, split) is a separate kernel instantiation, so each is
+        # validated at least once -- a mis-specialised split would otherwise
+        # surface only as a suspiciously fast wrong answer in the sweep table.
+        # Full cross-product only at the smallest shape; the per-check host
+        # comparison of an MxN tensor is far too slow to repeat at M=32768.
+        splits_to_check = COMP_SM_SPLITS if n == SHAPES[0] else [DEFAULT_COMP_SM]
+        check_epochs = {st: 0 for st in STRATEGIES}
+        for strategy, comp_sm in ((st, sm) for st in STRATEGIES for sm in splits_to_check):
             # Unlike the timed loop, the outputs ARE cleared between strategies.
             # Both write every element, so leaving the previous strategy's result
             # in place would let a strategy that writes nothing still pass the
@@ -138,12 +181,15 @@ def main():
             C_final.data_.zero_()
             sync_ranks()
 
-            # do our own run
+            # do our own run. The barrier is shared across splits for a given
+            # strategy and never cleared, so the epoch has to keep rising.
+            check_epochs[strategy] += 1
             mod.gemm_ar_intranode_blackwell(
-                A, B, C_dbuf, barriers[strategy], C_final, 1, strategy.value)
+                A, B, C_dbuf, barriers[strategy], C_final,
+                check_epochs[strategy], strategy.value, comp_sm)
             torch.cuda.synchronize()
 
-            tag = strategy.name
+            tag = f"{strategy.name}/{comp_sm}"
             gemm_correctness_check = check_close(
                 f"gemm M={M} [{tag}]", C_dbuf.data_, local_ref_cpu)
 
@@ -236,13 +282,17 @@ def main():
             torch.cuda.synchronize()
             del C_tmp
 
+        # Each (strategy, split) is a distinct kernel instantiation, so each
+        # needs its own warmup -- otherwise the first timed sample of a split
+        # pays module load and cudaFuncSetAttribute.
         for strategy in STRATEGIES:
-            for _ in range(WARMUP):
-                sync_ranks()
-                epochs[strategy] += 1
-                mod.gemm_ar_intranode_blackwell(
-                    A, B, C_dbuf, barriers[strategy], C_final,
-                    epochs[strategy], strategy.value)
+            for comp_sm in COMP_SM_SPLITS:
+                for _ in range(WARMUP):
+                    sync_ranks()
+                    epochs[strategy] += 1
+                    mod.gemm_ar_intranode_blackwell(
+                        A, B, C_dbuf, barriers[strategy], C_final,
+                        epochs[strategy], strategy.value, comp_sm)
 
         if cutlass_ok:
             for _ in range(WARMUP):
@@ -269,23 +319,28 @@ def main():
         # The order is identical on every rank by construction, which it must
         # be: every condition is a collective, so a rank running PUSH while a
         # peer runs the NCCL baseline would deadlock.
-        BASELINE = "baseline"
-        CUTLASS = "cutlass"
-        conditions = [BASELINE, *STRATEGIES] + ([CUTLASS] if cutlass_ok else [])
-        ORDERS = list(permutations(conditions))
-        if is_chief and BENCH_ITER % len(ORDERS):
-            print(f"  [warn] BENCH_ITER={BENCH_ITER} is not a multiple of "
-                  f"{len(ORDERS)}; condition order is only partly balanced",
-                  flush=True)
+        BASELINE = ("baseline",)
+        CUTLASS = ("cutlass",)
+        # One condition per (signal strategy, comp/comm SM split). The split is
+        # only a launch argument -- the barrier protocol depends on the strategy
+        # alone -- so splits share a strategy's barrier and epoch counter, which
+        # keeps rising monotonically across all of them.
+        conditions = ([BASELINE]
+                      + [("fused", st, sm) for st in STRATEGIES for sm in COMP_SM_SPLITS]
+                      + ([CUTLASS] if cutlass_ok else []))
+        ORDERS = williams_orders(conditions)
+        # Round the target iteration count to a whole number of orders so the
+        # balancing is exact rather than approximate.
+        iterations = max(1, round(BENCH_ITER / len(ORDERS))) * len(ORDERS)
 
         samples = {c: [] for c in conditions}
 
-        for it in range(BENCH_ITER):
+        for it in range(iterations):
             for cond in ORDERS[it % len(ORDERS)]:
                 sync_ranks()
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
-                if cond is BASELINE:
+                if cond == BASELINE:
                     s.record()
                     C_tmp = torch.matmul(A, B)
                     dist.all_reduce(C_tmp)
@@ -296,16 +351,17 @@ def main():
                     # The caching allocator is stream-ordered, so releasing it
                     # before the recorded work completes is safe.
                     del C_tmp
-                elif cond is CUTLASS:
+                elif cond == CUTLASS:
                     s.record()
                     cutlass_run()
                     e.record()
                 else:
-                    epochs[cond] += 1
+                    _, strategy, comp_sm = cond
+                    epochs[strategy] += 1
                     s.record()
                     mod.gemm_ar_intranode_blackwell(
-                        A, B, C_dbuf, barriers[cond], C_final,
-                        epochs[cond], cond.value)
+                        A, B, C_dbuf, barriers[strategy], C_final,
+                        epochs[strategy], strategy.value, comp_sm)
                     e.record()
                 samples[cond].append((s, e))
 
@@ -320,9 +376,10 @@ def main():
         baseline_ms = median_then_max_cuda(
             elapsed_ms(samples[BASELINE]), label="cublas+nccl")
         fused_ms = {
-            s: median_then_max_cuda(
-                elapsed_ms(samples[s]), label=f"fused[{s.name}]")
-            for s in STRATEGIES
+            (st, sm): median_then_max_cuda(
+                elapsed_ms(samples[("fused", st, sm)]),
+                label=f"fused[{st.name}/{sm}]")
+            for st in STRATEGIES for sm in COMP_SM_SPLITS
         }
         cutlass_ms = (
             median_then_max_cuda(elapsed_ms(samples[CUTLASS]), label="cutlass")
@@ -332,45 +389,39 @@ def main():
         # 2*M*K*N per rank for the local GEMM slice
         flops = 2.0 * M * K * N
         if is_chief:
-            print(
-                f"  cublas+nccl   : {baseline_ms:8.3f} ms  "
-                f"({flops / (baseline_ms * 1e9):7.1f} TFLOP/s)",
-                flush=True,
-            )
-            for strategy in STRATEGIES:
-                ms = fused_ms[strategy]
-                speedup = baseline_ms / ms if ms > 0 else float("nan")
-                print(
-                    f"  fused[{strategy.name:<4}]   : {ms:8.3f} ms  "
-                    f"({flops / (ms * 1e9):7.1f} TFLOP/s)  "
-                    f"{speedup:6.3f}x vs cublas+nccl",
-                    flush=True,
-                )
+            def tflops(ms):
+                return flops / (ms * 1e9) if ms > 0 else float("nan")
+
+            print(f"  {'cublas+nccl':<20}: {baseline_ms:8.3f} ms  "
+                  f"({tflops(baseline_ms):7.1f} TFLOP/s)", flush=True)
             if cutlass_ms is not None:
-                speedup = baseline_ms / cutlass_ms if cutlass_ms > 0 else float("nan")
-                print(
-                    f"  cutlass       : {cutlass_ms:8.3f} ms  "
-                    f"({flops / (cutlass_ms * 1e9):7.1f} TFLOP/s)  "
-                    f"{speedup:6.3f}x vs cublas+nccl",
-                    flush=True,
-                )
-                for strategy in STRATEGIES:
-                    ms = fused_ms[strategy]
-                    if ms > 0:
-                        print(
-                            f"  cutlass/{strategy.name:<4}  : "
-                            f"{cutlass_ms / ms:8.3f}x "
-                            f"(>1 means fused[{strategy.name}] is faster)",
-                            flush=True,
-                        )
-            push_ms = fused_ms[GemmToArSignal.PUSH]
-            pull_ms = fused_ms[GemmToArSignal.PULL]
-            if pull_ms > 0:
-                print(
-                    f"  push vs pull  : {push_ms / pull_ms:8.3f}x "
-                    f"(>1 means PULL is faster)",
-                    flush=True,
-                )
+                print(f"  {'cutlass':<20}: {cutlass_ms:8.3f} ms  "
+                      f"({tflops(cutlass_ms):7.1f} TFLOP/s)  "
+                      f"{baseline_ms / cutlass_ms:6.3f}x vs cublas+nccl",
+                      flush=True)
+
+            # Sweep table, sorted fastest first, so the best split is obvious
+            # and the shape of the curve is visible next to it.
+            print(f"  -- comp/comm SM sweep (of {NUM_BLOCKS} blocks) --", flush=True)
+            for (st, sm), ms in sorted(fused_ms.items(), key=lambda kv: kv[1]):
+                tag = f"{st.name}/{sm}:{NUM_BLOCKS - sm}"
+                line = (f"  {tag:<20}: {ms:8.3f} ms  ({tflops(ms):7.1f} TFLOP/s)  "
+                        f"{baseline_ms / ms:6.3f}x vs cublas+nccl")
+                if cutlass_ms is not None and ms > 0:
+                    line += f"  {cutlass_ms / ms:6.3f}x vs cutlass"
+                print(line, flush=True)
+
+            best = min(fused_ms, key=fused_ms.get)
+            best_ms = fused_ms[best]
+            default_key = (best[0], DEFAULT_COMP_SM)
+            msg = (f"  best: {best[0].name} @ {best[1]}/{NUM_BLOCKS - best[1]} "
+                   f"= {best_ms:.3f} ms")
+            if default_key in fused_ms and fused_ms[default_key] > 0:
+                msg += f"  ({fused_ms[default_key] / best_ms:.3f}x vs {DEFAULT_COMP_SM} split)"
+            if cutlass_ms is not None and best_ms > 0:
+                verdict = "BEATS" if best_ms < cutlass_ms else "behind"
+                msg += f"  [{verdict} cutlass by {abs(1 - cutlass_ms / best_ms) * 100:.1f}%]"
+            print(msg, flush=True)
 
         del C_dbuf, barriers, C_final, A, B
         if cutlass_ok:

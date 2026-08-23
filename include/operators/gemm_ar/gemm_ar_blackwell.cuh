@@ -22,14 +22,26 @@
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
-struct config {
+// Default comp/comm SM split. Only NUM_COMP_SM varies across the sweep;
+// everything else in config_t is split-independent, so `config` (the default
+// instantiation) stays valid everywhere that does not care about the split.
+static constexpr int DEFAULT_NUM_COMP_SM = 128;
+
+// The comp/comm split as a template parameter: comp SMs run the GEMM, the
+// remaining NUM_BLOCKS - NUM_COMP_SM run the all-reduce. Sweeping this trades
+// GEMM throughput against AR drain rate, and the optimum is shape dependent.
+template <int NUM_COMP_SM_ = DEFAULT_NUM_COMP_SM>
+struct config_t {
     static constexpr int NUM_BLOCKS = 148;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
-    static constexpr int NUM_COMP_SM = 128;
+    static constexpr int NUM_COMP_SM = NUM_COMP_SM_;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
+    static_assert(NUM_COMP_SM > 0, "need at least one comp SM");
+    static_assert(NUM_COMM_SM > 0,
+                  "need at least one comm SM; the AR is never run by comp SMs");
     // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
     // Maybe I can also save some SMs just for all-reduce?
     // I need to have a regular epilogue, and then do the all reduce -- maybe I can save SMs just
@@ -42,6 +54,12 @@ struct config {
     static constexpr int NUM_WARPS = CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS + 1;
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
     static constexpr int NUM_CLUSTERS = 2;
+    // Clusters are co-scheduled, so a cluster may not straddle the comp/comm
+    // boundary: blockIdx.x < NUM_COMP_SM has to split whole clusters.
+    static_assert(NUM_COMP_SM % NUM_CLUSTERS == 0,
+                  "comp SMs must be a whole number of clusters");
+    static_assert(NUM_BLOCKS % NUM_CLUSTERS == 0,
+                  "grid must be a whole number of clusters");
 
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
@@ -70,6 +88,8 @@ struct config {
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 };
+
+using config = config_t<DEFAULT_NUM_COMP_SM>;
 
 enum GemmToArSignalStrategy {
     PUSH = 0,  // write to host buffer to signal completion
@@ -170,13 +190,58 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
         .epoch = epoch};
 }
 
+// Comp/comm SM splits compiled into the module. Each entry costs a full set of
+// kernel instantiations (x2 signal strategies x3 shape buckets), so the sweep is
+// opt-in -- build with -DGEMM_AR_COMP_SM_SWEEP to get all of them. Every value
+// must be even (whole clusters) and less than config_t<>::NUM_BLOCKS; config_t
+// static_asserts both.
+#ifdef GEMM_AR_COMP_SM_SWEEP
+#define GEMM_AR_FOR_EACH_COMP_SM(F) \
+    F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108)
+#else
+#define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
+#endif
+
+template <int STRATEGY, int COMP_SM>
+inline void gemm_ar_dispatch_shape(const fused_globals& G, int M) {
+    if (M <= 2048) {
+        launch_fused_gemm_ar_blackwell<4, 32, STRATEGY, COMP_SM>(G);
+    } else if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, 64, STRATEGY, COMP_SM>(G);
+    } else {
+        launch_fused_gemm_ar_blackwell<8, 64, STRATEGY, COMP_SM>(G);
+    }
+}
+
+template <int COMP_SM>
+inline void gemm_ar_dispatch_strategy(const fused_globals& G, int M, int strategy) {
+    if (strategy == GemmToArSignalStrategy::PUSH) {
+        gemm_ar_dispatch_shape<GemmToArSignalStrategy::PUSH, COMP_SM>(G, M);
+    } else {
+        gemm_ar_dispatch_shape<GemmToArSignalStrategy::PULL, COMP_SM>(G, M);
+    }
+}
+
+// Lets the benchmark sweep exactly what was compiled instead of hardcoding a
+// list that can drift from GEMM_AR_FOR_EACH_COMP_SM.
+inline std::vector<int> compiled_comp_sm_splits() {
+    std::vector<int> out;
+#define GEMM_AR_COLLECT_COMP_SM(SM) out.push_back(SM);
+    GEMM_AR_FOR_EACH_COMP_SM(GEMM_AR_COLLECT_COMP_SM)
+#undef GEMM_AR_COLLECT_COMP_SM
+    return out;
+}
+
+inline int num_blocks() { return config::NUM_BLOCKS; }
+
 void entrypoint(const at::Tensor& A,
                 const at::Tensor& B,
                 dist::ParallelBuffer& C,
                 dist::ParallelBuffer& barrier,
                 dist::ParallelBuffer& C_final,
                 const int epoch,
-                int gemm_to_ar_signal_strategy) {
+                int gemm_to_ar_signal_strategy,
+                int num_comp_sm) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -185,27 +250,25 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH) {
-        if (M <= 2048) {
-            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PUSH>(G);
-        } else if (M <= 4096) {
-            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PUSH>(G);
-        } else {
-            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PUSH>(G);
-        }
-    } else if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL) {
-        if (M <= 2048) {
-            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PULL>(G);
-        } else if (M <= 4096) {
-            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PULL>(G);
-        } else {
-            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PULL>(G);
-        }
-    } else {
-        TORCH_CHECK(false,
-                    "Unknown gemm_to_ar_signal_strategy ",
-                    gemm_to_ar_signal_strategy,
-                    "; expected PUSH(0) or PULL(1)");
+    TORCH_CHECK(gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH ||
+                    gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL,
+                "Unknown gemm_to_ar_signal_strategy ",
+                gemm_to_ar_signal_strategy,
+                "; expected PUSH(0) or PULL(1)");
+
+    bool launched = false;
+#define GEMM_AR_TRY_COMP_SM(SM)                                                       \
+    if (!launched && num_comp_sm == (SM)) {                                           \
+        gemm_ar_dispatch_strategy<(SM)>(G, M, gemm_to_ar_signal_strategy);            \
+        launched = true;                                                              \
     }
+    GEMM_AR_FOR_EACH_COMP_SM(GEMM_AR_TRY_COMP_SM)
+#undef GEMM_AR_TRY_COMP_SM
+
+    TORCH_CHECK(launched,
+                "num_comp_sm=",
+                num_comp_sm,
+                " is not compiled into this module; rebuild with "
+                "-DGEMM_AR_COMP_SM_SWEEP or call compiled_comp_sm_splits()");
 }
 };  // namespace gemm_ar_intranode_blackwell
