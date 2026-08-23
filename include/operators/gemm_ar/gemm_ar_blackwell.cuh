@@ -202,24 +202,56 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 #define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
 #endif
 
-template <int STRATEGY, int COMP_SM>
+// AR_UNROLL = independent multimem load/store requests each AR thread keeps in
+// flight. The non-sweep list keeps both values the shape heuristic picks (32
+// for M <= 2048, 64 above), so a default build behaves exactly as before.
+#ifdef GEMM_AR_UNROLL_SWEEP
+#define GEMM_AR_FOR_EACH_UNROLL(F) F(16) F(32) F(64)
+#else
+#define GEMM_AR_FOR_EACH_UNROLL(F) F(32) F(64)
+#endif
+
+// Passed as ar_unroll to fall back on the shape heuristic instead of pinning a
+// value. Must stay <= 0 so it can never collide with a real unroll factor.
+static constexpr int AR_UNROLL_BY_SHAPE = 0;
+
+inline int default_ar_unroll(int M) { return M <= 2048 ? 32 : 64; }
+
+// SUPERGROUP_WIDTH stays derived from M rather than swept: it sets the tile
+// walk, and comp and comm must agree on it or the barrier coordinates diverge.
+template <int STRATEGY, int COMP_SM, int AR_UNROLL>
 inline void gemm_ar_dispatch_shape(const fused_globals& G, int M) {
-    if (M <= 2048) {
-        launch_fused_gemm_ar_blackwell<4, 32, STRATEGY, COMP_SM>(G);
-    } else if (M <= 4096) {
-        launch_fused_gemm_ar_blackwell<4, 64, STRATEGY, COMP_SM>(G);
+    if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, AR_UNROLL, STRATEGY, COMP_SM>(G);
     } else {
-        launch_fused_gemm_ar_blackwell<8, 64, STRATEGY, COMP_SM>(G);
+        launch_fused_gemm_ar_blackwell<8, AR_UNROLL, STRATEGY, COMP_SM>(G);
     }
 }
 
-template <int COMP_SM>
-inline void gemm_ar_dispatch_strategy(const fused_globals& G, int M, int strategy) {
-    if (strategy == GemmToArSignalStrategy::PUSH) {
-        gemm_ar_dispatch_shape<GemmToArSignalStrategy::PUSH, COMP_SM>(G, M);
-    } else {
-        gemm_ar_dispatch_shape<GemmToArSignalStrategy::PULL, COMP_SM>(G, M);
+// The comp_sm x unroll cross product is built from nested template functions
+// rather than nested macros -- the macros stay one-dimensional and readable.
+template <int STRATEGY, int COMP_SM>
+inline bool gemm_ar_dispatch_unroll(const fused_globals& G, int M, int ar_unroll) {
+    bool ok = false;
+#define GEMM_AR_TRY_UNROLL(UN)                                          \
+    if (!ok && ar_unroll == (UN)) {                                     \
+        gemm_ar_dispatch_shape<STRATEGY, COMP_SM, UN>(G, M);            \
+        ok = true;                                                      \
     }
+    GEMM_AR_FOR_EACH_UNROLL(GEMM_AR_TRY_UNROLL)
+#undef GEMM_AR_TRY_UNROLL
+    return ok;
+}
+
+template <int COMP_SM>
+inline bool gemm_ar_dispatch_strategy(const fused_globals& G,
+                                      int M,
+                                      int strategy,
+                                      int ar_unroll) {
+    if (strategy == GemmToArSignalStrategy::PUSH) {
+        return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PUSH, COMP_SM>(G, M, ar_unroll);
+    }
+    return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PULL, COMP_SM>(G, M, ar_unroll);
 }
 
 // Lets the benchmark sweep exactly what was compiled instead of hardcoding a
@@ -232,6 +264,14 @@ inline std::vector<int> compiled_comp_sm_splits() {
     return out;
 }
 
+inline std::vector<int> compiled_ar_unrolls() {
+    std::vector<int> out;
+#define GEMM_AR_COLLECT_UNROLL(UN) out.push_back(UN);
+    GEMM_AR_FOR_EACH_UNROLL(GEMM_AR_COLLECT_UNROLL)
+#undef GEMM_AR_COLLECT_UNROLL
+    return out;
+}
+
 inline int num_blocks() { return config::NUM_BLOCKS; }
 
 void entrypoint(const at::Tensor& A,
@@ -241,7 +281,8 @@ void entrypoint(const at::Tensor& A,
                 dist::ParallelBuffer& C_final,
                 const int epoch,
                 int gemm_to_ar_signal_strategy,
-                int num_comp_sm) {
+                int num_comp_sm,
+                int ar_unroll) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -256,19 +297,30 @@ void entrypoint(const at::Tensor& A,
                 gemm_to_ar_signal_strategy,
                 "; expected PUSH(0) or PULL(1)");
 
-    bool launched = false;
+    const int unroll =
+        (ar_unroll <= AR_UNROLL_BY_SHAPE) ? default_ar_unroll(M) : ar_unroll;
+
+    bool matched_sm = false, launched = false;
 #define GEMM_AR_TRY_COMP_SM(SM)                                                       \
     if (!launched && num_comp_sm == (SM)) {                                           \
-        gemm_ar_dispatch_strategy<(SM)>(G, M, gemm_to_ar_signal_strategy);            \
-        launched = true;                                                              \
+        matched_sm = true;                                                            \
+        launched =                                                                    \
+            gemm_ar_dispatch_strategy<(SM)>(G, M, gemm_to_ar_signal_strategy, unroll);\
     }
     GEMM_AR_FOR_EACH_COMP_SM(GEMM_AR_TRY_COMP_SM)
 #undef GEMM_AR_TRY_COMP_SM
 
-    TORCH_CHECK(launched,
+    // Split the two failures so the message names the axis that is missing
+    // rather than blaming whichever was checked first.
+    TORCH_CHECK(matched_sm,
                 "num_comp_sm=",
                 num_comp_sm,
                 " is not compiled into this module; rebuild with "
                 "-DGEMM_AR_COMP_SM_SWEEP or call compiled_comp_sm_splits()");
+    TORCH_CHECK(launched,
+                "ar_unroll=",
+                unroll,
+                " is not compiled into this module; rebuild with "
+                "-DGEMM_AR_UNROLL_SWEEP or call compiled_ar_unrolls()");
 }
 };  // namespace gemm_ar_intranode_blackwell

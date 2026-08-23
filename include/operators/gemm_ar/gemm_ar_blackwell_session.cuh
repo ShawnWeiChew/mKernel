@@ -16,10 +16,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("epoch"),
           pybind11::arg("gemm_to_ar_signal_strategy"),
           pybind11::arg("num_comp_sm") =
-              gemm_ar_intranode_blackwell::DEFAULT_NUM_COMP_SM);
+              gemm_ar_intranode_blackwell::DEFAULT_NUM_COMP_SM,
+          pybind11::arg("ar_unroll") =
+              gemm_ar_intranode_blackwell::AR_UNROLL_BY_SHAPE);
     // Lets the bench sweep exactly the splits this module was built with,
     // rather than a hardcoded list that can drift from the build flags.
     m.def("compiled_comp_sm_splits",
           &gemm_ar_intranode_blackwell::compiled_comp_sm_splits);
+    m.def("compiled_ar_unrolls", &gemm_ar_intranode_blackwell::compiled_ar_unrolls);
     m.def("num_blocks", &gemm_ar_intranode_blackwell::num_blocks);
 }
