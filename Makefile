@@ -83,12 +83,16 @@ INTRA_NUM_DEVICES ?= 8
 # 108 kernels vs 8 for a default build), which is a long compile.
 COMP_SM_SWEEP   ?= 0
 UNROLL_SWEEP    ?= 0
+SIGNAL_DEPTH_SWEEP ?= 0
 SWEEP_DEFINES   :=
 ifeq ($(COMP_SM_SWEEP),1)
     SWEEP_DEFINES += -DGEMM_AR_COMP_SM_SWEEP
 endif
 ifeq ($(UNROLL_SWEEP),1)
     SWEEP_DEFINES += -DGEMM_AR_UNROLL_SWEEP
+endif
+ifeq ($(SIGNAL_DEPTH_SWEEP),1)
+    SWEEP_DEFINES += -DGEMM_AR_SIGNAL_DEPTH_SWEEP
 endif
 
 COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES) $(SWEEP_DEFINES)
@@ -152,7 +156,7 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_all
+.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_all
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -162,7 +166,9 @@ run_gemm_ar_blackwell : gemm_ar_blackwell
 # Prefer sweeping one axis at a time: sweep_all is the 108-kernel cross product.
 sweep_comp_sm : ; $(MAKE) COMP_SM_SWEEP=1 run_gemm_ar_blackwell
 sweep_unroll  : ; $(MAKE) UNROLL_SWEEP=1 run_gemm_ar_blackwell
-sweep_all     : ; $(MAKE) COMP_SM_SWEEP=1 UNROLL_SWEEP=1 run_gemm_ar_blackwell
+sweep_depth   : ; $(MAKE) SIGNAL_DEPTH_SWEEP=1 run_gemm_ar_blackwell
+# 528 kernels. Prefer one axis at a time unless you are chasing an interaction.
+sweep_all     : ; $(MAKE) COMP_SM_SWEEP=1 UNROLL_SWEEP=1 SIGNAL_DEPTH_SWEEP=1 run_gemm_ar_blackwell
 
 gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
 

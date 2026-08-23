@@ -18,11 +18,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_comp_sm") =
               gemm_ar_intranode_blackwell::DEFAULT_NUM_COMP_SM,
           pybind11::arg("ar_unroll") =
-              gemm_ar_intranode_blackwell::AR_UNROLL_BY_SHAPE);
+              gemm_ar_intranode_blackwell::AR_UNROLL_BY_SHAPE,
+          pybind11::arg("signal_depth") =
+              gemm_ar_intranode_blackwell::DEFAULT_SIGNAL_DEPTH);
     // Lets the bench sweep exactly the splits this module was built with,
     // rather than a hardcoded list that can drift from the build flags.
     m.def("compiled_comp_sm_splits",
           &gemm_ar_intranode_blackwell::compiled_comp_sm_splits);
     m.def("compiled_ar_unrolls", &gemm_ar_intranode_blackwell::compiled_ar_unrolls);
+    m.def("compiled_signal_depths",
+          &gemm_ar_intranode_blackwell::compiled_signal_depths);
     m.def("num_blocks", &gemm_ar_intranode_blackwell::num_blocks);
 }

@@ -54,7 +54,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
+template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM, int SIGNAL_DEPTH>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     // Only the comp/comm split varies; every other config constant is
     // split-independent, so plain `config::` stays correct elsewhere.
@@ -328,6 +328,49 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         tmem[0] =
             tm_alloc.allocate<fused_globals::C_tt_tile>(warpgroup_id * fused_globals::COL_BLOCK);
 
+        // Announcing a tile. Factored out because the pipelined path signals
+        // from both the steady-state loop and the drain tail. Only the thread
+        // that issued the TMA stores may call it -- it is the same thread whose
+        // store_async_wait establishes that the data has landed.
+        auto signal_tile = [&](int row, int col, int dev) {
+            if (warpgroup::laneid() != 0) {
+                return;
+            }
+            if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
+                dist::signal(G.comp_comm_barrier, {row, col}, dev, 1);
+            } else {
+                // only need a GPU scope, because the data only needs to be present in local L2
+                // for peer to read over nvlink
+                (void)dev;
+                comm::atomic_u32::release_store_gpu(
+                    &G.comp_comm_barrier[G.dev_idx][{row, col}], G.epoch);
+            }
+        };
+
+        // cp.async.bulk.wait_group counts GROUPS, not transactions or bytes --
+        // a group is whatever the last cp.async.bulk.commit_group bundled. TK's
+        // store_async commits its own group per call
+        // (tk_ops_thread_memory_tile_tma.cuh:75), so one store == one group and
+        // a tile's EPILOGUE_STAGES stores are EPILOGUE_STAGES groups.
+        //
+        // This constant therefore tracks TK, not the tile shape. If store_async
+        // ever batched its commits, the correct value would drop to 1 per tile
+        // and leaving EPILOGUE_STAGES pending would let SIGNAL_DEPTH*8 tiles be
+        // in flight while only SIGNAL_DEPTH were held back from announcement --
+        // publishing tiles whose stores have not landed.
+        constexpr int STORE_GROUPS_PER_TILE = fused_globals::EPILOGUE_STAGES;
+
+        // Tiles stored but not yet announced, for SIGNAL_DEPTH > 0. Sized 1 at
+        // depth 0 purely so the declaration stays legal; nothing reads it.
+        constexpr int SIG_RING = (SIGNAL_DEPTH > 0) ? SIGNAL_DEPTH : 1;
+        int ring_row[SIG_RING], ring_col[SIG_RING], ring_dev[SIG_RING];
+        int ring_filled = 0, ring_head = 0;
+        (void)ring_row;
+        (void)ring_col;
+        (void)ring_dev;
+        (void)ring_filled;
+        (void)ring_head;
+
         for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             // this returns an index in the 512 * 256 tile
             auto [tile_row_id, tile_col_id] =
@@ -342,21 +385,18 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                      warpgroup_id,
                      tile_id + num_comp_clusters >= num_tiles_total);
 
-            // TODO: for the sake of corretness, sync here before issuing a completion argument
-            // not sure if there is a world where I can wait for the store completion on another
-            // thread the concern is that there is a race between the previous another way is to
-            // weave the tma completion into the barrier that the epilogue waits on in the first
-            // place? we will definitely lose parallelism here though
-            // TODO: verify that only 1 thread waits on this completion, the rest can fire forward
-            dist::tma::store_async_wait();
+            // Depth 0 drains every group this tile committed, then announces
+            // that tile. Depth D>0 leaves D tiles' worth of groups in flight
+            // and announces the tile D iterations back instead: bulk groups
+            // retire in commit order, so "at most D*EPILOGUE_STAGES pending"
+            // means everything older than that tile has landed.
+            //
+            // The wait count and the tile being announced MUST move together.
+            // Leaving groups in flight while announcing the current tile
+            // publishes a tile whose last chunks have not landed -- the peer
+            // then reduces stale memory, intermittently and silently.
+            dist::tma::store_async_wait<SIGNAL_DEPTH * STORE_GROUPS_PER_TILE>();
 
-            // if (elect_warp_leader()) {
-            //     arrive(epilogue_gmem_store_finished);
-            // }
-
-            // TODO: not sure if there is an optimization where I can have a relaxed -> release
-            // TODO: what if I have number of threads that is equal to the number of devices I
-            // want to signal???
             // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
             // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
             // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
@@ -364,19 +404,33 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // not a function of tile_id.
             const int device_to_signal = (c_row_tile % 4) + (tile_col_id % 2) * 4;
 
-            // NOTE: there is no need to use a warpgroup::sync() here, becuase the thread issuing
-            // the TMA store is also the thread doing the TMA wait, so the signal will not be sent
-            // until the TMA wait is completed
-            if (warpgroup::laneid() == 0) {
-                if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
-                    dist::signal(
-                        G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
+            if constexpr (SIGNAL_DEPTH == 0) {
+                signal_tile(c_row_tile, tile_col_id, device_to_signal);
+            } else {
+                // Ring holds the tiles issued but not yet announced. Once it is
+                // full, ring_head is the oldest -- which the wait above just
+                // guaranteed complete.
+                if (ring_filled == SIG_RING) {
+                    signal_tile(ring_row[ring_head], ring_col[ring_head], ring_dev[ring_head]);
                 } else {
-                    // only need a GPU scope, because the data only needs to be present in local L2
-                    // for peer to read over nvlink
-                    comm::atomic_u32::release_store_gpu(
-                        &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
+                    ring_filled++;
                 }
+                ring_row[ring_head] = c_row_tile;
+                ring_col[ring_head] = tile_col_id;
+                ring_dev[ring_head] = device_to_signal;
+                ring_head = (ring_head + 1) % SIG_RING;
+            }
+        }
+
+        if constexpr (SIGNAL_DEPTH > 0) {
+            // Mandatory tail. Without it the last SIGNAL_DEPTH tiles are never
+            // announced and every comm block waiting on them spins forever.
+            dist::tma::store_async_wait<0>();
+#pragma unroll
+            for (int k = 0; k < SIG_RING; k++) {
+                if (k >= ring_filled) break;
+                const int slot = (ring_head + SIG_RING - ring_filled + k) % SIG_RING;
+                signal_tile(ring_row[slot], ring_col[slot], ring_dev[slot]);
             }
         }
     }
@@ -491,23 +545,35 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
+template <int SUPERGROUP_WIDTH,
+          int AR_UNROLL,
+          int GEMM_TO_AR_SIGNAL_STRATEGY,
+          int COMP_SM,
+          int SIGNAL_DEPTH>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config_t<COMP_SM>::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
+        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
     } else {
         fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
+template <int SUPERGROUP_WIDTH,
+          int AR_UNROLL,
+          int GEMM_TO_AR_SIGNAL_STRATEGY,
+          int COMP_SM,
+          int SIGNAL_DEPTH>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
+template <int SUPERGROUP_WIDTH,
+          int AR_UNROLL,
+          int GEMM_TO_AR_SIGNAL_STRATEGY,
+          int COMP_SM,
+          int SIGNAL_DEPTH>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -516,7 +582,8 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
     auto this_kernel =
-        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>;
+        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM,
+                              SIGNAL_DEPTH>;
 
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's

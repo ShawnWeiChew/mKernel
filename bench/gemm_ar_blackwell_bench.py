@@ -16,6 +16,7 @@ from common import check_close
 SHAPES= [2048, 4096, 8192, 16384, 32768]
 # Split the sweep is compared against; must be in GEMM_AR_FOR_EACH_COMP_SM.
 DEFAULT_COMP_SM = 128
+DEFAULT_SIGNAL_DEPTH = 0
 
 
 def default_ar_unroll(M):
@@ -138,17 +139,22 @@ def main():
     # from asking for a split that would TORCH_CHECK at launch.
     COMP_SM_SPLITS = list(mod.compiled_comp_sm_splits())
     AR_UNROLLS = list(mod.compiled_ar_unrolls())
+    SIGNAL_DEPTHS = list(mod.compiled_signal_depths())
     NUM_BLOCKS = mod.num_blocks()
-    n_fused = len(STRATEGIES) * len(COMP_SM_SPLITS) * len(AR_UNROLLS)
+    n_fused = (len(STRATEGIES) * len(COMP_SM_SPLITS) * len(AR_UNROLLS)
+              * len(SIGNAL_DEPTHS))
     if is_chief:
         print(f"comp/comm SM splits compiled in (of {NUM_BLOCKS} blocks): "
               + ", ".join(f"{sm}/{NUM_BLOCKS - sm}" for sm in COMP_SM_SPLITS),
               flush=True)
         print(f"AR unroll factors compiled in: "
               + ", ".join(str(u) for u in AR_UNROLLS), flush=True)
+        print(f"signal pipeline depths compiled in: "
+              + ", ".join(str(d) for d in SIGNAL_DEPTHS), flush=True)
         print(f"{n_fused} fused configurations "
               f"({len(STRATEGIES)} strategies x {len(COMP_SM_SPLITS)} splits "
-              f"x {len(AR_UNROLLS)} unrolls)", flush=True)
+              f"x {len(AR_UNROLLS)} unrolls x {len(SIGNAL_DEPTHS)} depths)",
+              flush=True)
 
     for n in SHAPES:
         M, K, N = n, n // NUM_DEVICES, n
@@ -181,11 +187,13 @@ def main():
         # Full cross-product only at the smallest shape; the per-check host
         # comparison of an MxN tensor is far too slow to repeat at M=32768.
         if n == SHAPES[0]:
-            configs_to_check = [(sm, un) for sm in COMP_SM_SPLITS for un in AR_UNROLLS]
+            configs_to_check = [(sm, un, sd) for sm in COMP_SM_SPLITS
+                                for un in AR_UNROLLS for sd in SIGNAL_DEPTHS]
         else:
-            configs_to_check = [(DEFAULT_COMP_SM, default_ar_unroll(n))]
+            configs_to_check = [(DEFAULT_COMP_SM, default_ar_unroll(n),
+                                 DEFAULT_SIGNAL_DEPTH)]
         check_epochs = {st: 0 for st in STRATEGIES}
-        for strategy, (comp_sm, unroll) in (
+        for strategy, (comp_sm, unroll, depth) in (
                 (st, cfg) for st in STRATEGIES for cfg in configs_to_check):
             # Unlike the timed loop, the outputs ARE cleared between strategies.
             # Both write every element, so leaving the previous strategy's result
@@ -206,10 +214,10 @@ def main():
             check_epochs[strategy] += 1
             mod.gemm_ar_intranode_blackwell(
                 A, B, C_dbuf, barriers[strategy], C_final,
-                check_epochs[strategy], strategy.value, comp_sm, unroll)
+                check_epochs[strategy], strategy.value, comp_sm, unroll, depth)
             torch.cuda.synchronize()
 
-            tag = f"{strategy.name}/{comp_sm}/u{unroll}"
+            tag = f"{strategy.name}/{comp_sm}/u{unroll}/d{depth}"
             gemm_correctness_check = check_close(
                 f"gemm M={M} [{tag}]", C_dbuf.data_, local_ref_cpu)
 
@@ -308,12 +316,14 @@ def main():
         for strategy in STRATEGIES:
             for comp_sm in COMP_SM_SPLITS:
                 for unroll in AR_UNROLLS:
-                    for _ in range(WARMUP):
-                        sync_ranks()
-                        epochs[strategy] += 1
-                        mod.gemm_ar_intranode_blackwell(
-                            A, B, C_dbuf, barriers[strategy], C_final,
-                            epochs[strategy], strategy.value, comp_sm, unroll)
+                    for depth in SIGNAL_DEPTHS:
+                        for _ in range(WARMUP):
+                            sync_ranks()
+                            epochs[strategy] += 1
+                            mod.gemm_ar_intranode_blackwell(
+                                A, B, C_dbuf, barriers[strategy], C_final,
+                                epochs[strategy], strategy.value, comp_sm,
+                                unroll, depth)
 
         if cutlass_ok:
             for _ in range(WARMUP):
@@ -347,10 +357,11 @@ def main():
         # alone -- so splits share a strategy's barrier and epoch counter, which
         # keeps rising monotonically across all of them.
         conditions = ([BASELINE]
-                      + [("fused", st, sm, un)
+                      + [("fused", st, sm, un, sd)
                          for st in STRATEGIES
                          for sm in COMP_SM_SPLITS
-                         for un in AR_UNROLLS]
+                         for un in AR_UNROLLS
+                         for sd in SIGNAL_DEPTHS]
                       + ([CUTLASS] if cutlass_ok else []))
         ORDERS = williams_orders(conditions)
         # Round the target iteration count to a whole number of orders so the
@@ -380,12 +391,12 @@ def main():
                     cutlass_run()
                     e.record()
                 else:
-                    _, strategy, comp_sm, unroll = cond
+                    _, strategy, comp_sm, unroll, depth = cond
                     epochs[strategy] += 1
                     s.record()
                     mod.gemm_ar_intranode_blackwell(
                         A, B, C_dbuf, barriers[strategy], C_final,
-                        epochs[strategy], strategy.value, comp_sm, unroll)
+                        epochs[strategy], strategy.value, comp_sm, unroll, depth)
                     e.record()
                 samples[cond].append((s, e))
 
@@ -400,10 +411,11 @@ def main():
         baseline_ms = median_then_max_cuda(
             elapsed_ms(samples[BASELINE]), label="cublas+nccl")
         fused_ms = {
-            (st, sm, un): median_then_max_cuda(
-                elapsed_ms(samples[("fused", st, sm, un)]),
-                label=f"fused[{st.name}/{sm}/u{un}]")
-            for st in STRATEGIES for sm in COMP_SM_SPLITS for un in AR_UNROLLS
+            (st, sm, un, sd): median_then_max_cuda(
+                elapsed_ms(samples[("fused", st, sm, un, sd)]),
+                label=f"fused[{st.name}/{sm}/u{un}/d{sd}]")
+            for st in STRATEGIES for sm in COMP_SM_SPLITS
+            for un in AR_UNROLLS for sd in SIGNAL_DEPTHS
         }
         cutlass_ms = (
             median_then_max_cuda(elapsed_ms(samples[CUTLASS]), label="cutlass")
@@ -426,10 +438,11 @@ def main():
 
             # Sweep table, sorted fastest first, so the best split is obvious
             # and the shape of the curve is visible next to it.
-            print(f"  -- sweep: strategy / comp:comm of {NUM_BLOCKS} / AR unroll --",
+            print(f"  -- sweep: strategy / comp:comm of {NUM_BLOCKS} / "
+                  f"AR unroll / signal depth --",
                   flush=True)
-            for (st, sm, un), ms in sorted(fused_ms.items(), key=lambda kv: kv[1]):
-                tag = f"{st.name}/{sm}:{NUM_BLOCKS - sm}/u{un}"
+            for (st, sm, un, sd), ms in sorted(fused_ms.items(), key=lambda kv: kv[1]):
+                tag = f"{st.name}/{sm}:{NUM_BLOCKS - sm}/u{un}/d{sd}"
                 line = (f"  {tag:<24}: {ms:8.3f} ms  ({tflops(ms):7.1f} TFLOP/s)  "
                         f"{baseline_ms / ms:6.3f}x vs cublas+nccl")
                 if cutlass_ms is not None and ms > 0:
@@ -438,12 +451,14 @@ def main():
 
             best = min(fused_ms, key=fused_ms.get)
             best_ms = fused_ms[best]
-            baseline_cfg = (best[0], DEFAULT_COMP_SM, default_ar_unroll(M))
+            baseline_cfg = (best[0], DEFAULT_COMP_SM, default_ar_unroll(M),
+                            DEFAULT_SIGNAL_DEPTH)
             msg = (f"  best: {best[0].name} @ {best[1]}:{NUM_BLOCKS - best[1]} "
-                   f"unroll={best[2]} = {best_ms:.3f} ms")
+                   f"unroll={best[2]} depth={best[3]} = {best_ms:.3f} ms")
             if baseline_cfg in fused_ms and fused_ms[baseline_cfg] > 0:
                 msg += (f"  ({fused_ms[baseline_cfg] / best_ms:.3f}x vs the "
-                        f"{DEFAULT_COMP_SM}/u{baseline_cfg[2]} default)")
+                        f"{DEFAULT_COMP_SM}/u{baseline_cfg[2]}/d{DEFAULT_SIGNAL_DEPTH} "
+                        f"default)")
             if cutlass_ms is not None and best_ms > 0:
                 verdict = "BEATS" if best_ms < cutlass_ms else "behind"
                 msg += f"  [{verdict} cutlass by {abs(1 - cutlass_ms / best_ms) * 100:.1f}%]"

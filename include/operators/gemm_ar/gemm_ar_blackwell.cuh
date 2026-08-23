@@ -197,7 +197,7 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // static_asserts both.
 #ifdef GEMM_AR_COMP_SM_SWEEP
 #define GEMM_AR_FOR_EACH_COMP_SM(F) \
-    F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108)
+    F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108) F(104) F(100)
 #else
 #define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
 #endif
@@ -206,52 +206,84 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // flight. The non-sweep list keeps both values the shape heuristic picks (32
 // for M <= 2048, 64 above), so a default build behaves exactly as before.
 #ifdef GEMM_AR_UNROLL_SWEEP
-#define GEMM_AR_FOR_EACH_UNROLL(F) F(16) F(32) F(64)
+#define GEMM_AR_FOR_EACH_UNROLL(F) F(8) F(16) F(32) F(64)
 #else
 #define GEMM_AR_FOR_EACH_UNROLL(F) F(32) F(64)
+#endif
+
+// SIGNAL_DEPTH = how many tiles' TMA stores stay in flight when a tile is
+// announced to the comm SMs. 0 drains fully and announces the tile just stored
+// (the original behaviour). D > 0 leaves D tiles in flight and announces the
+// tile D iterations back, trading a shorter epilogue stall for a later signal
+// -- which gives the comm SMs their work later, so it can go either way.
+#ifdef GEMM_AR_SIGNAL_DEPTH_SWEEP
+#define GEMM_AR_FOR_EACH_SIGNAL_DEPTH(F) F(0) F(1) F(2)
+#else
+#define GEMM_AR_FOR_EACH_SIGNAL_DEPTH(F) F(0)
 #endif
 
 // Passed as ar_unroll to fall back on the shape heuristic instead of pinning a
 // value. Must stay <= 0 so it can never collide with a real unroll factor.
 static constexpr int AR_UNROLL_BY_SHAPE = 0;
+static constexpr int DEFAULT_SIGNAL_DEPTH = 0;
 
 inline int default_ar_unroll(int M) { return M <= 2048 ? 32 : 64; }
 
 // SUPERGROUP_WIDTH stays derived from M rather than swept: it sets the tile
 // walk, and comp and comm must agree on it or the barrier coordinates diverge.
-template <int STRATEGY, int COMP_SM, int AR_UNROLL>
+template <int STRATEGY, int COMP_SM, int AR_UNROLL, int SIGNAL_DEPTH>
 inline void gemm_ar_dispatch_shape(const fused_globals& G, int M) {
     if (M <= 4096) {
-        launch_fused_gemm_ar_blackwell<4, AR_UNROLL, STRATEGY, COMP_SM>(G);
+        launch_fused_gemm_ar_blackwell<4, AR_UNROLL, STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
     } else {
-        launch_fused_gemm_ar_blackwell<8, AR_UNROLL, STRATEGY, COMP_SM>(G);
+        launch_fused_gemm_ar_blackwell<8, AR_UNROLL, STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
     }
+}
+
+template <int STRATEGY, int COMP_SM, int AR_UNROLL>
+inline bool gemm_ar_dispatch_depth(const fused_globals& G, int M, int signal_depth) {
+    bool ok = false;
+#define GEMM_AR_TRY_DEPTH(D)                                                    \
+    if (!ok && signal_depth == (D)) {                                           \
+        gemm_ar_dispatch_shape<STRATEGY, COMP_SM, AR_UNROLL, D>(G, M);           \
+        ok = true;                                                              \
+    }
+    GEMM_AR_FOR_EACH_SIGNAL_DEPTH(GEMM_AR_TRY_DEPTH)
+#undef GEMM_AR_TRY_DEPTH
+    return ok;
 }
 
 // The comp_sm x unroll cross product is built from nested template functions
 // rather than nested macros -- the macros stay one-dimensional and readable.
 template <int STRATEGY, int COMP_SM>
-inline bool gemm_ar_dispatch_unroll(const fused_globals& G, int M, int ar_unroll) {
-    bool ok = false;
-#define GEMM_AR_TRY_UNROLL(UN)                                          \
-    if (!ok && ar_unroll == (UN)) {                                     \
-        gemm_ar_dispatch_shape<STRATEGY, COMP_SM, UN>(G, M);            \
-        ok = true;                                                      \
+inline bool gemm_ar_dispatch_unroll(const fused_globals& G,
+                                    int M,
+                                    int ar_unroll,
+                                    int signal_depth) {
+    bool matched = false, ok = false;
+#define GEMM_AR_TRY_UNROLL(UN)                                                  \
+    if (!matched && ar_unroll == (UN)) {                                        \
+        matched = true;                                                         \
+        ok = gemm_ar_dispatch_depth<STRATEGY, COMP_SM, UN>(G, M, signal_depth);  \
     }
     GEMM_AR_FOR_EACH_UNROLL(GEMM_AR_TRY_UNROLL)
 #undef GEMM_AR_TRY_UNROLL
-    return ok;
+    // Distinguishing the two lets the caller name the axis that is missing.
+    return matched && ok;
 }
 
 template <int COMP_SM>
 inline bool gemm_ar_dispatch_strategy(const fused_globals& G,
                                       int M,
                                       int strategy,
-                                      int ar_unroll) {
+                                      int ar_unroll,
+                                      int signal_depth) {
     if (strategy == GemmToArSignalStrategy::PUSH) {
-        return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PUSH, COMP_SM>(G, M, ar_unroll);
+        return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PUSH, COMP_SM>(
+            G, M, ar_unroll, signal_depth);
     }
-    return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PULL, COMP_SM>(G, M, ar_unroll);
+    return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PULL, COMP_SM>(
+        G, M, ar_unroll, signal_depth);
 }
 
 // Lets the benchmark sweep exactly what was compiled instead of hardcoding a
@@ -272,6 +304,14 @@ inline std::vector<int> compiled_ar_unrolls() {
     return out;
 }
 
+inline std::vector<int> compiled_signal_depths() {
+    std::vector<int> out;
+#define GEMM_AR_COLLECT_DEPTH(D) out.push_back(D);
+    GEMM_AR_FOR_EACH_SIGNAL_DEPTH(GEMM_AR_COLLECT_DEPTH)
+#undef GEMM_AR_COLLECT_DEPTH
+    return out;
+}
+
 inline int num_blocks() { return config::NUM_BLOCKS; }
 
 void entrypoint(const at::Tensor& A,
@@ -282,7 +322,8 @@ void entrypoint(const at::Tensor& A,
                 const int epoch,
                 int gemm_to_ar_signal_strategy,
                 int num_comp_sm,
-                int ar_unroll) {
+                int ar_unroll,
+                int signal_depth) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -304,8 +345,8 @@ void entrypoint(const at::Tensor& A,
 #define GEMM_AR_TRY_COMP_SM(SM)                                                       \
     if (!launched && num_comp_sm == (SM)) {                                           \
         matched_sm = true;                                                            \
-        launched =                                                                    \
-            gemm_ar_dispatch_strategy<(SM)>(G, M, gemm_to_ar_signal_strategy, unroll);\
+        launched = gemm_ar_dispatch_strategy<(SM)>(                                   \
+            G, M, gemm_to_ar_signal_strategy, unroll, signal_depth);                  \
     }
     GEMM_AR_FOR_EACH_COMP_SM(GEMM_AR_TRY_COMP_SM)
 #undef GEMM_AR_TRY_COMP_SM
@@ -320,7 +361,10 @@ void entrypoint(const at::Tensor& A,
     TORCH_CHECK(launched,
                 "ar_unroll=",
                 unroll,
+                " / signal_depth=",
+                signal_depth,
                 " is not compiled into this module; rebuild with "
-                "-DGEMM_AR_UNROLL_SWEEP or call compiled_ar_unrolls()");
+                "-DGEMM_AR_UNROLL_SWEEP / -DGEMM_AR_SIGNAL_DEPTH_SWEEP, or call "
+                "compiled_ar_unrolls() / compiled_signal_depths()");
 }
 };  // namespace gemm_ar_intranode_blackwell
