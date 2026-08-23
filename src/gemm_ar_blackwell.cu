@@ -376,79 +376,16 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 }
 
 // ============================================================================
-// Pipelined intra-node all-reduce tile helper
+// Intranode All-Reduce
 // ============================================================================
 //
-// Ported from gemm_ar.cu's gemm_ar_pipelined_ar_tile (see the comment block
-// there). The naive version issued one multimem.ld_reduce and one multimem.st
-// per element, both carrying a "memory" ASM clobber, so every element cost two
-// serialized NVSwitch round-trips (~600 ns each) with exactly one 4-byte
-// request in flight per thread. That caps the AR at a few tens of GB/s
-// regardless of how much NVLink bandwidth is available.
-//
-// Fix: issue AR_UNROLL independent ld_reduce into separate registers before
-// any store, using the no-clobber variants, so the warp scheduler can keep
-// AR_UNROLL NVSwitch round-trips in flight at once.
-//
-// Safety: the caller's __syncthreads() after the per-tile barrier wait is the
-// acquire fence that makes every device's writes to C_dist visible, so the
-// individual loads do not need their own "memory" clobber. The ops are still
-// `asm volatile`, so they are neither reordered against each other nor
-// eliminated.
-constexpr int AR_UNROLL = 8;
-
+// Ported from gemm_ar.cu's gemm_ar_pipelined_ar_tile
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
 __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
-                                                  int col_base) {
-    // The comm side works in C_tile rows (ROW_BLOCK / CONSUMER_WARPS), which is
-    // the granularity the epilogue signals at and the granularity row_base is
-    // computed in. Walking a full ROW_BLOCK from it spills into the next row
-    // tile, and on the last one runs off the end of the M x N buffer.
-    constexpr int AR_ROWS = fused_globals::ROW_BLOCK / config::CONSUMER_WARPS;  // 128
+                                                  int col_base);
 
-    // bf16_2 units — one 4-byte multimem access each.
-    constexpr int UNITS_PER_ROW = fused_globals::COL_BLOCK / 2;  // 128
-    constexpr int TOTAL_UNITS = AR_ROWS * UNITS_PER_ROW;         // 16384
-    constexpr int NT = config::NUM_THREADS;
-    constexpr int BATCH = AR_UNROLL * NT;
-
-    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
-        comm::bf16_2* ld_ptrs[AR_UNROLL];
-        comm::bf16_2* st_ptrs[AR_UNROLL];
-        uint32_t tmps[AR_UNROLL];
-
-        // Consecutive threads take consecutive bf16_2 units, so each warp's
-        // requests coalesce into contiguous 128B chunks.
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            const int j = base + u * NT;
-            if (j < TOTAL_UNITS) {
-                const int r = row_base + j / UNITS_PER_ROW;
-                const int c = col_base + (j % UNITS_PER_ROW) * 2;
-                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(G.C_dist.mc_ptr_at({r, c}));
-                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(G.C_final.mc_ptr_at({r, c}));
-            }
-        }
-
-        // All loads before any store — this is the whole point of the helper.
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            if (base + u * NT < TOTAL_UNITS) {
-                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
-                                                                                 ld_ptrs[u]);
-            }
-        }
-
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            if (base + u * NT < TOTAL_UNITS) {
-                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
-            }
-        }
-    }
-}
-
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
@@ -488,27 +425,70 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 
         const int row_base = actual_tile_row * (fused_globals::ROW_BLOCK / config::CONSUMER_WARPS);
         const int col_base = tile_col_idx * fused_globals::COL_BLOCK;
-        pipelined_ar_tile(G, row_base, col_base);
+        pipelined_ar_tile<AR_UNROLL,
+                          fused_globals::ROW_BLOCK / config::CONSUMER_WARPS,
+                          fused_globals::COL_BLOCK>(G, row_base, col_base);
     }
 }
 
-template <int SUPERGROUP_WIDTH>
+namespace ar_detail {
+// create variations for how much caching can be done based on the unroll factor, to stay within the
+// register limits
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_no_cache(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base);
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_ld_cached(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base);
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
+                                                 const fused_globals::C_final_tensor& C_final,
+                                                 int row_base,
+                                                 int col_base);
+}  // namespace ar_detail
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
+                                                  int row_base,
+                                                  int col_base) {
+    if constexpr (AR_UNROLL >= 128) {
+        ar_detail::ar_unroll_no_cache<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+            G.C_dist, G.C_final, row_base, col_base);
+    } else if (AR_UNROLL >= 32) {
+        ar_detail::ar_unroll_ld_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+            G.C_dist, G.C_final, row_base, col_base);
+    } else {
+        ar_detail::ar_unroll_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+            G.C_dist, G.C_final, row_base, col_base);
+    }
+}
+
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config::NUM_COMP_SM) {
         fused_comp_sm<SUPERGROUP_WIDTH>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL>(G);
 }
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -516,7 +496,7 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL>;
 
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
@@ -550,6 +530,146 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
 
     // MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 }
+
+namespace ar_detail {
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_no_cache(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    // bf16_2 units — one 4-byte multimem access each.
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
+    constexpr int NT = config::NUM_THREADS;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(
+                    tmps[u], reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c})));
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
+                    reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c})), tmps[u]);
+            }
+        }
+    }
+}
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
+                                                 const fused_globals::C_final_tensor& C_final,
+                                                 int row_base,
+                                                 int col_base) {
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
+    constexpr int NT = config::NUM_THREADS;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+            }
+        }
+    }
+}
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_ld_cached(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
+    constexpr int NT = config::NUM_THREADS;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+        const ptrdiff_t st_delta = C_final.mc_ptr - C_dist.mc_ptr;  // outside the loop
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
+                    reinterpret_cast<comm::bf16_2*>(reinterpret_cast<comm::bf16*>(ld_ptrs[u]) +
+                                                    st_delta),
+                    tmps[u]);
+            }
+        }
+    }
+}
+};  // namespace ar_detail
 
 };  // namespace gemm_ar_intranode_blackwell
 

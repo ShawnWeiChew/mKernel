@@ -22,7 +22,7 @@
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
@@ -172,10 +172,12 @@ void entrypoint(const at::Tensor& A,
 
     fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
 
-    if (M <= 4096) {
-        launch_fused_gemm_ar_blackwell<4>(G);
+    if (M <= 2048) {
+        launch_fused_gemm_ar_blackwell<4, 32>(G);
+    } else if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, 64>(G);
     } else {
-        launch_fused_gemm_ar_blackwell<8>(G);
+        launch_fused_gemm_ar_blackwell<8, 64>(G);
     }
 }
 };  // namespace gemm_ar_intranode_blackwell
