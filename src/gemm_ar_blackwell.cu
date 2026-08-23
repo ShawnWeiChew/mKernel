@@ -130,7 +130,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
     // normally, it has to be a full sync(), but since we are waiting on the PDL launch later in the
     // code, we can just arrive here, then wait later
-    everyone::tma::cluster::sync();
+    everyone::tma::cluster::arrive_aligned();
 
     // tile_row_idx is this CTA's FIRST A row tile, in A_tile units
     // (ROW_BLOCK / CONSUMER_WARPS rows, already rank adjusted) -- consumer c
@@ -281,9 +281,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         if (warp_id == config::PRODUCER_WARP_ID) {
             if (elect_warp_leader()) {
-                // pdl::wait();
+                pdl::wait();
                 // NOTE: This splits up the arrive at the top and interleaves the work in between
-                // everyone::tma::cluster::wait();
+                everyone::tma::cluster::wait();
                 int input_stage_id = 0;
                 for (int tile_id = cluster_idx; tile_id < num_tiles_total;
                      tile_id += num_comp_clusters) {
@@ -301,7 +301,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if (cta_rank == 0 && elect_warp_leader()) {
                 // consumer_id pairs this warp with epilogue warpgroup
                 // consumer_id: same A tile, same accumulator, same semaphores.
-                // everyone::tma::cluster::wait();
+                everyone::tma::cluster::wait();
                 const int consumer_id = warp_id - config::FIRST_CONSUMER_WARP_ID;
 
                 // give each warp its own view of tmem
@@ -317,7 +317,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
-        // everyone::tma::cluster::wait_aligned();
+        everyone::tma::cluster::wait_aligned();
 
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
@@ -366,6 +366,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             if (warpgroup::laneid() == 0) {
                 dist::signal(G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
             }
+        }
+
+        // At this point, the final warpgroup 0 has finished write to gmem
+        // and data has been flushed -- we want some overlap with next kernel launch
+        // This will not be the last threadblock to signal either
+        if (warpgroup_id == 0 && warpgroup::laneid() == 0) {
+            pdl::arrive();
         }
     }
 }
@@ -419,6 +426,11 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
             } while (val < iter_gate_value);
         }
         __syncthreads();
+
+        // try signalling PDL completion if this is the last AR to run for this SM
+        if (tile_id + tile_id_stride >= num_tiles_total) {
+            pdl::arrive();
+        }
 
         const int row_base = actual_tile_row * (fused_globals::ROW_BLOCK / config::CONSUMER_WARPS);
         const int col_base = tile_col_idx * fused_globals::COL_BLOCK;
@@ -509,20 +521,19 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
         }
     }
 
-    this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
-    // cudaLaunchAttribute attrs[1];
-    // attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    // attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    // cudaLaunchConfig_t launch_config = {};
-    // launch_config.gridDim = grid;
-    // launch_config.blockDim = num_threads;
-    // launch_config.dynamicSmemBytes = smem_size;
-    // launch_config.stream = stream;
-    // // launch_config.attrs = attrs;
-    // launch_config.numAttrs = 1;
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = grid;
+    launch_config.blockDim = num_threads;
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
 
-    // MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
+    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 }
 
 namespace ar_detail {
