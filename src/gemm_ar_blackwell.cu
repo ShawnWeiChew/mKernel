@@ -460,10 +460,7 @@ template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
 __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base) {
-    if constexpr (AR_UNROLL >= 128) {
-        ar_detail::ar_unroll_no_cache<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
-            G.C_dist, G.C_final, row_base, col_base);
-    } else if (AR_UNROLL >= 32) {
+    if constexpr (AR_UNROLL >= 32) {
         ar_detail::ar_unroll_ld_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
             G.C_dist, G.C_final, row_base, col_base);
     } else {
@@ -532,48 +529,6 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
 }
 
 namespace ar_detail {
-
-template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
-__device__ __forceinline__ void ar_unroll_no_cache(
-    const fused_globals::C_distributed_tensor& C_dist,
-    const fused_globals::C_final_tensor& C_final,
-    int row_base,
-    int col_base) {
-    // bf16_2 units — one 4-byte multimem access each.
-    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
-    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
-    constexpr int NT = config::NUM_THREADS;
-    constexpr int BATCH = AR_UNROLL * NT;
-
-    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
-        uint32_t tmps[AR_UNROLL];
-
-        // Consecutive threads take consecutive bf16_2 units, so each warp's
-        // requests coalesce into contiguous 128B chunks.
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            const int j = base + u * config::NUM_THREADS;
-            if (j < TOTAL_UNITS) {
-                const int r = row_base + j / UNITS_PER_ROW;
-                const int c = col_base + (j % UNITS_PER_ROW) * 2;
-                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(
-                    tmps[u], reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c})));
-            }
-        }
-
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            const int j = base + u * config::NUM_THREADS;
-            if (j < TOTAL_UNITS) {
-                const int r = row_base + j / UNITS_PER_ROW;
-                const int c = col_base + (j % UNITS_PER_ROW) * 2;
-                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(
-                    reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c})), tmps[u]);
-            }
-        }
-    }
-}
-
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
 __device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
                                                  const fused_globals::C_final_tensor& C_final,
