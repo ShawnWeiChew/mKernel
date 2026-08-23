@@ -95,7 +95,10 @@ ifeq ($(SIGNAL_DEPTH_SWEEP),1)
     SWEEP_DEFINES += -DGEMM_AR_SIGNAL_DEPTH_SWEEP
 endif
 
-COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES) $(SWEEP_DEFINES)
+# EXTRA_DEFINES lets a target pin individual sweep axes, e.g.
+#   EXTRA_DEFINES='-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16)'
+EXTRA_DEFINES   ?=
+COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES) $(SWEEP_DEFINES) $(EXTRA_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
@@ -156,7 +159,7 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_all
+.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_depth_x_split sweep_all
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -167,6 +170,19 @@ run_gemm_ar_blackwell : gemm_ar_blackwell
 sweep_comp_sm : ; $(MAKE) COMP_SM_SWEEP=1 run_gemm_ar_blackwell
 sweep_unroll  : ; $(MAKE) UNROLL_SWEEP=1 run_gemm_ar_blackwell
 sweep_depth   : ; $(MAKE) SIGNAL_DEPTH_SWEEP=1 run_gemm_ar_blackwell
+
+# Targeted experiment: signal depth 0 vs 1, across every comp/comm split, with
+# unroll pinned to 16 and PULL only (the pairing that has been winning). Pinning
+# the settled axes keeps this at 44 kernels instead of the 528 of sweep_all.
+# NOTE on quoting: the -D values contain parentheses and a space, so each one
+# needs single quotes that survive to the nvcc command line. The outer double
+# quotes are eaten by the shell running this recipe, leaving make holding the
+# single-quoted strings; those are then stripped by the shell running nvcc.
+# Single outer quotes would expose the bare "(F)" to the shell and fail.
+sweep_depth_x_split :
+	$(MAKE) COMP_SM_SWEEP=1 \
+	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0) F(1)' -DGEMM_AR_ENABLE_PUSH=0" \
+	        run_gemm_ar_blackwell
 # 528 kernels. Prefer one axis at a time unless you are chasing an interaction.
 sweep_all     : ; $(MAKE) COMP_SM_SWEEP=1 UNROLL_SWEEP=1 SIGNAL_DEPTH_SWEEP=1 run_gemm_ar_blackwell
 

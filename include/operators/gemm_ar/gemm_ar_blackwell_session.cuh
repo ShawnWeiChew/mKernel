@@ -26,6 +26,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compiled_comp_sm_splits",
           &gemm_ar_intranode_blackwell::compiled_comp_sm_splits);
     m.def("compiled_ar_unrolls", &gemm_ar_intranode_blackwell::compiled_ar_unrolls);
+    m.def("compiled_strategies", &gemm_ar_intranode_blackwell::compiled_strategies);
     m.def("compiled_signal_depths",
           &gemm_ar_intranode_blackwell::compiled_signal_depths);
     m.def("num_blocks", &gemm_ar_intranode_blackwell::num_blocks);

@@ -37,7 +37,7 @@ class GemmToArSignal(Enum):
 
 # Both signalling strategies are benchmarked (and correctness-checked) on every
 # shape, so the runtime knob can be compared head to head.
-STRATEGIES = (GemmToArSignal.PUSH, GemmToArSignal.PULL)
+ALL_STRATEGIES = (GemmToArSignal.PUSH, GemmToArSignal.PULL)
 
 
 def make_barrier(mod, local_rank, world_size):
@@ -140,6 +140,10 @@ def main():
     COMP_SM_SPLITS = list(mod.compiled_comp_sm_splits())
     AR_UNROLLS = list(mod.compiled_ar_unrolls())
     SIGNAL_DEPTHS = list(mod.compiled_signal_depths())
+    # Only sweep strategies that were actually instantiated -- a build can drop
+    # one to halve the kernel count once it has been settled.
+    _enabled = set(mod.compiled_strategies())
+    STRATEGIES = tuple(st for st in ALL_STRATEGIES if st.value in _enabled)
     NUM_BLOCKS = mod.num_blocks()
     n_fused = (len(STRATEGIES) * len(COMP_SM_SPLITS) * len(AR_UNROLLS)
               * len(SIGNAL_DEPTHS))
@@ -147,6 +151,8 @@ def main():
         print(f"comp/comm SM splits compiled in (of {NUM_BLOCKS} blocks): "
               + ", ".join(f"{sm}/{NUM_BLOCKS - sm}" for sm in COMP_SM_SPLITS),
               flush=True)
+        print("signal strategies compiled in: "
+              + ", ".join(st.name for st in STRATEGIES), flush=True)
         print(f"AR unroll factors compiled in: "
               + ", ".join(str(u) for u in AR_UNROLLS), flush=True)
         print(f"signal pipeline depths compiled in: "
@@ -463,6 +469,16 @@ def main():
                 verdict = "BEATS" if best_ms < cutlass_ms else "behind"
                 msg += f"  [{verdict} cutlass by {abs(1 - cutlass_ms / best_ms) * 100:.1f}%]"
             print(msg, flush=True)
+
+            if len(STRATEGIES) == 2:
+                push_best = min(v for k, v in fused_ms.items()
+                                if k[0] is GemmToArSignal.PUSH)
+                pull_best = min(v for k, v in fused_ms.items()
+                                if k[0] is GemmToArSignal.PULL)
+                if pull_best > 0:
+                    print(f"  push vs pull  : {push_best / pull_best:8.3f}x "
+                          f"(>1 means PULL is faster; best config of each)",
+                          flush=True)
 
         del C_dbuf, barriers, C_final, A, B
         if cutlass_ok:

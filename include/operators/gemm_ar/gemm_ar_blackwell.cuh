@@ -195,20 +195,28 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // opt-in -- build with -DGEMM_AR_COMP_SM_SWEEP to get all of them. Every value
 // must be even (whole clusters) and less than config_t<>::NUM_BLOCKS; config_t
 // static_asserts both.
+// Each axis list can be overridden from the build, e.g.
+//   -D'GEMM_AR_FOR_EACH_UNROLL(F)=F(16)'
+// which compiles just that value instead of the sweep default. Useful for
+// pinning axes you have already settled and sweeping only the open ones.
+#ifndef GEMM_AR_FOR_EACH_COMP_SM
 #ifdef GEMM_AR_COMP_SM_SWEEP
 #define GEMM_AR_FOR_EACH_COMP_SM(F) \
     F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108) F(104) F(100)
 #else
 #define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
 #endif
+#endif
 
 // AR_UNROLL = independent multimem load/store requests each AR thread keeps in
 // flight. The non-sweep list keeps both values the shape heuristic picks (32
 // for M <= 2048, 64 above), so a default build behaves exactly as before.
+#ifndef GEMM_AR_FOR_EACH_UNROLL
 #ifdef GEMM_AR_UNROLL_SWEEP
 #define GEMM_AR_FOR_EACH_UNROLL(F) F(8) F(16) F(32) F(64)
 #else
 #define GEMM_AR_FOR_EACH_UNROLL(F) F(32) F(64)
+#endif
 #endif
 
 // SIGNAL_DEPTH = how many tiles' TMA stores stay in flight when a tile is
@@ -216,10 +224,12 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // (the original behaviour). D > 0 leaves D tiles in flight and announces the
 // tile D iterations back, trading a shorter epilogue stall for a later signal
 // -- which gives the comm SMs their work later, so it can go either way.
+#ifndef GEMM_AR_FOR_EACH_SIGNAL_DEPTH
 #ifdef GEMM_AR_SIGNAL_DEPTH_SWEEP
 #define GEMM_AR_FOR_EACH_SIGNAL_DEPTH(F) F(0) F(1) F(2)
 #else
 #define GEMM_AR_FOR_EACH_SIGNAL_DEPTH(F) F(0)
+#endif
 #endif
 
 // Passed as ar_unroll to fall back on the shape heuristic instead of pinning a
@@ -272,6 +282,19 @@ inline bool gemm_ar_dispatch_unroll(const fused_globals& G,
     return matched && ok;
 }
 
+// Set to 0 to leave a strategy uninstantiated entirely -- halves the kernel
+// count once you have settled on one. A call naming a disabled strategy fails
+// the TORCH_CHECK in entrypoint rather than silently running the other one.
+#ifndef GEMM_AR_ENABLE_PUSH
+#define GEMM_AR_ENABLE_PUSH 1
+#endif
+#ifndef GEMM_AR_ENABLE_PULL
+#define GEMM_AR_ENABLE_PULL 1
+#endif
+#if !GEMM_AR_ENABLE_PUSH && !GEMM_AR_ENABLE_PULL
+#error "at least one of GEMM_AR_ENABLE_PUSH / GEMM_AR_ENABLE_PULL must be 1"
+#endif
+
 template <int COMP_SM>
 inline bool gemm_ar_dispatch_strategy(const fused_globals& G,
                                       int M,
@@ -279,11 +302,19 @@ inline bool gemm_ar_dispatch_strategy(const fused_globals& G,
                                       int ar_unroll,
                                       int signal_depth) {
     if (strategy == GemmToArSignalStrategy::PUSH) {
+#if GEMM_AR_ENABLE_PUSH
         return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PUSH, COMP_SM>(
             G, M, ar_unroll, signal_depth);
+#else
+        return false;
+#endif
     }
+#if GEMM_AR_ENABLE_PULL
     return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PULL, COMP_SM>(
         G, M, ar_unroll, signal_depth);
+#else
+    return false;
+#endif
 }
 
 // Lets the benchmark sweep exactly what was compiled instead of hardcoding a
@@ -301,6 +332,17 @@ inline std::vector<int> compiled_ar_unrolls() {
 #define GEMM_AR_COLLECT_UNROLL(UN) out.push_back(UN);
     GEMM_AR_FOR_EACH_UNROLL(GEMM_AR_COLLECT_UNROLL)
 #undef GEMM_AR_COLLECT_UNROLL
+    return out;
+}
+
+inline std::vector<int> compiled_strategies() {
+    std::vector<int> out;
+#if GEMM_AR_ENABLE_PUSH
+    out.push_back(GemmToArSignalStrategy::PUSH);
+#endif
+#if GEMM_AR_ENABLE_PULL
+    out.push_back(GemmToArSignalStrategy::PULL);
+#endif
     return out;
 }
 
@@ -332,9 +374,11 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    TORCH_CHECK(gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH ||
-                    gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL,
-                "Unknown gemm_to_ar_signal_strategy ",
+    TORCH_CHECK((gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH &&
+                 GEMM_AR_ENABLE_PUSH) ||
+                    (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL &&
+                     GEMM_AR_ENABLE_PULL),
+                "Unknown or not-compiled gemm_to_ar_signal_strategy ",
                 gemm_to_ar_signal_strategy,
                 "; expected PUSH(0) or PULL(1)");
 
