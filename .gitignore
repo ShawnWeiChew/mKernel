@@ -11,3 +11,4 @@ modal_scripts
 compile_commands.json
 compile_commands.events.json
 .cache/
+traces/
