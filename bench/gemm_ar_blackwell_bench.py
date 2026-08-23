@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 import time
 from pathlib import Path
+from enum import Enum
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -12,8 +13,36 @@ import load_module  # noqa: E402
 from common import check_close
 
 SHAPES= [2048, 4096, 8192, 16384, 32768]
-WARMUP = 20
-BENCH_ITER = 10
+WARMUP = 10
+BENCH_ITER = 30
+
+class GemmToArSignal(Enum):
+    PUSH = 0
+    PULL = 1
+
+# Both signalling strategies are benchmarked (and correctness-checked) on every
+# shape, so the runtime knob can be compared head to head.
+STRATEGIES = (GemmToArSignal.PUSH, GemmToArSignal.PULL)
+
+
+def make_barrier(mod, local_rank, world_size):
+    """Allocate a zeroed comp->comm barrier buffer.
+
+    Each strategy needs its OWN barrier: the two leave the counters on
+    incompatible scales. PUSH has all NUM_DEVICES peers release_add 1 into the
+    destination's slot, so a tile is ready when the counter reaches
+    epoch * NUM_DEVICES. PULL has each device release_store its own epoch into
+    its own slot, and the reader multimem MIN-reduces across peers, so a tile is
+    ready when the reduced value reaches epoch. Sharing one buffer would let a
+    PULL store (epoch) knock the accumulated PUSH counter (epoch * NUM_DEVICES)
+    backwards, and a following PUSH would then never reach its gate -- a hang,
+    not a wrong answer.
+    """
+    barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
+        local_rank=local_rank, local_world_size=world_size, multicast=True)
+    barrier.data_.zero_()
+    return barrier
+
 
 def elapsed_ms(samples):
     """Drain (start, end) cuda event pairs into per-iter wall times (ms)."""
@@ -30,6 +59,7 @@ def sync_ranks():
     """
     torch.cuda.synchronize()
     dist.barrier()
+    time.sleep(0.05)
 
 
 def median_then_max_cuda(samples, label=""):
@@ -76,9 +106,7 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_dbuf.data_.zero_()
 
-        barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
-            local_rank=local_rank, local_world_size=world_size, multicast=True)
-        barrier.data_.zero_()
+        barriers = {s: make_barrier(mod, local_rank, world_size) for s in STRATEGIES}
 
         C_final = mod.DistBuffer((M, N), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
@@ -92,32 +120,54 @@ def main():
         dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
 
-        # do our own run
-        mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, 1)
-        torch.cuda.synchronize()
+        for strategy in STRATEGIES:
+            # Unlike the timed loop, the outputs ARE cleared between strategies.
+            # Both write every element, so leaving the previous strategy's result
+            # in place would let a strategy that writes nothing still pass the
+            # check. The memset cost is irrelevant outside the timed loop.
+            #
+            # sync_ranks() brackets the clear: rank r must not zero its C_dbuf
+            # while a peer is still multimem.ld_reduce-ing the previous run out
+            # of it, and no rank may launch until every peer has finished
+            # zeroing.
+            sync_ranks()
+            C_dbuf.data_.zero_()
+            C_final.data_.zero_()
+            sync_ranks()
 
-        gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
+            # do our own run
+            mod.gemm_ar_intranode_blackwell(
+                A, B, C_dbuf, barriers[strategy], C_final, 1, strategy.value)
+            torch.cuda.synchronize()
 
-        # C_final is the all-reduced output, so it is checked against the
-        # all-reduced reference. The C_dbuf check above is the local GEMM slice,
-        # which isolates a comp-side bug from a comm-side one.
-        correctness_ok = check_close(
-            f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
-        )
+            tag = strategy.name
+            gemm_correctness_check = check_close(
+                f"gemm M={M} [{tag}]", C_dbuf.data_, local_ref_cpu)
 
-        if not gemm_correctness_check:
+            # C_final is the all-reduced output, so it is checked against the
+            # all-reduced reference. The C_dbuf check above is the local GEMM slice,
+            # which isolates a comp-side bug from a comm-side one.
+            correctness_ok = check_close(
+                f"gemm_ar_blackwell M={M} [{tag}]", C_final.data_, C_ref_cpu,
+                atol=0.55, rtol=0.12
+            )
+
+            if not gemm_correctness_check:
+                if is_chief:
+                    print(f"{M=} [{tag}] GEMM error :(")
+                dist.destroy_process_group()
+                return 1
+            elif not correctness_ok:
+                if is_chief:
+                    print(f"{M=} [{tag}] AR Error :(((")
+                dist.destroy_process_group()
+                return 1
+
             if is_chief:
-                print(f"{M=} GEMM error :(")
-            dist.destroy_process_group()
-            return 1
-        elif not correctness_ok:
-            if is_chief:
-                print(f"{M=} AR Error :(((")
-            dist.destroy_process_group()
-            return 1
+                print(f"{M=} [{tag}] correct :)")
 
-        if is_chief:
-            print(f"{M=} correct :)")
+        del C_dbuf, C_final, barriers, A, B, C_ref_cpu, local_ref_cpu
+        dist.barrier()
 
     if is_chief:
         print("Correctness checks passed, benchmarking now...")
@@ -133,9 +183,7 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_dbuf.data_.zero_()
 
-        barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
-            local_rank=local_rank, local_world_size=world_size, multicast=True)
-        barrier.data_.zero_()
+        barriers = {s: make_barrier(mod, local_rank, world_size) for s in STRATEGIES}
 
         C_final = mod.DistBuffer((M, N), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
@@ -173,49 +221,37 @@ def main():
         dist.barrier()
         time.sleep(5)
 
-        # No per-iteration clearing. The kernel gates each tile on
-        # epoch * NUM_DEVICES and never clears the counters on the device, so the
-        # barrier only has to be zeroed once at allocation — the rising threshold
-        # does the rest. C_dbuf and C_final do not need clearing either: the
-        # epilogue TMA-stores every 128x256 tile of C_dbuf and the AR multimem.st
-        # writes every element of C_final, so both are fully overwritten each
-        # launch. At M=N=32768 that removes ~2 GB of memset per iteration.
-        #
-        # epoch must keep rising across BOTH loops, since the barrier is not
-        # cleared between them: restarting it at 1 for the timed loop would gate
-        # on NUM_DEVICES while the counters already sit at WARMUP * NUM_DEVICES,
-        # so every wait would fall through instantly and the AR would read tiles
-        # the GEMM had not written yet.
-        #
-        # sync_ranks() stays. It is not about the barrier any more — it is what
-        # stops rank r from starting launch k+1 and overwriting C_dist[r] while a
-        # peer is still multimem.ld_reduce-ing epoch k out of it.
-        epoch = 0
+        fused_samples = {}
+        for strategy in STRATEGIES:
+            barrier = barriers[strategy]
+            epoch = 0
 
-        # warmup fused kernel
-        for _ in range(WARMUP):
-            sync_ranks()
-            epoch += 1
-            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, epoch)
-        torch.cuda.synchronize()
-        dist.barrier()
-        time.sleep(5)
+            # warmup fused kernel
+            for _ in range(WARMUP):
+                sync_ranks()
+                epoch += 1
+                mod.gemm_ar_intranode_blackwell(
+                    A, B, C_dbuf, barrier, C_final, epoch, strategy.value)
+            torch.cuda.synchronize()
+            dist.barrier()
+            time.sleep(5)
 
+            samples = []
+            for _ in range(BENCH_ITER):
+                sync_ranks()
+                epoch += 1
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                mod.gemm_ar_intranode_blackwell(
+                    A, B, C_dbuf, barrier, C_final, epoch, strategy.value)
+                e.record()
+                samples.append((s, e))
+            fused_samples[strategy] = samples
 
-        fused_kernel_samples = []
-        for _ in range(BENCH_ITER):
-            sync_ranks()
-            epoch += 1
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, epoch)
-            e.record()
-            fused_kernel_samples.append((s, e))
-
-        torch.cuda.synchronize()
-        dist.barrier()
-        time.sleep(5)
+            torch.cuda.synchronize()
+            dist.barrier()
+            time.sleep(5)
 
         # events are only readable once the stream has drained
         if is_chief:
@@ -223,26 +259,39 @@ def main():
 
         baseline_ms = median_then_max_cuda(
             elapsed_ms(baseline_samples), label="cublas+nccl")
-        fused_ms = median_then_max_cuda(
-            elapsed_ms(fused_kernel_samples), label="fused")
+        fused_ms = {
+            s: median_then_max_cuda(
+                elapsed_ms(fused_samples[s]), label=f"fused[{s.name}]")
+            for s in STRATEGIES
+        }
 
         # 2*M*K*N per rank for the local GEMM slice
         flops = 2.0 * M * K * N
         if is_chief:
-            speedup = baseline_ms / fused_ms if fused_ms > 0 else float("nan")
             print(
-                f"  cublas+nccl : {baseline_ms:8.3f} ms  "
+                f"  cublas+nccl   : {baseline_ms:8.3f} ms  "
                 f"({flops / (baseline_ms * 1e9):7.1f} TFLOP/s)",
                 flush=True,
             )
-            print(
-                f"  fused       : {fused_ms:8.3f} ms  "
-                f"({flops / (fused_ms * 1e9):7.1f} TFLOP/s)",
-                flush=True,
-            )
-            print(f"  speedup     : {speedup:8.3f}x", flush=True)
+            for strategy in STRATEGIES:
+                ms = fused_ms[strategy]
+                speedup = baseline_ms / ms if ms > 0 else float("nan")
+                print(
+                    f"  fused[{strategy.name:<4}]   : {ms:8.3f} ms  "
+                    f"({flops / (ms * 1e9):7.1f} TFLOP/s)  "
+                    f"{speedup:6.3f}x vs cublas+nccl",
+                    flush=True,
+                )
+            push_ms = fused_ms[GemmToArSignal.PUSH]
+            pull_ms = fused_ms[GemmToArSignal.PULL]
+            if pull_ms > 0:
+                print(
+                    f"  push vs pull  : {push_ms / pull_ms:8.3f}x "
+                    f"(>1 means PULL is faster)",
+                    flush=True,
+                )
 
-        del C_dbuf, barrier, C_final, A, B
+        del C_dbuf, barriers, C_final, A, B
         dist.barrier()
 
     dist.destroy_process_group()

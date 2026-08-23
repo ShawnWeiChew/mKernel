@@ -22,7 +22,7 @@
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
@@ -69,6 +69,11 @@ struct config {
                   "Register split over-subscribes the launch register pool");
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+};
+
+enum GemmToArSignalStrategy {
+    PUSH = 0,  // write to host buffer to signal completion
+    PULL = 1,  // write to own buffer, host will poll with multimem
 };
 
 struct fused_globals {
@@ -170,7 +175,8 @@ void entrypoint(const at::Tensor& A,
                 dist::ParallelBuffer& C,
                 dist::ParallelBuffer& barrier,
                 dist::ParallelBuffer& C_final,
-                const int epoch) {
+                const int epoch,
+                int gemm_to_ar_signal_strategy) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -179,12 +185,27 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    if (M <= 2048) {
-        launch_fused_gemm_ar_blackwell<4, 32>(G);
-    } else if (M <= 4096) {
-        launch_fused_gemm_ar_blackwell<4, 64>(G);
+    if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH) {
+        if (M <= 2048) {
+            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PUSH>(G);
+        } else if (M <= 4096) {
+            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PUSH>(G);
+        } else {
+            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PUSH>(G);
+        }
+    } else if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL) {
+        if (M <= 2048) {
+            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PULL>(G);
+        } else if (M <= 4096) {
+            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PULL>(G);
+        } else {
+            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PULL>(G);
+        }
     } else {
-        launch_fused_gemm_ar_blackwell<8, 64>(G);
+        TORCH_CHECK(false,
+                    "Unknown gemm_to_ar_signal_strategy ",
+                    gemm_to_ar_signal_strategy,
+                    "; expected PUSH(0) or PULL(1)");
     }
 }
 };  // namespace gemm_ar_intranode_blackwell

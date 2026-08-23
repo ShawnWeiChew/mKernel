@@ -10,6 +10,7 @@
 #include <tuple>
 #include <vector>
 
+#include "comm/atomic_u32.cuh"
 #include "comm/comm.cuh"
 #include "comm/multimem.cuh"
 #include "common/cuda_checks.cuh"
@@ -53,7 +54,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -364,7 +365,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // the TMA store is also the thread doing the TMA wait, so the signal will not be sent
             // until the TMA wait is completed
             if (warpgroup::laneid() == 0) {
-                dist::signal(G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
+                if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
+                    dist::signal(
+                        G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
+                } else {
+                    // only need a GPU scope, because the data only needs to be present in local L2
+                    // for peer to read over nvlink
+                    comm::atomic_u32::release_store_gpu(
+                        &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
+                }
             }
         }
     }
@@ -380,7 +389,7 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
@@ -412,11 +421,23 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
             // https://github.com/NVIDIA/cutlass/issues/3117#issuecomment-5179892505
             // only need a gpu scope load here, since we only need the data to be present in the
             // local L2
-            int val;
-            do {
-                val = comm::atomic_u32::relaxed_load_s32_gpu(
-                    &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
-            } while (val < iter_gate_value);
+
+            if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
+                int val;
+                do {
+                    val = comm::atomic_u32::relaxed_load_s32_gpu(
+                        &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
+                } while (val < iter_gate_value);
+            } else {
+                int val;
+                do {
+                    comm::multimem<int>::ld_reduce<comm::reduce_op::MIN,
+                                                   comm::memory_model::STRONG>(
+                        val,
+                        reinterpret_cast<const int*>(
+                            G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
+                } while (val < (int)G.epoch);
+            }
         }
         __syncthreads();
 
@@ -429,8 +450,8 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
 }
 
 namespace ar_detail {
-// create variations for how much caching can be done based on the unroll factor, to stay within the
-// register limits
+// create variations for how much caching can be done based on the unroll factor, to stay within
+// the register limits
 
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
 __device__ __forceinline__ void ar_unroll_no_cache(
@@ -466,23 +487,23 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH>(G);
+        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -490,7 +511,8 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL>;
+    auto this_kernel =
+        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>;
 
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
@@ -510,19 +532,6 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     }
 
     this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
-    // cudaLaunchAttribute attrs[1];
-    // attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    // attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    // cudaLaunchConfig_t launch_config = {};
-    // launch_config.gridDim = grid;
-    // launch_config.blockDim = num_threads;
-    // launch_config.dynamicSmemBytes = smem_size;
-    // launch_config.stream = stream;
-    // // launch_config.attrs = attrs;
-    // launch_config.numAttrs = 1;
-
-    // MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 }
 
 namespace ar_detail {
