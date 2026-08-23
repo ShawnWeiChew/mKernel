@@ -303,6 +303,15 @@ def main():
                 cutlass_run = cutlass_dgemm_ar.build(
                     M=M, N=N, K=K, rank=rank, world_size=world_size,
                     device=local_rank)
+                if is_chief:
+                    swz, raster = cutlass_run.config
+                    note = ("autotuned" if hasattr(cutlass_run, "autotune_log")
+                            else "matched to SUPERGROUP_WIDTH")
+                    print(f"  cutlass config: swizzle_size={swz} "
+                          f"raster_order={raster} ({note})", flush=True)
+                    for cswz, craster, cms in getattr(cutlass_run, "autotune_log", []):
+                        print(f"    [autotune] swizzle={cswz} raster={craster}: "
+                              f"{cms:8.3f} ms", flush=True)
             except Exception as exc:
                 cutlass_ok, cutlass_why = False, f"{type(exc).__name__}: {exc}"
         vote = torch.tensor([1 if cutlass_ok else 0], device="cuda")
