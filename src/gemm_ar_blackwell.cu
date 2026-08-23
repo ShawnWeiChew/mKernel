@@ -364,11 +364,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // cluster tile -- so the destination is the sub-row index itself,
             // not a function of tile_id.
             const int device_to_signal = (c_row_tile % 4) + (tile_col_id % 2) * 4;
-            // One arrival per device per tile: the receiver waits for exactly
-            // NUM_DEVICES, so this must fire from a single thread -- and it has
-            // to be the same thread that issued the stores above, since
-            // store_async_wait only orders that thread's own TMA group.
-            warpgroup::sync(warpgroup_id + 1);
+
+            // NOTE: there is no need to use a warpgroup::sync() here, becuase the thread issuing
+            // the TMA store is also the thread doing the TMA wait, so the signal will not be sent
+            // until the TMA wait is completed
             if (warpgroup::laneid() == 0) {
                 dist::signal(G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
             }
@@ -476,10 +475,14 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         // not go through the L1 cache + signal from before is a release add operation
         const int actual_tile_row = tile_row_idx * NUM_DEVICES_PER_TILE + comm_row_idx;
         if (threadIdx.x == 0) {
-            dist::wait(G.comp_comm_barrier,
-                       {actual_tile_row, tile_col_idx},
-                       G.dev_idx,
-                       config::NUM_DEVICES);
+            // https://github.com/NVIDIA/cutlass/issues/3117#issuecomment-5179892505
+            // only need a gpu scope load here, since we only need the data to be present in the
+            // local L2
+            int val;
+            do {
+                val = comm::atomic_u32::relaxed_load_s32_gpu(
+                    &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
+            } while (val != config::NUM_DEVICES);
         }
         __syncthreads();
 
