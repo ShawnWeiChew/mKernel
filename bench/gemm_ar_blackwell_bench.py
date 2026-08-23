@@ -59,6 +59,23 @@ def make_barrier(mod, local_rank, world_size):
     return barrier
 
 
+def reference_config(M, splits, unrolls, depths):
+    """The 'default' configuration, clamped to what this build compiled.
+
+    A build that pins an axis -- e.g. -D'GEMM_AR_FOR_EACH_UNROLL(F)=F(16)' --
+    will not contain the shape heuristic's pick, so asking for it
+    unconditionally trips the kernel's TORCH_CHECK. Used both to choose which
+    config the non-smallest shapes validate, and to label which sweep row was
+    the pre-sweep default.
+    """
+    def pick(want, avail):
+        return want if want in avail else avail[0]
+
+    return (pick(DEFAULT_COMP_SM, splits),
+            pick(default_ar_unroll(M), unrolls),
+            pick(DEFAULT_SIGNAL_DEPTH, depths))
+
+
 def williams_orders(items):
     """Balanced Latin square (Williams design) over `items`.
 
@@ -196,8 +213,8 @@ def main():
             configs_to_check = [(sm, un, sd) for sm in COMP_SM_SPLITS
                                 for un in AR_UNROLLS for sd in SIGNAL_DEPTHS]
         else:
-            configs_to_check = [(DEFAULT_COMP_SM, default_ar_unroll(n),
-                                 DEFAULT_SIGNAL_DEPTH)]
+            configs_to_check = [
+                reference_config(n, COMP_SM_SPLITS, AR_UNROLLS, SIGNAL_DEPTHS)]
         check_epochs = {st: 0 for st in STRATEGIES}
         for strategy, (comp_sm, unroll, depth) in (
                 (st, cfg) for st in STRATEGIES for cfg in configs_to_check):
@@ -457,14 +474,14 @@ def main():
 
             best = min(fused_ms, key=fused_ms.get)
             best_ms = fused_ms[best]
-            baseline_cfg = (best[0], DEFAULT_COMP_SM, default_ar_unroll(M),
-                            DEFAULT_SIGNAL_DEPTH)
+            ref_sm, ref_un, ref_sd = reference_config(
+                M, COMP_SM_SPLITS, AR_UNROLLS, SIGNAL_DEPTHS)
+            baseline_cfg = (best[0], ref_sm, ref_un, ref_sd)
             msg = (f"  best: {best[0].name} @ {best[1]}:{NUM_BLOCKS - best[1]} "
                    f"unroll={best[2]} depth={best[3]} = {best_ms:.3f} ms")
             if baseline_cfg in fused_ms and fused_ms[baseline_cfg] > 0:
                 msg += (f"  ({fused_ms[baseline_cfg] / best_ms:.3f}x vs the "
-                        f"{DEFAULT_COMP_SM}/u{baseline_cfg[2]}/d{DEFAULT_SIGNAL_DEPTH} "
-                        f"default)")
+                        f"{ref_sm}/u{ref_un}/d{ref_sd} reference)")
             if cutlass_ms is not None and best_ms > 0:
                 verdict = "BEATS" if best_ms < cutlass_ms else "behind"
                 msg += f"  [{verdict} cutlass by {abs(1 - cutlass_ms / best_ms) * 100:.1f}%]"
