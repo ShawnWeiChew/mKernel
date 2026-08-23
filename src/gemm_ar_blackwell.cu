@@ -242,12 +242,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         warpgroup::sync(epilogue_barrier);
 
         // signal tmem empty
-        // TODO: figure out where to put PDL
         if (elect_warp_leader()) {
-            // if (is_last_tile && warp_id == 0) {
-            //     pdl::arrive();
-            // }
-            // TODO: move this into dist namespace
             tma::cluster::arrive(epilogue_tmem_finished[warpgroup_id], 0);
         }
 
@@ -387,6 +382,8 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
 
 template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
+    const int iter_gate_value = G.epoch * config::NUM_DEVICES;
+
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
     const int num_tiles_per_row = G.N / fused_globals::COL_BLOCK;
     const int num_row_tiles = G.M / (fused_globals::ROW_BLOCK / config::CONSUMER_WARPS);
@@ -419,7 +416,7 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
             do {
                 val = comm::atomic_u32::relaxed_load_s32_gpu(
                     &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
-            } while (val != config::NUM_DEVICES);
+            } while (val < iter_gate_value);
         }
         __syncthreads();
 

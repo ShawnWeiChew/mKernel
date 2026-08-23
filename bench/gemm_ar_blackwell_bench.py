@@ -93,14 +93,14 @@ def main():
         torch.cuda.synchronize()
 
         # do our own run
-        mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+        mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, 1)
         torch.cuda.synchronize()
 
         gemm_correctness_check = check_close(f"gemm M={M}", C_dbuf.data_, local_ref_cpu)
 
-        # NOTE: checks C_dbuf, not C_final — with config::NUM_COMP_SM == NUM_BLOCKS
-        # there are no comm SMs, so nothing writes C_final. Point this back at
-        # C_final/C_ref_cpu once the comm SMs are re-enabled.
+        # C_final is the all-reduced output, so it is checked against the
+        # all-reduced reference. The C_dbuf check above is the local GEMM slice,
+        # which isolates a comp-side bug from a comm-side one.
         correctness_ok = check_close(
             f"gemm_ar_blackwell M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
         )
@@ -141,8 +141,12 @@ def main():
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_final.data_.zero_()
 
-        time.sleep(5)
+        # Drain, line the ranks up, then soak. The sleep only resets temperature
+        # if the GPU is already idle when it starts, so it has to come after the
+        # synchronize -- otherwise the queue is still draining through it.
+        torch.cuda.synchronize()
         dist.barrier()
+        time.sleep(5)
         # warmup cublas + NCCL
         for _ in range(WARMUP):
             C_tmp = torch.matmul(A, B)
@@ -150,8 +154,9 @@ def main():
             torch.cuda.synchronize()
             del C_tmp
 
-        time.sleep(5)
+        torch.cuda.synchronize()
         dist.barrier()
+        time.sleep(5)
 
         baseline_samples = []
         for _ in range(BENCH_ITER):
@@ -163,47 +168,54 @@ def main():
             dist.all_reduce(C_tmp)
             e.record()
             baseline_samples.append((s, e))
-        time.sleep(5)
-        
 
         torch.cuda.synchronize()
         dist.barrier()
-
-        # The kernel's tile flags are plain counters compared with == NUM_DEVICES
-        # and are never cleared on the device, so every launch needs a zeroed
-        # barrier. Zeroing it locally is not enough: rank r exits as soon as its
-        # own tiles hit 4, while a peer may still be draining its comm SMs. If r
-        # relaunches at that point its epilogue bumps the peer's counters past 4
-        # (the peer then spins forever on !=4), or the peer's own zeroing wipes
-        # r's fresh signals. So the reset must be followed by a host barrier —
-        # no rank may launch until every rank has finished clearing.
-        def reset_fused_state():
-            C_dbuf.data_.zero_()
-            barrier.data_.zero_()
-            C_final.data_.zero_()
-            sync_ranks()
-
-        # warmp fused kernel
-        for _ in range(WARMUP):
-            reset_fused_state()
-            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
         time.sleep(5)
+
+        # No per-iteration clearing. The kernel gates each tile on
+        # epoch * NUM_DEVICES and never clears the counters on the device, so the
+        # barrier only has to be zeroed once at allocation — the rising threshold
+        # does the rest. C_dbuf and C_final do not need clearing either: the
+        # epilogue TMA-stores every 128x256 tile of C_dbuf and the AR multimem.st
+        # writes every element of C_final, so both are fully overwritten each
+        # launch. At M=N=32768 that removes ~2 GB of memset per iteration.
+        #
+        # epoch must keep rising across BOTH loops, since the barrier is not
+        # cleared between them: restarting it at 1 for the timed loop would gate
+        # on NUM_DEVICES while the counters already sit at WARMUP * NUM_DEVICES,
+        # so every wait would fall through instantly and the AR would read tiles
+        # the GEMM had not written yet.
+        #
+        # sync_ranks() stays. It is not about the barrier any more — it is what
+        # stops rank r from starting launch k+1 and overwriting C_dist[r] while a
+        # peer is still multimem.ld_reduce-ing epoch k out of it.
+        epoch = 0
+
+        # warmup fused kernel
+        for _ in range(WARMUP):
+            sync_ranks()
+            epoch += 1
+            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, epoch)
+        torch.cuda.synchronize()
         dist.barrier()
+        time.sleep(5)
 
 
         fused_kernel_samples = []
         for _ in range(BENCH_ITER):
-            reset_fused_state()
+            sync_ranks()
+            epoch += 1
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
-            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final)
+            mod.gemm_ar_intranode_blackwell(A, B, C_dbuf, barrier, C_final, epoch)
             e.record()
             fused_kernel_samples.append((s, e))
-        time.sleep(5)
 
         torch.cuda.synchronize()
         dist.barrier()
+        time.sleep(5)
 
         # events are only readable once the stream has drained
         if is_chief:

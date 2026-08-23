@@ -126,6 +126,9 @@ struct fused_globals {
     int N;
     int K;
 
+    // used so that launches can be chained together
+    int epoch;
+
     struct pipeline_inputs {
         A_tile A[config::CONSUMER_WARPS];
         B_tile B;
@@ -144,7 +147,8 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
                                                              int dev_idx,
                                                              int M,
                                                              int N,
-                                                             int K) {
+                                                             int K,
+                                                             int epoch) {
     return {
         .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),
         .B = ::dist::local_tensor_from_tensor<fused_globals::B_local_tensor>(B),
@@ -157,20 +161,23 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
         .dev_idx = dev_idx,
         .M = M,
         .N = N,
-        .K = K};
+        .K = K,
+        .epoch = epoch};
 }
 
 void entrypoint(const at::Tensor& A,
                 const at::Tensor& B,
                 dist::ParallelBuffer& C,
                 dist::ParallelBuffer& barrier,
-                dist::ParallelBuffer& C_final) {
+                dist::ParallelBuffer& C_final,
+                const int epoch) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
-    fused_globals G = gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K);
+    fused_globals G =
+        gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
     if (M <= 2048) {
         launch_fused_gemm_ar_blackwell<4, 32>(G);
