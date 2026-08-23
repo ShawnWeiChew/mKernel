@@ -5,6 +5,7 @@ import torch.distributed as dist
 import time
 from pathlib import Path
 from enum import Enum
+from itertools import permutations
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -59,7 +60,6 @@ def sync_ranks():
     """
     torch.cuda.synchronize()
     dist.barrier()
-    time.sleep(0.05)
 
 
 def median_then_max_cuda(samples, label=""):
@@ -195,73 +195,96 @@ def main():
         torch.cuda.synchronize()
         dist.barrier()
         time.sleep(5)
-        # warmup cublas + NCCL
+        # Every condition is warmed before ANY of them is timed, so none pays
+        # another's cold-start cost once the measured loop begins. epochs is
+        # carried across warmup and timing because the barriers are never
+        # cleared -- see make_barrier.
+        epochs = {s: 0 for s in STRATEGIES}
+
         for _ in range(WARMUP):
             C_tmp = torch.matmul(A, B)
             dist.all_reduce(C_tmp)
             torch.cuda.synchronize()
             del C_tmp
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        time.sleep(5)
-
-        baseline_samples = []
-        for _ in range(BENCH_ITER):
-            sync_ranks()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            C_tmp = torch.matmul(A, B)
-            dist.all_reduce(C_tmp)
-            e.record()
-            baseline_samples.append((s, e))
-
-        torch.cuda.synchronize()
-        dist.barrier()
-        time.sleep(5)
-
-        fused_samples = {}
         for strategy in STRATEGIES:
-            barrier = barriers[strategy]
-            epoch = 0
-
-            # warmup fused kernel
             for _ in range(WARMUP):
                 sync_ranks()
-                epoch += 1
+                epochs[strategy] += 1
                 mod.gemm_ar_intranode_blackwell(
-                    A, B, C_dbuf, barrier, C_final, epoch, strategy.value)
-            torch.cuda.synchronize()
-            dist.barrier()
-            time.sleep(5)
+                    A, B, C_dbuf, barriers[strategy], C_final,
+                    epochs[strategy], strategy.value)
 
-            samples = []
-            for _ in range(BENCH_ITER):
+        torch.cuda.synchronize()
+        dist.barrier()
+        time.sleep(5)
+
+        # Interleave the conditions rather than running each to completion.
+        # Clock and thermal state drift monotonically across a run, so a fixed
+        # order (all baseline, then all PUSH, then all PULL) systematically
+        # favours whichever condition runs while the part is coolest. A
+        # PUSH-vs-PULL gap measured that way cannot be distinguished from drift.
+        # Shuffling the order within each iteration spreads the drift evenly
+        # over all three instead of aligning it with one.
+        #
+        # Counterbalanced rather than randomised: cycling through all 3! = 6
+        # permutations puts every condition in every slot exactly the same
+        # number of times (BENCH_ITER / 6 each), and also balances which
+        # condition immediately precedes which. A shuffle only achieves that in
+        # expectation -- at BENCH_ITER=30 it still leaves visible skew, which is
+        # the very thing being controlled for.
+        #
+        # The order is identical on every rank by construction, which it must
+        # be: all three conditions are collectives, so a rank running PUSH while
+        # a peer runs the NCCL baseline would deadlock.
+        BASELINE = "baseline"
+        ORDERS = list(permutations([BASELINE, *STRATEGIES]))
+        if is_chief and BENCH_ITER % len(ORDERS):
+            print(f"  [warn] BENCH_ITER={BENCH_ITER} is not a multiple of "
+                  f"{len(ORDERS)}; condition order is only partly balanced",
+                  flush=True)
+
+        samples = {BASELINE: []}
+        samples.update({s: [] for s in STRATEGIES})
+
+        for it in range(BENCH_ITER):
+            for cond in ORDERS[it % len(ORDERS)]:
                 sync_ranks()
-                epoch += 1
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
-                s.record()
-                mod.gemm_ar_intranode_blackwell(
-                    A, B, C_dbuf, barrier, C_final, epoch, strategy.value)
-                e.record()
-                samples.append((s, e))
-            fused_samples[strategy] = samples
+                if cond is BASELINE:
+                    s.record()
+                    C_tmp = torch.matmul(A, B)
+                    dist.all_reduce(C_tmp)
+                    e.record()
+                    # Freed here rather than at loop end so the baseline's
+                    # output does not sit on the device through the two fused
+                    # runs -- at M=N=32768 that is another 2 GB of headroom.
+                    # The caching allocator is stream-ordered, so releasing it
+                    # before the recorded work completes is safe.
+                    del C_tmp
+                else:
+                    epochs[cond] += 1
+                    s.record()
+                    mod.gemm_ar_intranode_blackwell(
+                        A, B, C_dbuf, barriers[cond], C_final,
+                        epochs[cond], cond.value)
+                    e.record()
+                samples[cond].append((s, e))
 
-            torch.cuda.synchronize()
-            dist.barrier()
-            time.sleep(5)
+        torch.cuda.synchronize()
+        dist.barrier()
+        time.sleep(5)
 
         # events are only readable once the stream has drained
         if is_chief:
             print(f"M={M} K={K} N={N}", flush=True)
 
         baseline_ms = median_then_max_cuda(
-            elapsed_ms(baseline_samples), label="cublas+nccl")
+            elapsed_ms(samples[BASELINE]), label="cublas+nccl")
         fused_ms = {
             s: median_then_max_cuda(
-                elapsed_ms(fused_samples[s]), label=f"fused[{s.name}]")
+                elapsed_ms(samples[s]), label=f"fused[{s.name}]")
             for s in STRATEGIES
         }
 
