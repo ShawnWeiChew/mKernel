@@ -164,7 +164,16 @@ def stats_then_max_cuda(samples, label=""):
         print(f"  [rank-ms] {label}: {per_rank}", flush=True)
 
     iqr_pct = (hi - lo) / med * 100.0 if med > 0 else float("nan")
-    return med, iqr_pct
+    # Standard error of the MEDIAN, which is the statistic actually compared --
+    # not the spread of single iterations. For roughly normal samples
+    # sigma ~ IQR/1.349 and SE_median ~ 1.2533*sigma/sqrt(n), so
+    # SE_median ~ 0.929*IQR/sqrt(n). At IQR 5.8% over 64 samples that is 0.67%,
+    # an order of magnitude tighter than the raw IQR -- which is why ranking on
+    # the IQR declares everything tied when the medians are in fact separable.
+    # Corroborated by cross-run reproducibility: the same cutlass config lands
+    # within ~0.7% across independent runs.
+    se_pct = 0.929 * iqr_pct / (n ** 0.5) if n > 0 else float("nan")
+    return med, iqr_pct, se_pct
 
 def main():
     rank = int(os.environ["RANK"])
@@ -457,10 +466,12 @@ def main():
         # over the rotations actually used.
         iterations = max(1, -(-BENCH_ITER // len(ORDERS))) * len(ORDERS)
         if is_chief and len(ORDERS) < len(all_orders):
+            full_iters = max(1, -(-BENCH_ITER // len(all_orders))) * len(all_orders)
             print(f"  [orders] {len(conditions)} conditions, using "
                   f"{len(ORDERS)}/{len(all_orders)} rotations, "
                   f"{iterations} iters -> {iterations * len(conditions)} launches "
-                  f"(all rotations would be {len(all_orders) ** 2})", flush=True)
+                  f"(all {len(all_orders)} rotations: {full_iters} iters -> "
+                  f"{full_iters * len(conditions)} launches)", flush=True)
 
         samples = {c: [] for c in conditions}
 
@@ -559,18 +570,25 @@ def main():
             # it does not, every config inside the band is statistically tied
             # and the "winner" is whichever one got lucky this run. Reporting
             # the band stops a 0.5% reshuffle from being read as a result.
-            spreads = sorted(v[1] for v in fused_stats.values())
-            noise_pct = spreads[len(spreads) // 2]
+            # Resolution is 2 standard errors of the median (~95%), not the raw
+            # per-iteration IQR: the IQR describes single samples, the medians
+            # are what get ranked. Using the IQR here declared 13 configs tied
+            # when their medians reproduce to well under 1% across runs.
+            ses = sorted(v[2] for v in fused_stats.values())
+            iqrs = sorted(v[1] for v in fused_stats.values())
+            noise_pct = 2.0 * ses[len(ses) // 2]
             tied = sorted(
                 (k for k, ms in fused_ms.items()
                  if ms > 0 and (ms - best_ms) / best_ms * 100.0 <= noise_pct),
                 key=lambda k: fused_ms[k])
-            print(f"  noise floor   : median per-config IQR {noise_pct:.1f}% "
+            print(f"  resolution    : +/-{noise_pct:.2f}% (2 SE of the median) "
                   f"over {len(fused_stats)} configs; "
-                  f"{len(tied)} within that of the best", flush=True)
+                  f"per-iteration IQR {iqrs[len(iqrs) // 2]:.1f}%; "
+                  f"{len(tied)} within resolution of the best", flush=True)
             if len(tied) > 1:
                 names = ", ".join(
-                    f"{k[1]}:{NUM_BLOCKS - k[1]}/u{k[2]}/d{k[3]}" for k in tied[:6])
+                    f"{k[0].name}/{k[1]}:{NUM_BLOCKS - k[1]}/u{k[2]}/d{k[3]}"
+                    for k in tied[:6])
                 more = f" (+{len(tied) - 6} more)" if len(tied) > 6 else ""
                 print(f"  tied for best : {names}{more}", flush=True)
             ref_sm, ref_un, ref_sd = reference_config(
