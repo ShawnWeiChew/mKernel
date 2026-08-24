@@ -201,8 +201,13 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // pinning axes you have already settled and sweeping only the open ones.
 #ifndef GEMM_AR_FOR_EACH_COMP_SM
 #ifdef GEMM_AR_COMP_SM_SWEEP
+// 144/140/136 extend toward the GEMM-bound end: at M=32768 the optimum sat at
+// 132, the previous top of the range, and per-SM parity with cutlass says the
+// remaining deficit is exactly the SMs not doing GEMM. These probe how few comm
+// SMs the all-reduce can be squeezed into before it becomes the bottleneck.
 #define GEMM_AR_FOR_EACH_COMP_SM(F) \
-    F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108) F(104) F(100)
+    F(144) F(140) F(136) F(132) F(128) F(126) F(124) F(122) F(118) F(116) \
+    F(112) F(108) F(104) F(100)
 #else
 #define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
 #endif
