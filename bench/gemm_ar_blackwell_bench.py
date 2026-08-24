@@ -121,20 +121,44 @@ def median_then_max_cuda(samples, label=""):
     """Local median over iters, then max over ranks (the slowest rank sets the
     collective's cost). Also prints the per-rank medians so a straggler is
     visible instead of being hidden behind the max."""
-    sorted_samples = sorted(float(x) for x in samples)
-    median = sorted_samples[len(sorted_samples) // 2]
+    return stats_then_max_cuda(samples, label)[0]
 
-    t = torch.tensor([median], dtype=torch.float64, device="cuda")
+
+def stats_then_max_cuda(samples, label=""):
+    """As median_then_max_cuda, but also carries that rank's dispersion out.
+
+    Returns (median_ms, iqr_pct) for the rank that set the max, where iqr_pct
+    is (p75 - p25) / median * 100. The spread has to come from the *same* rank
+    as the median -- mixing a fast rank's spread with a slow rank's centre
+    would describe a distribution nobody measured -- so this all_gathers the
+    triple and indexes the argmax rather than reducing each field separately.
+
+    Dispersion is not decoration here. The sweep ranks configurations whose
+    true separation is around 1%, and picking the argmin over dozens of noisy
+    conditions is a max-of-noise estimator: it selects whichever condition got
+    lucky, and gets more optimistic the more conditions you add. Printing the
+    spread next to the median is what makes that visible instead of inferred.
+    """
+    sorted_samples = sorted(float(x) for x in samples)
+    n = len(sorted_samples)
+    median = sorted_samples[n // 2]
+    p25 = sorted_samples[max(0, int(0.25 * n))]
+    p75 = sorted_samples[min(n - 1, int(0.75 * n))]
+
+    t = torch.tensor([median, p25, p75], dtype=torch.float64, device="cuda")
     gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
+
+    rows = [g.tolist() for g in gathered]
+    slowest = max(range(len(rows)), key=lambda i: rows[i][0])
+    med, lo, hi = rows[slowest]
+
     if label and dist.get_rank() == 0:
-        per_rank = " ".join(
-            f"r{i}={float(x.item()):.3f}" for i, x in enumerate(gathered)
-        )
+        per_rank = " ".join(f"r{i}={r[0]:.3f}" for i, r in enumerate(rows))
         print(f"  [rank-ms] {label}: {per_rank}", flush=True)
 
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return float(t.item())
+    iqr_pct = (hi - lo) / med * 100.0 if med > 0 else float("nan")
+    return med, iqr_pct
 
 def main():
     rank = int(os.environ["RANK"])
@@ -297,32 +321,46 @@ def main():
         # Every rank must agree on whether it is in, or the interleave would put
         # one rank in a collective the others are not running. availability() is
         # local, so the decision is all-reduced to a unanimous answer.
-        cutlass_ok, cutlass_why = cutlass_dgemm_ar.availability()
-        if cutlass_ok:
-            try:
-                cutlass_run = cutlass_dgemm_ar.build(
-                    M=M, N=N, K=K, rank=rank, world_size=world_size,
-                    device=local_rank)
+        # Each variant is admitted independently: lamport lives in a different
+        # upstream file that a given checkout may not have, and there is no
+        # reason a missing one should cost us the other.
+        cutlass_runs = {}
+        for variant in cutlass_dgemm_ar.VARIANTS:
+            ok, why = cutlass_dgemm_ar.availability(variant)
+            run = None
+            if ok:
+                try:
+                    run = cutlass_dgemm_ar.build(
+                        M=M, N=N, K=K, rank=rank, world_size=world_size,
+                        device=local_rank, variant=variant)
+                except Exception as exc:
+                    ok, why = False, f"{type(exc).__name__}: {exc}"
+            # Every rank must agree on whether a variant is in, or the
+            # interleave would put one rank in a collective the others are not
+            # running. availability() is local, so vote it to unanimous.
+            vote = torch.tensor([1 if ok else 0], device="cuda")
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+            if not vote.item():
+                del run
                 if is_chief:
-                    swz, raster = cutlass_run.config
-                    note = ("autotuned" if hasattr(cutlass_run, "autotune_log")
-                            else "matched to SUPERGROUP_WIDTH")
-                    print(f"  cutlass config: swizzle_size={swz} "
-                          f"raster_order={raster} ({note})", flush=True)
-                    for cswz, craster, cms in getattr(cutlass_run, "autotune_log", []):
-                        print(f"    [autotune] swizzle={cswz} raster={craster}: "
-                              f"{cms:8.3f} ms", flush=True)
-            except Exception as exc:
-                cutlass_ok, cutlass_why = False, f"{type(exc).__name__}: {exc}"
-        vote = torch.tensor([1 if cutlass_ok else 0], device="cuda")
-        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
-        if not vote.item():
-            if cutlass_ok:
-                del cutlass_run
-            cutlass_ok = False
+                    print(f"  [skip] cutlass[{variant}] CuTeDSL GEMM+AR: "
+                          f"{why or 'peer opted out'}", flush=True)
+                continue
+            cutlass_runs[variant] = run
             if is_chief:
-                print(f"  [skip] cutlass CuTeDSL GEMM+AR: {cutlass_why or 'peer opted out'}",
-                      flush=True)
+                swz, raster = run.config
+                note = ("autotuned" if hasattr(run, "autotune_log")
+                        else "matched to SUPERGROUP_WIDTH")
+                print(f"  cutlass[{variant}] config: swizzle_size={swz} "
+                      f"raster_order={raster} ({note})", flush=True)
+                for cswz, craster, cms in getattr(run, "autotune_log", []):
+                    print(f"    [autotune] swizzle={cswz} raster={craster}: "
+                          f"{cms:8.3f} ms", flush=True)
+        # The "vs cutlass" ratio columns stay pinned to the LDMC variant: it is
+        # built on the same primitives as ours (multimem ld_reduce/st,
+        # reduce-scatter shaped), so that ratio isolates our implementation
+        # rather than our choice of algorithm. Lamport is reported alongside and
+        # judged separately in the verdict line.
 
         # Drain, line the ranks up, then soak. The sleep only resets temperature
         # if the GPU is already idle when it starts, so it has to come after the
@@ -357,10 +395,10 @@ def main():
                                 epochs[strategy], strategy.value, comp_sm,
                                 unroll, depth)
 
-        if cutlass_ok:
+        for run in cutlass_runs.values():
             for _ in range(WARMUP):
                 sync_ranks()
-                cutlass_run()
+                run()
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -383,7 +421,7 @@ def main():
         # be: every condition is a collective, so a rank running PUSH while a
         # peer runs the NCCL baseline would deadlock.
         BASELINE = ("baseline",)
-        CUTLASS = ("cutlass",)
+        CUTLASS_CONDS = {v: ("cutlass", v) for v in cutlass_runs}
         # One condition per (signal strategy, comp/comm SM split). The split is
         # only a launch argument -- the barrier protocol depends on the strategy
         # alone -- so splits share a strategy's barrier and epoch counter, which
@@ -394,7 +432,7 @@ def main():
                          for sm in COMP_SM_SPLITS
                          for un in AR_UNROLLS
                          for sd in SIGNAL_DEPTHS]
-                      + ([CUTLASS] if cutlass_ok else []))
+                      + [CUTLASS_CONDS[v] for v in sorted(cutlass_runs)])
         ORDERS = williams_orders(conditions)
         # Round the target iteration count to a whole number of orders so the
         # balancing is exact rather than approximate.
@@ -418,9 +456,10 @@ def main():
                     # The caching allocator is stream-ordered, so releasing it
                     # before the recorded work completes is safe.
                     del C_tmp
-                elif cond == CUTLASS:
+                elif cond[0] == "cutlass":
+                    run = cutlass_runs[cond[1]]
                     s.record()
-                    cutlass_run()
+                    run()
                     e.record()
                 else:
                     _, strategy, comp_sm, unroll, depth = cond
@@ -442,17 +481,21 @@ def main():
 
         baseline_ms = median_then_max_cuda(
             elapsed_ms(samples[BASELINE]), label="cublas+nccl")
-        fused_ms = {
-            (st, sm, un, sd): median_then_max_cuda(
+        fused_stats = {
+            (st, sm, un, sd): stats_then_max_cuda(
                 elapsed_ms(samples[("fused", st, sm, un, sd)]),
                 label=f"fused[{st.name}/{sm}/u{un}/d{sd}]")
             for st in STRATEGIES for sm in COMP_SM_SPLITS
             for un in AR_UNROLLS for sd in SIGNAL_DEPTHS
         }
-        cutlass_ms = (
-            median_then_max_cuda(elapsed_ms(samples[CUTLASS]), label="cutlass")
-            if cutlass_ok else None
-        )
+        fused_ms = {k: v[0] for k, v in fused_stats.items()}
+        cutlass_all = {
+            v: median_then_max_cuda(elapsed_ms(samples[CUTLASS_CONDS[v]]),
+                                    label=f"cutlass[{v}]")
+            for v in sorted(cutlass_runs)
+        }
+        # Ratio columns are against LDMC -- see the note where it is built.
+        cutlass_ms = cutlass_all.get("ldmc")
 
         # 2*M*K*N per rank for the local GEMM slice
         flops = 2.0 * M * K * N
@@ -462,11 +505,13 @@ def main():
 
             print(f"  {'cublas+nccl':<20}: {baseline_ms:8.3f} ms  "
                   f"({tflops(baseline_ms):7.1f} TFLOP/s)", flush=True)
-            if cutlass_ms is not None:
-                print(f"  {'cutlass':<20}: {cutlass_ms:8.3f} ms  "
-                      f"({tflops(cutlass_ms):7.1f} TFLOP/s)  "
-                      f"{baseline_ms / cutlass_ms:6.3f}x vs cublas+nccl",
-                      flush=True)
+            for v, vms in sorted(cutlass_all.items(), key=lambda kv: kv[1]):
+                line = (f"  {'cutlass[' + v + ']':<20}: {vms:8.3f} ms  "
+                        f"({tflops(vms):7.1f} TFLOP/s)  "
+                        f"{baseline_ms / vms:6.3f}x vs cublas+nccl")
+                if cutlass_ms is not None and v != "ldmc":
+                    line += f"  {cutlass_ms / vms:6.3f}x vs cutlass[ldmc]"
+                print(line, flush=True)
 
             # Sweep table, sorted fastest first, so the best split is obvious
             # and the shape of the curve is visible next to it.
@@ -479,10 +524,31 @@ def main():
                         f"{baseline_ms / ms:6.3f}x vs cublas+nccl")
                 if cutlass_ms is not None and ms > 0:
                     line += f"  {cutlass_ms / ms:6.3f}x vs cutlass"
+                line += f"  +/-{fused_stats[(st, sm, un, sd)][1]:4.1f}%"
                 print(line, flush=True)
 
             best = min(fused_ms, key=fused_ms.get)
             best_ms = fused_ms[best]
+
+            # Noise floor and tie band. The argmin above is only meaningful if
+            # the gap to the runners-up exceeds the per-condition spread; when
+            # it does not, every config inside the band is statistically tied
+            # and the "winner" is whichever one got lucky this run. Reporting
+            # the band stops a 0.5% reshuffle from being read as a result.
+            spreads = sorted(v[1] for v in fused_stats.values())
+            noise_pct = spreads[len(spreads) // 2]
+            tied = sorted(
+                (k for k, ms in fused_ms.items()
+                 if ms > 0 and (ms - best_ms) / best_ms * 100.0 <= noise_pct),
+                key=lambda k: fused_ms[k])
+            print(f"  noise floor   : median per-config IQR {noise_pct:.1f}% "
+                  f"over {len(fused_stats)} configs; "
+                  f"{len(tied)} within that of the best", flush=True)
+            if len(tied) > 1:
+                names = ", ".join(
+                    f"{k[1]}:{NUM_BLOCKS - k[1]}/u{k[2]}/d{k[3]}" for k in tied[:6])
+                more = f" (+{len(tied) - 6} more)" if len(tied) > 6 else ""
+                print(f"  tied for best : {names}{more}", flush=True)
             ref_sm, ref_un, ref_sd = reference_config(
                 M, COMP_SM_SPLITS, AR_UNROLLS, SIGNAL_DEPTHS)
             baseline_cfg = (best[0], ref_sm, ref_un, ref_sd)
@@ -491,9 +557,15 @@ def main():
             if baseline_cfg in fused_ms and fused_ms[baseline_cfg] > 0:
                 msg += (f"  ({fused_ms[baseline_cfg] / best_ms:.3f}x vs the "
                         f"{ref_sm}/u{ref_un}/d{ref_sd} reference)")
-            if cutlass_ms is not None and best_ms > 0:
-                verdict = "BEATS" if best_ms < cutlass_ms else "behind"
-                msg += f"  [{verdict} cutlass by {abs(1 - cutlass_ms / best_ms) * 100:.1f}%]"
+            if cutlass_all and best_ms > 0:
+                # Judge against the strongest cutlass variant at this shape, not
+                # just LDMC -- lamport is a real alternative a reader would run,
+                # so beating LDMC while losing to lamport is not a win.
+                tough = min(cutlass_all, key=cutlass_all.get)
+                tough_ms = cutlass_all[tough]
+                verdict = "BEATS" if best_ms < tough_ms else "behind"
+                msg += (f"  [{verdict} cutlass[{tough}] by "
+                        f"{abs(1 - tough_ms / best_ms) * 100:.1f}%]")
             print(msg, flush=True)
 
             if len(STRATEGIES) == 2:
@@ -507,8 +579,8 @@ def main():
                           flush=True)
 
         del C_dbuf, barriers, C_final, A, B
-        if cutlass_ok:
-            del cutlass_run
+        cutlass_runs.clear()
+        cutlass_dgemm_ar.release()
         dist.barrier()
 
     dist.destroy_process_group()

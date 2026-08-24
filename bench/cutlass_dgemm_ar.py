@@ -1,45 +1,56 @@
-"""Adapter exposing NVIDIA's CuTeDSL distributed GEMM+AllReduce as a bench condition.
+"""Adapter exposing NVIDIA's CuTeDSL distributed GEMM+AllReduce as bench conditions.
 
-Upstream file:
+Two upstream variants are supported, both under
     cutlass/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/
-        distributed_gemm_all_reduce_blackwell.py   (pin to the tag matching your
-                                                    nvidia-cutlass-dsl wheel)
 
-That example is a standalone script -- its own argparse, its own process-group
-setup -- so it is loaded by path and its kernel class is driven directly,
-reusing the process group the bench has already initialised. Everything in it
-is guarded behind `if __name__ == "__main__"`, so importing it has no side
-effects.
+    distributed_gemm_all_reduce_blackwell.py          -> variant "ldmc"
+    distributed_gemm_all_reduce_lamport_blackwell.py  -> variant "lamport"
+
+"ldmc" is the NVLS path: multimem.ld_reduce + multimem.st, reduce-scatter
+shaped, same primitives as our kernel. "lamport" is the latency-optimised
+one-shot path: every rank reads every peer's full partial over plain P2P loads
+and reduces in registers, with no barrier at all -- arrival is detected by
+spinning on a -0.0 sentinel written into the data itself. That trades wire
+bandwidth for a saved round-trip, so at world_size 8 it moves ~(R-1)=7x the
+bytes and should only win when the message is small enough for latency to
+dominate. Both are worth having in the table for exactly that reason.
+
+Each example is a standalone script -- own argparse, own process-group setup --
+so it is loaded by path and its kernel class driven directly, reusing the
+process group the bench already initialised. Everything is guarded behind
+`if __name__ == "__main__"`, so importing has no side effects.
 
 Semantics match our kernel: each rank computes a full M x N GEMM from its own
-K-slice, then the result is all-reduced. The example's own correctness check
-does `dist.all_reduce(local_C)` as the reference, same as ours, so passing
-K = N // world_size gives an apples-to-apples comparison.
+K-slice, then the result is all-reduced. Both examples check themselves against
+`dist.all_reduce(local_C)`, same reference as ours, so K = N // world_size is
+apples to apples.
 
-Point one of these at the file:
+Point these at the files (or set CUTLASS_PATH to a source checkout and let both
+be found relatively):
     CUTLASS_DGEMM_AR=/path/to/distributed_gemm_all_reduce_blackwell.py
+    CUTLASS_DGEMM_AR_LAMPORT=/path/to/distributed_gemm_all_reduce_lamport_blackwell.py
     CUTLASS_PATH=/path/to/cutlass          (a source checkout, not the wheel)
 
 Set CUTLASS_AUTOTUNE=1 to pick the best (swizzle_size, raster_order) per shape
-by measurement instead of using the matched defaults.
+per variant by measurement instead of using the matched defaults.
 """
 import importlib.util
 import os
 from pathlib import Path
 
-_ENV_FILE = "CUTLASS_DGEMM_AR"
 _ENV_ROOT = "CUTLASS_PATH"
 _ENV_AUTOTUNE = "CUTLASS_AUTOTUNE"
-_REL = ("examples/python/CuTeDSL/cute/blackwell/kernel/distributed/"
-        "distributed_gemm_all_reduce_blackwell.py")
+_REL_DIR = "examples/python/CuTeDSL/cute/blackwell/kernel/distributed"
 
 # Tile geometry is pinned to match our kernel so the comparison is like for
-# like: 256x256 MMA tile, 2-CTA cluster, TMA store, multimem load-reduce/store.
+# like: 256x256 MMA tile, 2-CTA cluster, TMA store. Lamport *requires*
+# use_tma_store -- its multicast TMA store is the only producer path that fans
+# the epilogue out to peers atomically per 16B, which is what makes the
+# data-as-flag scheme sound.
 MMA_TILER_MN = (256, 256)
 CLUSTER_SHAPE_MN = (2, 1)
 USE_2CTA_INSTRS = True
 USE_TMA_STORE = True
-ALL_REDUCE = "LDMCxSTMC"
 
 # Autotune grid. Deliberately only the two scheduling knobs -- widening it to
 # mma_tiler/cluster would let CUTLASS win on a different tile shape, which is a
@@ -47,42 +58,77 @@ ALL_REDUCE = "LDMCxSTMC"
 AUTOTUNE_SWIZZLES = (1, 2, 4, 8)
 AUTOTUNE_RASTERS = ("m", "n")
 
-_module = None
+VARIANTS = ("ldmc", "lamport")
+DEFAULT_VARIANT = "ldmc"
+
+_SPEC = {
+    "ldmc": dict(
+        env="CUTLASS_DGEMM_AR",
+        filename="distributed_gemm_all_reduce_blackwell.py",
+        cls="Sm100PersistentDenseGemmAllReduceLDMCxSTMCKernel",
+        all_reduce="LDMCxSTMC",
+        # One workspace: the LDMC path writes and reduces in place, so there is
+        # no slot to rotate.
+        num_workspace=1,
+    ),
+    "lamport": dict(
+        env="CUTLASS_DGEMM_AR_LAMPORT",
+        filename="distributed_gemm_all_reduce_lamport_blackwell.py",
+        cls="Sm100PersistentDenseGemmAllReduceLamportKernel",
+        all_reduce="Lamport",
+        # NUM_C_BUFFERS = 3 is fixed inside the example's allocate_tensors
+        # (ping / pong / cooling) and it asserts num_workspace == that, so the
+        # A/B ring rotates in lockstep with the slot rotation.
+        num_workspace=3,
+    ),
+}
+
+_module = {}
 _tensor_cache = {}
+# Rotation counter per (variant, shape). Shared across autotune candidates on
+# purpose -- see _lamport_launcher.
+_rotation = {}
 
 
-def _locate():
-    p = os.environ.get(_ENV_FILE)
+def _check(variant):
+    if variant not in _SPEC:
+        raise ValueError(f"unknown variant {variant!r}, expected one of {VARIANTS}")
+    return _SPEC[variant]
+
+
+def _locate(variant):
+    spec = _check(variant)
+    p = os.environ.get(spec["env"])
     if p:
         return Path(p)
     root = os.environ.get(_ENV_ROOT)
     if root:
-        return Path(root) / _REL
+        return Path(root) / _REL_DIR / spec["filename"]
     return None
 
 
-def _load():
-    global _module
-    if _module is None:
-        path = _locate()
+def _load(variant=DEFAULT_VARIANT):
+    if variant not in _module:
+        spec = _check(variant)
+        path = _locate(variant)
         if path is None:
             raise RuntimeError(
-                f"set {_ENV_FILE} to distributed_gemm_all_reduce_blackwell.py, "
+                f"set {spec['env']} to {spec['filename']}, "
                 f"or {_ENV_ROOT} to a cutlass checkout")
         if not path.is_file():
             raise FileNotFoundError(f"{path} does not exist")
-        spec = importlib.util.spec_from_file_location(
-            "cutlass_dgemm_ar_example", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _module = mod
-    return _module
+        loader = importlib.util.spec_from_file_location(
+            f"cutlass_dgemm_ar_example_{variant}", path)
+        mod = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(mod)
+        _module[variant] = mod
+    return _module[variant]
 
 
-def availability():
+def availability(variant=DEFAULT_VARIANT):
     """(ok, reason). Cheap enough to call before every shape."""
     try:
-        _load()
+        _load(variant)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     return True, ""
@@ -99,18 +145,18 @@ def matched_swizzle(M):
     return 4 if M <= 4096 else 8
 
 
-def _tensors(ex, M, N, K, rank, world_size, device):
-    """Allocate once per shape and reuse across autotune candidates.
+def _tensors(ex, variant, M, N, K, rank, world_size, device):
+    """Allocate once per (variant, shape) and reuse across autotune candidates.
 
-    The flag buffer is worst-case sized upstream ((m/64)*(n/64)+160) precisely
-    so it can be shared across candidates, and A/B/C do not depend on the
-    schedule -- so reallocating per candidate would just burn several GB at
-    M=N=32768 for nothing.
+    A/B/C do not depend on the schedule, and upstream sizes the flag buffer for
+    the worst case precisely so it can be shared -- so reallocating per
+    candidate would just burn several GB at M=N=32768 for nothing.
     """
+    import inspect
     import cutlass
-    key = (M, N, K)
+    key = (variant, M, N, K)
     if key not in _tensor_cache:
-        _tensor_cache[key] = ex.allocate_tensors(
+        want = dict(
             mnkl=(M, N, K, 1),
             ab_dtype=cutlass.BFloat16,
             c_dtype=cutlass.BFloat16,
@@ -118,17 +164,84 @@ def _tensors(ex, M, N, K, rank, world_size, device):
             a_major="k",
             b_major="n",
             c_major="n",
-            num_workspace=1,
+            num_workspace=_SPEC[variant]["num_workspace"],
             device=device,
+            # For Lamport this is what arms every one of the three slots with
+            # the -0.0 sentinel. "test" arms only slot 0 and fills the rest with
+            # random data for its own verifier, which would make the first
+            # rotations read stale non-sentinel values.
             slot_init_mode="benchmark",
             global_rank=rank,
             local_rank=device,
             world_size=world_size,
         )
+        # The two examples' allocate_tensors do not take the same keywords --
+        # lamport's has no `local_rank`, for one -- and upstream is free to add
+        # or drop more between tags. Pass the intersection rather than hardcode
+        # a per-variant list that silently rots.
+        accepted = inspect.signature(ex.allocate_tensors).parameters
+        if not any(p.kind is p.VAR_KEYWORD for p in accepted.values()):
+            want = {k: v for k, v in want.items() if k in accepted}
+        missing = [name for name, p in accepted.items()
+                   if p.default is p.empty
+                   and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+                   and name not in want]
+        if missing:
+            raise RuntimeError(
+                f"cutlass[{variant}] allocate_tensors needs arguments this "
+                f"adapter does not supply: {missing}")
+        _tensor_cache[key] = ex.allocate_tensors(**want)
     return _tensor_cache[key]
 
 
-def _compile_one(ex, tensors, *, M, N, K, rank, world_size,
+def release():
+    """Drop every cached allocation.
+
+    The bench walks shapes largest-last and holds its own A/B/C alongside, and
+    Lamport's footprint is not small: three C slots plus a three-deep A/B ring
+    plus the comm-out buffer, which at M=N=32768 is several GB more than the
+    LDMC path. Nothing here survives a shape, so hand it back.
+    """
+    _tensor_cache.clear()
+    _rotation.clear()
+
+
+def _ldmc_kwargs(tensors, stream):
+    return dict(
+        a=tensors["cute_tensor_a_list"][0],
+        b=tensors["cute_tensor_b_list"][0],
+        c=tensors["cute_tensor_c"],
+        comm_in_multicast_tensor=tensors["cute_tensor_comm_in_mc"],
+        comm_out_multicast_tensor=tensors["cute_tensor_comm_out_mc"],
+        barrier_flag_unicast=tensors["cute_tensor_flag_unicast"],
+        barrier_flag_multicast=tensors["cute_tensor_flag_multicast"],
+        stream=stream,
+    )
+
+
+def _lamport_kwargs(tensors, stream, rank, i):
+    """Kwargs for rotation index `i`, mirroring upstream's make_kernel_kwargs.
+
+        ping    = i       % 3   this iter's read + write + epilogue target
+        pong    = (i + 1) % 3   this iter's clear target (armed for next iter)
+        cooling = (i + 2) % 3   untouched, draining
+    """
+    uc = tensors["cute_tensors_c_uc_per_peer_grouped"]
+    mc = tensors["cute_tensors_c_mc_per_peer_grouped"]
+    n_buf = len(uc)
+    ping, pong = i % n_buf, (i + 1) % n_buf
+    return dict(
+        a=tensors["cute_tensor_a_list"][i % n_buf],
+        b=tensors["cute_tensor_b_list"][i % n_buf],
+        c_multicast_tensor=mc[ping][rank],
+        comm_in_unicast_tensor_per_peer=uc[ping],
+        comm_clear_unicast_tensor_per_peer=uc[pong],
+        comm_out_unicast_tensor=tensors["cute_tensor_comm_out_uc"],
+        stream=stream,
+    )
+
+
+def _compile_one(ex, tensors, *, variant, M, N, K, rank, world_size,
                  swizzle_size, raster_order):
     """Compile one candidate. Returns a launcher, or None if unsupported."""
     import cuda.bindings.driver as cuda
@@ -138,7 +251,8 @@ def _compile_one(ex, tensors, *, M, N, K, rank, world_size,
     import cutlass.utils as utils
     import torch
 
-    kernel = ex.Sm100PersistentDenseGemmAllReduceLDMCxSTMCKernel(
+    spec = _SPEC[variant]
+    kernel = getattr(ex, spec["cls"])(
         acc_dtype=cutlass.Float32,
         c_dtype=cutlass.BFloat16,
         use_2cta_instrs=USE_2CTA_INSTRS,
@@ -147,7 +261,7 @@ def _compile_one(ex, tensors, *, M, N, K, rank, world_size,
         use_tma_store=USE_TMA_STORE,
         rank_id=rank,
         num_ranks=world_size,
-        all_reduce=ALL_REDUCE,
+        all_reduce=spec["all_reduce"],
         swizzle_size=swizzle_size,
         raster_order=raster_order,
     )
@@ -167,28 +281,60 @@ def _compile_one(ex, tensors, *, M, N, K, rank, world_size,
         return None
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    kwargs = dict(
-        a=tensors["cute_tensor_a_list"][0],
-        b=tensors["cute_tensor_b_list"][0],
-        c=tensors["cute_tensor_c"],
-        comm_in_multicast_tensor=tensors["cute_tensor_comm_in_mc"],
-        comm_out_multicast_tensor=tensors["cute_tensor_comm_out_mc"],
-        barrier_flag_unicast=tensors["cute_tensor_flag_unicast"],
-        barrier_flag_multicast=tensors["cute_tensor_flag_multicast"],
-        stream=stream,
-    )
-    compiled = cute.compile(
-        kernel,
-        **kwargs,
-        max_active_clusters=utils.HardwareInfo().get_max_active_clusters(
-            CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]),
-    )
+    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+        CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1])
 
-    def launch():
-        compiled(**kwargs)
+    if variant == "ldmc":
+        kwargs = _ldmc_kwargs(tensors, stream)
+        compiled = cute.compile(kernel, **kwargs,
+                                max_active_clusters=max_active_clusters)
+
+        def launch():
+            compiled(**kwargs)
+    else:
+        launch = _lamport_launcher(
+            cute, kernel, tensors, stream, rank,
+            max_active_clusters=max_active_clusters,
+            rot_key=(variant, M, N, K))
 
     launch._keepalive = tensors
     launch.config = (swizzle_size, raster_order)
+    return launch
+
+
+def _lamport_launcher(cute, kernel, tensors, stream, rank, *,
+                      max_active_clusters, rot_key):
+    """Launcher that advances the ping/pong/cooling rotation on every call.
+
+    Rotation is not optional. The Lamport consumer spins while the loaded word
+    still equals the -0.0 sentinel, so a slot is only safe to read if it was
+    scrubbed by the previous iteration's clear. Calling with a fixed slot would
+    hit data left over from the last call, exit the spin immediately on stale
+    values, and report a *faster* time for a wrong answer -- the worst possible
+    failure mode in a benchmark.
+
+    The counter is keyed by shape and shared across autotune candidates rather
+    than restarting per candidate. Candidates share one set of tensors, so
+    restarting at ping=0 would land on whichever slot the previous candidate
+    left dirty. Continuing the count keeps the invariant "the slot I am about to
+    read was cleared one iteration ago" true across candidate boundaries.
+
+    All ranks step the counter in lockstep because they issue the same calls in
+    the same order -- which they must anyway, these are collectives.
+    """
+    n_buf = len(tensors["cute_tensors_c_uc_per_peer_grouped"])
+    kwargs_ring = [_lamport_kwargs(tensors, stream, rank, i) for i in range(n_buf)]
+    # Pointers are kernel arguments, not baked constants, so one compile covers
+    # every rotation; upstream compiles against slot 0 the same way.
+    compiled = cute.compile(kernel, **kwargs_ring[0],
+                            max_active_clusters=max_active_clusters)
+    _rotation.setdefault(rot_key, 0)
+
+    def launch():
+        i = _rotation[rot_key]
+        compiled(**kwargs_ring[i % n_buf])
+        _rotation[rot_key] = i + 1
+
     return launch
 
 
@@ -220,34 +366,40 @@ def _time(launch, iters=5):
     return float(t.item())
 
 
-def build(*, M, N, K, rank, world_size, device,
+def build(*, M, N, K, rank, world_size, device, variant=DEFAULT_VARIANT,
           swizzle_size=None, raster_order="m", autotune=None):
-    """Compile for one shape. Returns a zero-arg launcher.
+    """Compile one variant for one shape. Returns a zero-arg launcher.
 
     swizzle_size=None uses matched_swizzle(M), i.e. the same tile-grouping width
     our kernel uses -- without it CUTLASS runs unswizzled and the comparison is
     not like for like.
 
     autotune=None reads CUTLASS_AUTOTUNE. When on, every (swizzle, raster) pair
-    is compiled and timed and the fastest is kept. All ranks evaluate the same
-    candidates in the same order and agree on the winner by all-reducing the
-    timings, which they must -- these are collectives.
+    is compiled and timed and the fastest is kept, per variant -- the two have
+    different comm structure and there is no reason for them to prefer the same
+    schedule. All ranks evaluate the same candidates in the same order and agree
+    on the winner by all-reducing the timings, which they must -- these are
+    collectives.
     """
-    ex = _load()
-    tensors = _tensors(ex, M, N, K, rank, world_size, device)
+    _check(variant)
+    ex = _load(variant)
+    tensors = _tensors(ex, variant, M, N, K, rank, world_size, device)
 
     if autotune is None:
         autotune = os.environ.get(_ENV_AUTOTUNE, "0") not in ("0", "", "false")
 
+    def compile_at(swz, raster):
+        return _compile_one(ex, tensors, variant=variant, M=M, N=N, K=K,
+                            rank=rank, world_size=world_size,
+                            swizzle_size=swz, raster_order=raster)
+
     if not autotune:
         if swizzle_size is None:
             swizzle_size = matched_swizzle(M)
-        launch = _compile_one(ex, tensors, M=M, N=N, K=K, rank=rank,
-                              world_size=world_size, swizzle_size=swizzle_size,
-                              raster_order=raster_order)
+        launch = compile_at(swizzle_size, raster_order)
         if launch is None:
             raise RuntimeError(
-                f"cutlass rejects swizzle_size={swizzle_size} "
+                f"cutlass[{variant}] rejects swizzle_size={swizzle_size} "
                 f"raster_order={raster_order} at M={M} N={N}")
         return launch
 
@@ -255,9 +407,7 @@ def build(*, M, N, K, rank, world_size, device,
     tried = []
     for raster in AUTOTUNE_RASTERS:
         for swz in AUTOTUNE_SWIZZLES:
-            cand = _compile_one(ex, tensors, M=M, N=N, K=K, rank=rank,
-                                world_size=world_size, swizzle_size=swz,
-                                raster_order=raster)
+            cand = compile_at(swz, raster)
             if cand is None:
                 continue
             ms = _time(cand)
@@ -265,6 +415,7 @@ def build(*, M, N, K, rank, world_size, device,
             if ms < best_ms:
                 best, best_ms = cand, ms
     if best is None:
-        raise RuntimeError(f"no cutlass config is implementable at M={M} N={N}")
+        raise RuntimeError(
+            f"no cutlass[{variant}] config is implementable at M={M} N={N}")
     best.autotune_log = tried
     return best

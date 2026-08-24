@@ -159,7 +159,7 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_depth_x_split sweep_unroll_x_split sweep_all
+.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_depth_x_split sweep_unroll_x_split sweep_shortlist sweep_all
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -189,6 +189,18 @@ sweep_depth_x_split :
 sweep_unroll_x_split :
 	$(MAKE) COMP_SM_SWEEP=1 \
 	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(140) F(136) F(132)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(8) F(11) F(14) F(16) F(22) F(32) F(43)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0) F(1)' -DGEMM_AR_ENABLE_PUSH=0" \
+	        run_gemm_ar_blackwell
+
+# Stage 2: confirmation. The wide sweeps above are SCREENS -- with dozens of
+# conditions separated by ~1% and measured with ~2% noise, their argmin picks
+# whichever config got lucky and reports it as faster than it is. This rebuilds
+# only the survivors, so the run is short (10 conditions, so little thermal
+# accumulation) and every config gets the full iteration count. Trust rankings
+# from here, not from the screens. Check the `noise floor` line: if the gap to
+# second place is inside it, the two are tied and the split is what matters.
+sweep_shortlist :
+	$(MAKE) COMP_SM_SWEEP=1 \
+	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(136) F(132)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16) F(43)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0) F(1)' -DGEMM_AR_ENABLE_PUSH=0" \
 	        run_gemm_ar_blackwell
 
 # 528 kernels. Prefer one axis at a time unless you are chasing an interaction.

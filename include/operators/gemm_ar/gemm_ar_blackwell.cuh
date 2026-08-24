@@ -40,8 +40,7 @@ struct config_t {
     static constexpr int NUM_COMP_SM = NUM_COMP_SM_;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
     static_assert(NUM_COMP_SM > 0, "need at least one comp SM");
-    static_assert(NUM_COMM_SM > 0,
-                  "need at least one comm SM; the AR is never run by comp SMs");
+    static_assert(NUM_COMM_SM > 0, "need at least one comm SM; the AR is never run by comp SMs");
     // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
     // Maybe I can also save some SMs just for all-reduce?
     // I need to have a regular epilogue, and then do the all reduce -- maybe I can save SMs just
@@ -56,10 +55,8 @@ struct config_t {
     static constexpr int NUM_CLUSTERS = 2;
     // Clusters are co-scheduled, so a cluster may not straddle the comp/comm
     // boundary: blockIdx.x < NUM_COMP_SM has to split whole clusters.
-    static_assert(NUM_COMP_SM % NUM_CLUSTERS == 0,
-                  "comp SMs must be a whole number of clusters");
-    static_assert(NUM_BLOCKS % NUM_CLUSTERS == 0,
-                  "grid must be a whole number of clusters");
+    static_assert(NUM_COMP_SM % NUM_CLUSTERS == 0, "comp SMs must be a whole number of clusters");
+    static_assert(NUM_BLOCKS % NUM_CLUSTERS == 0, "grid must be a whole number of clusters");
 
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
@@ -206,8 +203,8 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // remaining deficit is exactly the SMs not doing GEMM. These probe how few comm
 // SMs the all-reduce can be squeezed into before it becomes the bottleneck.
 #define GEMM_AR_FOR_EACH_COMP_SM(F) \
-    F(144) F(140) F(136) F(132) F(128) F(126) F(124) F(122) F(118) F(116) \
-    F(112) F(108) F(104) F(100)
+    F(144)                          \
+    F(140) F(136) F(132) F(128) F(126) F(124) F(122) F(118) F(116) F(112) F(108) F(104) F(100)
 #else
 #define GEMM_AR_FOR_EACH_COMP_SM(F) F(128)
 #endif
@@ -252,7 +249,9 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 static constexpr int AR_UNROLL_BY_SHAPE = 0;
 static constexpr int DEFAULT_SIGNAL_DEPTH = 0;
 
-inline int default_ar_unroll(int M) { return M <= 2048 ? 32 : 64; }
+inline int default_ar_unroll(int M) {
+    return M <= 2048 ? 32 : 64;
+}
 
 // SUPERGROUP_WIDTH stays derived from M rather than swept: it sets the tile
 // walk, and comp and comm must agree on it or the barrier coordinates diverge.
@@ -268,10 +267,10 @@ inline void gemm_ar_dispatch_shape(const fused_globals& G, int M) {
 template <int STRATEGY, int COMP_SM, int AR_UNROLL>
 inline bool gemm_ar_dispatch_depth(const fused_globals& G, int M, int signal_depth) {
     bool ok = false;
-#define GEMM_AR_TRY_DEPTH(D)                                                    \
-    if (!ok && signal_depth == (D)) {                                           \
-        gemm_ar_dispatch_shape<STRATEGY, COMP_SM, AR_UNROLL, D>(G, M);           \
-        ok = true;                                                              \
+#define GEMM_AR_TRY_DEPTH(D)                                           \
+    if (!ok && signal_depth == (D)) {                                  \
+        gemm_ar_dispatch_shape<STRATEGY, COMP_SM, AR_UNROLL, D>(G, M); \
+        ok = true;                                                     \
     }
     GEMM_AR_FOR_EACH_SIGNAL_DEPTH(GEMM_AR_TRY_DEPTH)
 #undef GEMM_AR_TRY_DEPTH
@@ -289,7 +288,7 @@ inline bool gemm_ar_dispatch_unroll(const fused_globals& G,
 #define GEMM_AR_TRY_UNROLL(UN)                                                  \
     if (!matched && ar_unroll == (UN)) {                                        \
         matched = true;                                                         \
-        ok = gemm_ar_dispatch_depth<STRATEGY, COMP_SM, UN>(G, M, signal_depth);  \
+        ok = gemm_ar_dispatch_depth<STRATEGY, COMP_SM, UN>(G, M, signal_depth); \
     }
     GEMM_AR_FOR_EACH_UNROLL(GEMM_AR_TRY_UNROLL)
 #undef GEMM_AR_TRY_UNROLL
@@ -311,11 +310,8 @@ inline bool gemm_ar_dispatch_unroll(const fused_globals& G,
 #endif
 
 template <int COMP_SM>
-inline bool gemm_ar_dispatch_strategy(const fused_globals& G,
-                                      int M,
-                                      int strategy,
-                                      int ar_unroll,
-                                      int signal_depth) {
+inline bool gemm_ar_dispatch_strategy(
+    const fused_globals& G, int M, int strategy, int ar_unroll, int signal_depth) {
     if (strategy == GemmToArSignalStrategy::PUSH) {
 #if GEMM_AR_ENABLE_PUSH
         return gemm_ar_dispatch_unroll<GemmToArSignalStrategy::PUSH, COMP_SM>(
@@ -369,7 +365,9 @@ inline std::vector<int> compiled_signal_depths() {
     return out;
 }
 
-inline int num_blocks() { return config::NUM_BLOCKS; }
+inline int num_blocks() {
+    return config::NUM_BLOCKS;
+}
 
 void entrypoint(const at::Tensor& A,
                 const at::Tensor& B,
@@ -389,23 +387,21 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    TORCH_CHECK((gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH &&
-                 GEMM_AR_ENABLE_PUSH) ||
-                    (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL &&
-                     GEMM_AR_ENABLE_PULL),
-                "Unknown or not-compiled gemm_to_ar_signal_strategy ",
-                gemm_to_ar_signal_strategy,
-                "; expected PUSH(0) or PULL(1)");
+    TORCH_CHECK(
+        (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH && GEMM_AR_ENABLE_PUSH) ||
+            (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL && GEMM_AR_ENABLE_PULL),
+        "Unknown or not-compiled gemm_to_ar_signal_strategy ",
+        gemm_to_ar_signal_strategy,
+        "; expected PUSH(0) or PULL(1)");
 
-    const int unroll =
-        (ar_unroll <= AR_UNROLL_BY_SHAPE) ? default_ar_unroll(M) : ar_unroll;
+    const int unroll = (ar_unroll <= AR_UNROLL_BY_SHAPE) ? default_ar_unroll(M) : ar_unroll;
 
     bool matched_sm = false, launched = false;
-#define GEMM_AR_TRY_COMP_SM(SM)                                                       \
-    if (!launched && num_comp_sm == (SM)) {                                           \
-        matched_sm = true;                                                            \
-        launched = gemm_ar_dispatch_strategy<(SM)>(                                   \
-            G, M, gemm_to_ar_signal_strategy, unroll, signal_depth);                  \
+#define GEMM_AR_TRY_COMP_SM(SM)                                      \
+    if (!launched && num_comp_sm == (SM)) {                          \
+        matched_sm = true;                                           \
+        launched = gemm_ar_dispatch_strategy<(SM)>(                  \
+            G, M, gemm_to_ar_signal_strategy, unroll, signal_depth); \
     }
     GEMM_AR_FOR_EACH_COMP_SM(GEMM_AR_TRY_COMP_SM)
 #undef GEMM_AR_TRY_COMP_SM
