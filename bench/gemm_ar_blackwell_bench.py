@@ -30,6 +30,12 @@ WARMUP = 30
 # position balancing stays exact, so the effective count can differ slightly --
 # it is printed per shape.
 BENCH_ITER = 60
+# Cap on how many Williams rotations a run uses. Each iteration runs every
+# condition, so using all n rotations costs O(n^2) launches; 8 keeps a wide
+# sweep to ~BENCH_ITER iterations while still placing every condition in 8
+# distinct positions. Small sweeps are unaffected -- with n <= 8 every rotation
+# is used and the balancing is exactly as before.
+MAX_ORDERS = 8
 
 class GemmToArSignal(Enum):
     PUSH = 0
@@ -433,10 +439,28 @@ def main():
                          for un in AR_UNROLLS
                          for sd in SIGNAL_DEPTHS]
                       + [CUTLASS_CONDS[v] for v in sorted(cutlass_runs)])
-        ORDERS = williams_orders(conditions)
-        # Round the target iteration count to a whole number of orders so the
-        # balancing is exact rather than approximate.
-        iterations = max(1, round(BENCH_ITER / len(ORDERS))) * len(ORDERS)
+        # Use at most MAX_ORDERS of the Williams rotations. Using all n of them
+        # makes the balancing perfect -- every condition sits in every position
+        # exactly once -- but it forces iterations to be a multiple of n, and
+        # since each iteration runs all n conditions the run costs O(n^2)
+        # launches. At n=227 that is ~51,500 launches per shape, several minutes
+        # of unbroken GPU load, and the thermal drift it induces is far larger
+        # than the 1% effects the sweep is trying to resolve: a sweep that heats
+        # the part until nothing is separable has not measured anything.
+        #
+        # k rotations still put every condition in k distinct positions, which
+        # removes position bias to the accuracy that matters here, and lets the
+        # sample count be chosen for statistics instead of for combinatorics.
+        all_orders = williams_orders(conditions)
+        ORDERS = all_orders[:MAX_ORDERS]
+        # Round up to a whole number of rotations so the balancing stays exact
+        # over the rotations actually used.
+        iterations = max(1, -(-BENCH_ITER // len(ORDERS))) * len(ORDERS)
+        if is_chief and len(ORDERS) < len(all_orders):
+            print(f"  [orders] {len(conditions)} conditions, using "
+                  f"{len(ORDERS)}/{len(all_orders)} rotations, "
+                  f"{iterations} iters -> {iterations * len(conditions)} launches "
+                  f"(all rotations would be {len(all_orders) ** 2})", flush=True)
 
         samples = {c: [] for c in conditions}
 

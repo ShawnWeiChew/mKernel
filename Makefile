@@ -198,9 +198,17 @@ sweep_unroll_x_split :
 # accumulation) and every config gets the full iteration count. Trust rankings
 # from here, not from the screens. Check the `noise floor` line: if the gap to
 # second place is inside it, the two are tied and the split is what matters.
+#
+# The open question it is aimed at: the wide sweep put 140:8 at u43/u64 in the
+# top two, but 140:8 at u16 measured 8.455 ms -- pinned against the ~36 GB/s
+# per-comm-SM wall. High unroll keeps more multimem requests in flight per
+# thread, which by Little's law is exactly what raises per-SM bandwidth, so
+# either the wall moves with unroll (and 140:8 is real, worth 4 more GEMM SMs)
+# or those two rows were noise. 136:12/u16 is the incumbent to beat. Both PUSH
+# and PULL stay in because the wide run flipped the winner between them.
 sweep_shortlist :
 	$(MAKE) COMP_SM_SWEEP=1 \
-	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(136) F(132)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16) F(43)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0) F(1)' -DGEMM_AR_ENABLE_PUSH=0" \
+	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(140) F(136)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16) F(43) F(64)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0)'" \
 	        run_gemm_ar_blackwell
 
 # 528 kernels. Prefer one axis at a time unless you are chasing an interaction.
