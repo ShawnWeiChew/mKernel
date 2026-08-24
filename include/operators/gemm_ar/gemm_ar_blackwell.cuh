@@ -216,9 +216,19 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
 // AR_UNROLL = independent multimem load/store requests each AR thread keeps in
 // flight. The non-sweep list keeps both values the shape heuristic picks (32
 // for M <= 2048, 64 above), so a default build behaves exactly as before.
+//
+// There is a hard ceiling on useful unroll. One AR tile is
+// TOTAL_UNITS = 128 rows * 128 bf16_2 units = 16384 units, spread over
+// NUM_THREADS = 384 threads, so a thread only ever has
+//   16384 / 384 = 42.67
+// units of work. Any unroll slot past 42 is a bounds-check that always fails:
+// it costs registers and issue slots and moves no data. That is why 64 has
+// never won -- a third of its slots are dead. The loop count is
+// ceil(42.67 / U), and the values below are chosen so the tail iteration is
+// not mostly empty: 11 -> 4 iters, 14 -> 3, 22 -> 2, 43 -> 1 (full).
 #ifndef GEMM_AR_FOR_EACH_UNROLL
 #ifdef GEMM_AR_UNROLL_SWEEP
-#define GEMM_AR_FOR_EACH_UNROLL(F) F(8) F(16) F(32) F(64)
+#define GEMM_AR_FOR_EACH_UNROLL(F) F(8) F(11) F(14) F(16) F(22) F(32) F(43) F(64)
 #else
 #define GEMM_AR_FOR_EACH_UNROLL(F) F(32) F(64)
 #endif
