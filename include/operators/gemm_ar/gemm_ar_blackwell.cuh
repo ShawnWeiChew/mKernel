@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,7 +23,7 @@
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
 struct config {
@@ -69,6 +70,25 @@ struct config {
                   "Register split over-subscribes the launch register pool");
 
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+
+    // Bit positions inside the packed phasebits word, one bit per barrier
+    // array. mma_finish and tma_load are shared across consumers, so they get a
+    // single bit each; the epilogue barriers are per consumer / per epilogue
+    // warpgroup, so they get CONSUMER_WARPS contiguous bits each.
+    static constexpr int PHASE_BIT_MMA_FINISH = 0;
+    static constexpr int PHASE_BIT_TMA_LOAD = PHASE_BIT_MMA_FINISH + 1;
+    static constexpr int PHASE_BIT_EPILOGUE_FINISHED = PHASE_BIT_TMA_LOAD + 1;
+    static constexpr int PHASE_BIT_EPILOGUE_READY = PHASE_BIT_EPILOGUE_FINISHED + CONSUMER_WARPS;
+    static_assert(EPILOGUE_WARPGROUPS == CONSUMER_WARPS,
+                  "The epilogue_ready phase bits are indexed by warpgroup but sized by consumer");
+    static_assert(PHASE_BIT_EPILOGUE_READY + CONSUMER_WARPS <= 32,
+                  "The phase bits must fit in a single 32-bit word");
+
+    // Barriers whose first wait expects a completed phase start at 1:
+    // mma_finish (the pipeline slot is free before the first MMA) and
+    // epilogue_finished (tmem is free before the first epilogue).
+    static constexpr uint32_t PHASE_BITS_INIT = (1u << PHASE_BIT_MMA_FINISH) |
+        (((1u << CONSUMER_WARPS) - 1) << PHASE_BIT_EPILOGUE_FINISHED);
 };
 
 enum GemmToArSignalStrategy {
@@ -185,27 +205,12 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PUSH) {
-        if (M <= 2048) {
-            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PUSH>(G);
-        } else if (M <= 4096) {
-            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PUSH>(G);
-        } else {
-            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PUSH>(G);
-        }
-    } else if (gemm_to_ar_signal_strategy == GemmToArSignalStrategy::PULL) {
-        if (M <= 2048) {
-            launch_fused_gemm_ar_blackwell<4, 32, GemmToArSignalStrategy::PULL>(G);
-        } else if (M <= 4096) {
-            launch_fused_gemm_ar_blackwell<4, 64, GemmToArSignalStrategy::PULL>(G);
-        } else {
-            launch_fused_gemm_ar_blackwell<8, 64, GemmToArSignalStrategy::PULL>(G);
-        }
+    if (M <= 2048) {
+        launch_fused_gemm_ar_blackwell<4, 32>(G);
+    } else if (M <= 4096) {
+        launch_fused_gemm_ar_blackwell<4, 64>(G);
     } else {
-        TORCH_CHECK(false,
-                    "Unknown gemm_to_ar_signal_strategy ",
-                    gemm_to_ar_signal_strategy,
-                    "; expected PUSH(0) or PULL(1)");
+        launch_fused_gemm_ar_blackwell<8, 64>(G);
     }
 }
 };  // namespace gemm_ar_intranode_blackwell

@@ -6,8 +6,6 @@ bench/source_of_truth
 
 .clang*
 .vscode
-modal_scripts
-# clangd
 compile_commands.json
 compile_commands.events.json
 .cache/

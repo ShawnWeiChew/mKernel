@@ -39,7 +39,7 @@ using namespace kittens;
 
 namespace gemm_ar_intranode_blackwell {
 
-// use snake-like pattern, referenced from:
+// use snake-like pattern, but without the safety path for odd numbered shapes referenced from:
 // https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
 template <int SUPERGROUP_WIDTH = 8>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
@@ -54,7 +54,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -66,13 +66,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         G.C_dist[G.dev_idx].prefetch_tma<fused_globals::C_tile>();
     }
 
-    // One CLUSTER computes one output block, not one CTA. mm2_AB is a
-    // cta_group::2 MMA, so M = A::rows * ncta = 256 and N = B::cols * ncta =
-    // 256: each CTA feeds its own 128 rows of A and its own 128 columns of B
-    // into the shared instruction, and its accumulator keeps the 128 output
-    // rows belonging to its own A rows. The tile walk therefore has to be
-    // indexed by cluster; indexing it by blockIdx.x pairs two unrelated tiles
-    // inside one MMA, which leaves exactly half of every stored tile wrong.
+    // Each TMA load loads 2 128 * 64 A tiiles and 64 * 256 B tile
+    // These tiles will then participate in 2CTA MMA, to produce a 256 * 256 tile per SM
     const int num_row_tiles = G.M / (fused_globals::ROW_BLOCK * config::NUM_CLUSTERS);
     const int num_col_tiles = G.N / fused_globals::COL_BLOCK;
     const int num_tiles_total = num_row_tiles * num_col_tiles;
@@ -93,21 +88,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     __shared__ semaphore mma_finish[fused_globals::PIPELINE_STAGES];
     __shared__ semaphore epilogue_ready[config::CONSUMER_WARPS];
     __shared__ semaphore epilogue_tmem_finished[config::CONSUMER_WARPS];
-    __shared__ semaphore epilogue_gmem_store_finished;
 
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
 
-    // combined phasebits, one bit per barrier array. A bit is toggled once per
-    // full ring traversal of its array, i.e. when the stage index wraps to 0 --
-    // the epilogue rings hold a single barrier per consumer, so their bits flip
-    // on every iteration.
-    // bit 4-5: epilogue_ready (consumer 0 & consumer 1)   - starts at 0
-    // bit 2-3: epilogue_finished (consumer 0 & consumer 1) - starts at 1
-    // these two stay the same since the mma and tma are
-    // shared
-    // bit 1: tma_load          - starts at 0
-    // bit 0: mma_finish        - starts at 1
-    uint32_t phasebits = 0b001101;
+    // combined phasebits, one bit per barrier array (see the PHASE_BIT_*
+    // layout in config). A bit is toggled once per full ring traversal of its
+    // array, i.e. when the stage index wraps to 0 -- the epilogue rings hold a
+    // single barrier per consumer, so their bits flip on every iteration.
+    uint32_t phasebits = config::PHASE_BITS_INIT;
 
     if (warp_id == 0 && elect_warp_leader()) {
 #pragma unroll
@@ -123,26 +111,17 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             init_semaphore(epilogue_ready[c], 0, 1);
             // broadcasted back to the mma thread to signal that tmem is ready
             init_semaphore(epilogue_tmem_finished[c], WARPGROUP_WARPS * config::NUM_CLUSTERS, 0);
-            // one barrier to register that the 256 * 256 tile has been completed
-            init_semaphore(
-                epilogue_gmem_store_finished, WARPGROUP_WARPS * config::CONSUMER_WARPS, 0);
         }
     }
 
-    // normally, it has to be a full sync(), but since we are waiting on the PDL launch later in the
-    // code, we can just arrive here, then wait later
+    // flush to ensure the mbarriers are visible
     everyone::tma::cluster::sync();
 
-    // tile_row_idx is this CTA's FIRST A row tile, in A_tile units
-    // (ROW_BLOCK / CONSUMER_WARPS rows, already rank adjusted) -- consumer c
-    // takes the tile c further along, which is the same row tile its epilogue
-    // warpgroup stores back. tile_col_idx is the cluster's C column tile
-    // (COL_BLOCK units).
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(mma_finish[input_stage_id], (phasebits & 0b1));
+            wait(mma_finish[input_stage_id], (phasebits >> config::PHASE_BIT_MMA_FINISH) & 0b1);
 
             tma::cluster::expect_bytes(tma_load[input_stage_id],
                                        sizeof(fused_globals::A_tile) * config::CONSUMER_WARPS +
@@ -171,27 +150,27 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
-                phasebits ^= 1;
+                phasebits ^= (1 << config::PHASE_BIT_MMA_FINISH);
             }
         }
     };
 
-    // each only handles 16
     auto consume = [&](int& input_stage_id, fused_globals::C_tt_tile* tmem, const int consumer_id) {
-        wait(epilogue_tmem_finished[consumer_id], (phasebits >> (2 + consumer_id)) & 0b1);
+        wait(epilogue_tmem_finished[consumer_id],
+             (phasebits >> (config::PHASE_BIT_EPILOGUE_FINISHED + consumer_id)) & 0b1);
 
         {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+            wait(tma_load[input_stage_id], (phasebits >> config::PHASE_BIT_TMA_LOAD) & 0b1);
 
             mm2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
 
             if (input_stage_id == 0) {
-                phasebits ^= (1 << 1);
+                phasebits ^= (1 << config::PHASE_BIT_TMA_LOAD);
             }
         }
 
@@ -199,13 +178,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
-            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+            wait(tma_load[input_stage_id], (phasebits >> config::PHASE_BIT_TMA_LOAD) & 0b1);
 
             mma2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
-                phasebits ^= (1 << 1);
+                phasebits ^= (1 << config::PHASE_BIT_TMA_LOAD);
             }
         }
 
@@ -213,7 +192,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         // This consumer owns exactly one accumulator, so epilogue_finished
         // completes once per output tile and its phase flips every iteration.
-        phasebits ^= (1 << (2 + consumer_id));
+        phasebits ^= (1 << (config::PHASE_BIT_EPILOGUE_FINISHED + consumer_id));
     };
 
     auto epilogue = [&](int tile_row_idx,
@@ -221,7 +200,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                         fused_globals::C_tt_tile* tmem,
                         const int warpgroup_id,
                         bool is_last_tile) {
-        wait(epilogue_ready[warpgroup_id], (phasebits >> (4 + warpgroup_id)) & 0b1);
+        wait(epilogue_ready[warpgroup_id],
+             (phasebits >> (config::PHASE_BIT_EPILOGUE_READY + warpgroup_id)) & 0b1);
 
         const auto& C_out = G.C_dist[G.dev_idx];
         constexpr int C_CHUNK_COLS = fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES;
@@ -268,7 +248,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         // Same single-accumulator ring as the consumer side: epilogue_ready
         // completes once per output tile, so this flips every iteration.
-        phasebits ^= (1 << (4 + warpgroup_id));
+        phasebits ^= (1 << (config::PHASE_BIT_EPILOGUE_READY + warpgroup_id));
     };
 
     // Row tiles are A_tile/C_tile sized (ROW_BLOCK / CONSUMER_WARPS rows), so a
@@ -282,9 +262,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
         if (warp_id == config::PRODUCER_WARP_ID) {
             if (elect_warp_leader()) {
-                // pdl::wait();
-                // NOTE: This splits up the arrive at the top and interleaves the work in between
-                // everyone::tma::cluster::wait();
                 int input_stage_id = 0;
                 for (int tile_id = cluster_idx; tile_id < num_tiles_total;
                      tile_id += num_comp_clusters) {
@@ -300,9 +277,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         } else if (warp_id >= config::FIRST_CONSUMER_WARP_ID &&
                    warp_id < config::FIRST_CONSUMER_WARP_ID + config::CONSUMER_WARPS) {
             if (cta_rank == 0 && elect_warp_leader()) {
-                // consumer_id pairs this warp with epilogue warpgroup
-                // consumer_id: same A tile, same accumulator, same semaphores.
-                // everyone::tma::cluster::wait();
                 const int consumer_id = warp_id - config::FIRST_CONSUMER_WARP_ID;
 
                 // give each warp its own view of tmem
@@ -318,8 +292,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
-        // everyone::tma::cluster::wait_aligned();
-
         // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
         tmem[0] =
@@ -339,41 +311,22 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                      warpgroup_id,
                      tile_id + num_comp_clusters >= num_tiles_total);
 
-            // TODO: for the sake of corretness, sync here before issuing a completion argument
-            // not sure if there is a world where I can wait for the store completion on another
-            // thread the concern is that there is a race between the previous another way is to
-            // weave the tma completion into the barrier that the epilogue waits on in the first
-            // place? we will definitely lose parallelism here though
-            // TODO: verify that only 1 thread waits on this completion, the rest can fire forward
+            // TMA store visible in GMEM
             dist::tma::store_async_wait();
 
-            // if (elect_warp_leader()) {
-            //     arrive(epilogue_gmem_store_finished);
-            // }
-
-            // TODO: not sure if there is an optimization where I can have a relaxed -> release
-            // TODO: what if I have number of threads that is equal to the number of devices I
-            // want to signal???
             // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
-            // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
-            // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
-            // cluster tile -- so the destination is the sub-row index itself,
-            // not a function of tile_id.
+            // holds 2,3
             const int device_to_signal = (c_row_tile % 4) + (tile_col_id % 2) * 4;
 
             // NOTE: there is no need to use a warpgroup::sync() here, becuase the thread issuing
             // the TMA store is also the thread doing the TMA wait, so the signal will not be sent
             // until the TMA wait is completed
             if (warpgroup::laneid() == 0) {
-                if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
-                    dist::signal(
-                        G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
-                } else {
-                    // only need a GPU scope, because the data only needs to be present in local L2
-                    // for peer to read over nvlink
-                    comm::atomic_u32::release_store_gpu(
-                        &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
-                }
+                // https://github.com/NVIDIA/cutlass/issues/3117#issuecomment-5179892505
+                // only need a GPU scope, because the data only needs to be present in local L2
+                // for peer to read over nvlink
+                comm::atomic_u32::release_store_gpu(
+                    &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
             }
         }
     }
@@ -389,7 +342,7 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
@@ -418,26 +371,13 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         // not go through the L1 cache + signal from before is a release add operation
         const int actual_tile_row = tile_row_idx * NUM_DEVICES_PER_TILE + comm_row_idx;
         if (threadIdx.x == 0) {
-            // https://github.com/NVIDIA/cutlass/issues/3117#issuecomment-5179892505
-            // only need a gpu scope load here, since we only need the data to be present in the
-            // local L2
-
-            if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
-                int val;
-                do {
-                    val = comm::atomic_u32::relaxed_load_s32_gpu(
-                        &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
-                } while (val < iter_gate_value);
-            } else {
-                int val;
-                do {
-                    comm::multimem<int>::ld_reduce<comm::reduce_op::MIN,
-                                                   comm::memory_model::STRONG>(
-                        val,
-                        reinterpret_cast<const int*>(
-                            G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
-                } while (val < (int)G.epoch);
-            }
+            int val;
+            do {
+                comm::multimem<int>::ld_reduce<comm::reduce_op::MIN, comm::memory_model::STRONG>(
+                    val,
+                    reinterpret_cast<const int*>(
+                        G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
+            } while (val < (int)G.epoch);
         }
         __syncthreads();
 
@@ -487,23 +427,23 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+        fused_comp_sm<SUPERGROUP_WIDTH>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -511,74 +451,12 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
-    auto this_kernel =
-        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL>;
 
-    // smem_size is built from compile-time constants, so this only has to be
-    // set once — doing it per launch puts a host API call inside the caller's
-    // timing window. The attribute is per-device state though, so the guard has
-    // to be per-device: a single static flag would leave every device but the
-    // first one at the 48KB default.
-    constexpr int MAX_LOCAL_DEVICES = 8;
-    int dev = 0;
-    MKERNEL_CUDACHECK(cudaGetDevice(&dev));
-    static bool smem_configured[MAX_LOCAL_DEVICES] = {};
-    if (dev >= MAX_LOCAL_DEVICES || !smem_configured[dev]) {
-        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-            this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        if (dev < MAX_LOCAL_DEVICES) {
-            smem_configured[dev] = true;
-        }
-    }
+    MKERNEL_CUDACHECK(
+        cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
-}
-
-namespace ar_detail {
-template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
-__device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
-                                                 const fused_globals::C_final_tensor& C_final,
-                                                 int row_base,
-                                                 int col_base) {
-    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
-    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
-    constexpr int NT = config::NUM_THREADS;
-    constexpr int BATCH = AR_UNROLL * NT;
-
-    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
-        comm::bf16_2* ld_ptrs[AR_UNROLL];
-        comm::bf16_2* st_ptrs[AR_UNROLL];
-        uint32_t tmps[AR_UNROLL];
-
-        // Consecutive threads take consecutive bf16_2 units, so each warp's
-        // requests coalesce into contiguous 128B chunks.
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            const int j = base + u * config::NUM_THREADS;
-            if (j < TOTAL_UNITS) {
-                const int r = row_base + j / UNITS_PER_ROW;
-                const int c = col_base + (j % UNITS_PER_ROW) * 2;
-                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
-                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
-            }
-        }
-
-        // All loads before any store — this is the whole point of the helper.
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
-                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
-                                                                                 ld_ptrs[u]);
-            }
-        }
-
-#pragma unroll
-        for (int u = 0; u < AR_UNROLL; u++) {
-            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
-                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
-            }
-        }
-    }
 }
 
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
@@ -630,8 +508,6 @@ __device__ __forceinline__ void ar_unroll_ld_cached(
         }
     }
 }
-};  // namespace ar_detail
-
 };  // namespace gemm_ar_intranode_blackwell
 
 #include "operators/gemm_ar/gemm_ar_blackwell_session.cuh"
