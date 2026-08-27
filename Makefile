@@ -84,6 +84,11 @@ INTRA_NUM_DEVICES ?= 8
 COMP_SM_SWEEP   ?= 0
 UNROLL_SWEEP    ?= 0
 SIGNAL_DEPTH_SWEEP ?= 0
+# VEC_SWEEP=1 adds the vectorised AR inner loop (multimem .v4, 16B per request)
+# at the unrolls in GEMM_AR_FOR_EACH_VEC_UNROLL. It ADDS to the scalar unroll
+# list rather than replacing it, so a build with both compiles both paths and
+# the bench can compare them head to head in one run.
+VEC_SWEEP       ?= 0
 SWEEP_DEFINES   :=
 ifeq ($(COMP_SM_SWEEP),1)
     SWEEP_DEFINES += -DGEMM_AR_COMP_SM_SWEEP
@@ -93,6 +98,9 @@ ifeq ($(UNROLL_SWEEP),1)
 endif
 ifeq ($(SIGNAL_DEPTH_SWEEP),1)
     SWEEP_DEFINES += -DGEMM_AR_SIGNAL_DEPTH_SWEEP
+endif
+ifeq ($(VEC_SWEEP),1)
+    SWEEP_DEFINES += -DGEMM_AR_VEC_SWEEP
 endif
 
 # EXTRA_DEFINES lets a target pin individual sweep axes, e.g.
@@ -159,7 +167,7 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_depth_x_split sweep_unroll_x_split sweep_shortlist sweep_all
+.PHONY: all clean bench check test-slot-math plots sweep_comp_sm sweep_unroll sweep_depth sweep_vec sweep_depth_x_split sweep_unroll_x_split sweep_vec_x_split sweep_shortlist sweep_all
 
 run_gemm_ar_blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -170,6 +178,7 @@ run_gemm_ar_blackwell : gemm_ar_blackwell
 sweep_comp_sm : ; $(MAKE) COMP_SM_SWEEP=1 run_gemm_ar_blackwell
 sweep_unroll  : ; $(MAKE) UNROLL_SWEEP=1 run_gemm_ar_blackwell
 sweep_depth   : ; $(MAKE) SIGNAL_DEPTH_SWEEP=1 run_gemm_ar_blackwell
+sweep_vec     : ; $(MAKE) VEC_SWEEP=1 run_gemm_ar_blackwell
 
 # Targeted experiment: signal depth 0 vs 1, across every comp/comm split, with
 # unroll pinned to 16 and PULL only (the pairing that has been winning). Pinning
@@ -209,6 +218,27 @@ sweep_unroll_x_split :
 sweep_shortlist :
 	$(MAKE) COMP_SM_SWEEP=1 \
 	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(140) F(136)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16) F(43) F(64)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0)'" \
+	        run_gemm_ar_blackwell
+
+# Scalar vs vectorised AR inner loop, across a comp/comm split range that now
+# reaches down to 96. The two unroll lists are NOT the same numbers: a vec
+# request moves 16B instead of 4B, so one AR tile is 4096 units instead of
+# 16384 and the per-thread work ceiling drops from 42.67 to 10.67. 16/32/43 are
+# the scalar values that bracket the current winner; 8/10/11 are the vec values
+# with the same tail-iteration property (11 covers the tile in a single pass).
+# Comparing u43 scalar against u11 vec is the honest comparison -- both are
+# "one pass, no dead slots" -- and the rest bracket it.
+#
+# Both PUSH and PULL stay in: the winner has flipped between them before, and
+# the vec path changes the AR's request pattern, which is exactly the thing the
+# signalling strategy interacts with.
+#
+# 8 splits x 6 unroll variants x 2 strategies x 2 shape buckets = 192 kernels.
+# That is a long compile -- it is a screen, not a confirmation run; see the
+# note above sweep_shortlist before trusting its argmin.
+sweep_vec_x_split :
+	$(MAKE) COMP_SM_SWEEP=1 VEC_SWEEP=1 \
+	        EXTRA_DEFINES="'-DGEMM_AR_FOR_EACH_COMP_SM(F)=F(144) F(140) F(136) F(132) F(116) F(108) F(100) F(96)' '-DGEMM_AR_FOR_EACH_UNROLL(F)=F(16) F(32) F(43)' '-DGEMM_AR_FOR_EACH_VEC_UNROLL(F)=F(8) F(10) F(11)' '-DGEMM_AR_FOR_EACH_SIGNAL_DEPTH(F)=F(0)'" \
 	        run_gemm_ar_blackwell
 
 # 528 kernels. Prefer one axis at a time unless you are chasing an interaction.

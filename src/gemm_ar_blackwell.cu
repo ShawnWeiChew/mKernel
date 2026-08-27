@@ -342,8 +342,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 // only need a GPU scope, because the data only needs to be present in local L2
                 // for peer to read over nvlink
                 (void)dev;
-                comm::atomic_u32::release_store_gpu(
-                    &G.comp_comm_barrier[G.dev_idx][{row, col}], G.epoch);
+                comm::atomic_u32::release_store_gpu(&G.comp_comm_barrier[G.dev_idx][{row, col}],
+                                                    G.epoch);
             }
         };
 
@@ -428,7 +428,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             dist::tma::store_async_wait<0>();
 #pragma unroll
             for (int k = 0; k < SIG_RING; k++) {
-                if (k >= ring_filled) break;
+                if (k >= ring_filled)
+                    break;
                 const int slot = (ring_head + SIG_RING - ring_filled + k) % SIG_RING;
                 signal_tile(ring_row[slot], ring_col[slot], ring_dev[slot]);
             }
@@ -441,12 +442,16 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 // ============================================================================
 //
 // Ported from gemm_ar.cu's gemm_ar_pipelined_ar_tile
-template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int TRY_VEC>
 __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int COMP_SM>
+template <int SUPERGROUP_WIDTH,
+          int AR_UNROLL,
+          int GEMM_TO_AR_SIGNAL_STRATEGY,
+          int COMP_SM,
+          int TRY_VEC>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     using cfg = config_t<COMP_SM>;
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
@@ -503,7 +508,8 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         const int col_base = tile_col_idx * fused_globals::COL_BLOCK;
         pipelined_ar_tile<AR_UNROLL,
                           fused_globals::ROW_BLOCK / config::CONSUMER_WARPS,
-                          fused_globals::COL_BLOCK>(G, row_base, col_base);
+                          fused_globals::COL_BLOCK,
+                          TRY_VEC>(G, row_base, col_base);
     }
 }
 
@@ -526,22 +532,34 @@ __device__ __forceinline__ void ar_unroll_ld_cached(
     int col_base);
 
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_vec_cached(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base);
+
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
 __device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
                                                  const fused_globals::C_final_tensor& C_final,
                                                  int row_base,
                                                  int col_base);
 }  // namespace ar_detail
 
-template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N, int TRY_VEC>
 __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base) {
-    if constexpr (AR_UNROLL >= 32) {
-        ar_detail::ar_unroll_ld_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+    if constexpr (TRY_VEC) {
+        ar_detail::ar_unroll_vec_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
             G.C_dist, G.C_final, row_base, col_base);
     } else {
-        ar_detail::ar_unroll_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
-            G.C_dist, G.C_final, row_base, col_base);
+        if constexpr (AR_UNROLL >= 32) {
+            ar_detail::ar_unroll_ld_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+                G.C_dist, G.C_final, row_base, col_base);
+        } else {
+            ar_detail::ar_unroll_cached<AR_UNROLL, SUBTILE_M, SUBTILE_N>(
+                G.C_dist, G.C_final, row_base, col_base);
+        }
     }
 }
 
@@ -549,12 +567,14 @@ template <int SUPERGROUP_WIDTH,
           int AR_UNROLL,
           int GEMM_TO_AR_SIGNAL_STRATEGY,
           int COMP_SM,
-          int SIGNAL_DEPTH>
+          int SIGNAL_DEPTH,
+          int TRY_VEC>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config_t<COMP_SM>::NUM_COMP_SM) {
         fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM,
+                           TRY_VEC>(G);
     }
 }
 
@@ -562,18 +582,21 @@ template <int SUPERGROUP_WIDTH,
           int AR_UNROLL,
           int GEMM_TO_AR_SIGNAL_STRATEGY,
           int COMP_SM,
-          int SIGNAL_DEPTH>
+          int SIGNAL_DEPTH,
+          int TRY_VEC>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM, SIGNAL_DEPTH>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM, SIGNAL_DEPTH,
+                 TRY_VEC>(G);
 }
 
 template <int SUPERGROUP_WIDTH,
           int AR_UNROLL,
           int GEMM_TO_AR_SIGNAL_STRATEGY,
           int COMP_SM,
-          int SIGNAL_DEPTH>
+          int SIGNAL_DEPTH,
+          int TRY_VEC>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -581,9 +604,12 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
 
-    auto this_kernel =
-        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, COMP_SM,
-                              SIGNAL_DEPTH>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH,
+                                                 AR_UNROLL,
+                                                 GEMM_TO_AR_SIGNAL_STRATEGY,
+                                                 COMP_SM,
+                                                 SIGNAL_DEPTH,
+                                                 TRY_VEC>;
 
     // smem_size is built from compile-time constants, so this only has to be
     // set once — doing it per launch puts a host API call inside the caller's
@@ -697,6 +723,89 @@ __device__ __forceinline__ void ar_unroll_ld_cached(
                     reinterpret_cast<comm::bf16_2*>(reinterpret_cast<comm::bf16*>(ld_ptrs[u]) +
                                                     st_delta),
                     tmps[u]);
+            }
+        }
+    }
+}
+
+// One vec4 unit is 4 x bf16x2 = 8 bf16 = 16B, so the register operands have to be 32-bit ("r"),
+// not pointers -- a bf16_2* is 8B and will not bind to an "r" constraint. The accumulate
+// precision is pinned to f32 to match the scalar path in comm::multimem<bf16_2>: dropping
+// acc::f32 accumulates the 8-way reduction in bf16 and would make the vec sweep a test of two
+// changes at once. In SASS these are LDGMC.E.HPADD.BF16x8 (with) vs LDGMC.E.ADD.BF16x8 (without).
+__device__ __forceinline__ void multimem_vec4_ld_reduce_weak_no_clobber(uint32_t (&dst)[4],
+                                                                        const comm::bf16_2* src) {
+    asm volatile("multimem.ld_reduce.weak.global.add.acc::f32.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
+                 : "l"(src));
+}
+
+__device__ __forceinline__ void multimem_vec4_store_weak_no_clobber(comm::bf16_2* dst,
+                                                                    const uint32_t (&src)[4]) {
+    asm volatile("multimem.st.weak.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(dst),
+                 "r"(src[0]),
+                 "r"(src[1]),
+                 "r"(src[2]),
+                 "r"(src[3]));
+}
+
+// This should allow loading of 8 values at a time. This also works well because our tile size (128
+// * 256) is divisible by 8
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_vec_cached(
+    const fused_globals::C_distributed_tensor& C_dist,
+    const fused_globals::C_final_tensor& C_final,
+    int row_base,
+    int col_base) {
+    constexpr int VEC_SIZE_F32 =
+        4;  // number of f32 (= bf16x2) values moved by a single vec instruction
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2 / VEC_SIZE_F32;  // 32
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;       // 4096
+    constexpr int NT = config::NUM_THREADS;
+    // A "unit" is already a whole vec4, so the grid-stride is AR_UNROLL * NT units -- exactly the
+    // span the unrolled body below covers (j = base + u * NT, u < AR_UNROLL). Folding VEC_SIZE_F32
+    // in here would stride 4x past what the body wrote and silently drop 3/4 of the tile.
+    constexpr int BATCH = AR_UNROLL * NT;
+    // multimem.ld_reduce.v4 requires a 16B-aligned address. c is a multiple of 8 bf16 by
+    // construction above, col_base is a multiple of COL_BLOCK, and the row stride is N -- so this
+    // holds as long as a row is a whole number of vec4 units.
+    static_assert(SUBTILE_N % (2 * VEC_SIZE_F32) == 0,
+                  "the subtile row must be a whole number of vec4 units");
+
+    // 4096 units / 384 threads = 10.67, so AR_UNROLL >= 11 covers the tile in one pass.
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        // AR_UNROLL * (2 + 2 + 4) registers: 88 at AR_UNROLL=11, well under the limit
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL][VEC_SIZE_F32];
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;  // last value is 127
+                // 2 bf16 per bf16x2 x 4 bf16x2 per vec4 = 8 columns per unit; last value is 248,
+                // and 248 + 8 = 256 = SUBTILE_N, so the row is covered exactly.
+                const int c = col_base + (j % UNITS_PER_ROW) * 2 * VEC_SIZE_F32;
+
+                // only store every start pointer, the rest can be determined in the instruction
+                // itself
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                multimem_vec4_ld_reduce_weak_no_clobber(tmps[u], ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                multimem_vec4_store_weak_no_clobber(st_ptrs[u], tmps[u]);
             }
         }
     }

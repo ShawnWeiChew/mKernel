@@ -20,12 +20,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("ar_unroll") =
               gemm_ar_intranode_blackwell::AR_UNROLL_BY_SHAPE,
           pybind11::arg("signal_depth") =
-              gemm_ar_intranode_blackwell::DEFAULT_SIGNAL_DEPTH);
+              gemm_ar_intranode_blackwell::DEFAULT_SIGNAL_DEPTH,
+          pybind11::arg("try_vec") = 0);
     // Lets the bench sweep exactly the splits this module was built with,
     // rather than a hardcoded list that can drift from the build flags.
     m.def("compiled_comp_sm_splits",
           &gemm_ar_intranode_blackwell::compiled_comp_sm_splits);
     m.def("compiled_ar_unrolls", &gemm_ar_intranode_blackwell::compiled_ar_unrolls);
+    m.def("compiled_vec_ar_unrolls",
+          &gemm_ar_intranode_blackwell::compiled_vec_ar_unrolls);
+    // (ar_unroll, try_vec) pairs -- the paired axis the bench sweeps.
+    m.def("compiled_ar_variants", &gemm_ar_intranode_blackwell::compiled_ar_variants);
     m.def("compiled_strategies", &gemm_ar_intranode_blackwell::compiled_strategies);
     m.def("compiled_signal_depths",
           &gemm_ar_intranode_blackwell::compiled_signal_depths);

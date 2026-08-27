@@ -24,6 +24,12 @@ def default_ar_unroll(M):
     shape heuristic picks when ar_unroll is left at AR_UNROLL_BY_SHAPE. Used
     only to label which sweep entry is the pre-sweep default."""
     return 32 if M <= 2048 else 64
+
+
+def variant_tag(variant):
+    """(ar_unroll, try_vec) -> the label used in every printed row."""
+    unroll, try_vec = variant
+    return f"u{unroll}v" if try_vec else f"u{unroll}"
 WARMUP = 30
 # Target sample count per configuration. The timed loop rounds it to a whole
 # number of Williams orders (i.e. a multiple of the condition count) so the
@@ -65,7 +71,7 @@ def make_barrier(mod, local_rank, world_size):
     return barrier
 
 
-def reference_config(M, splits, unrolls, depths):
+def reference_config(M, splits, variants, depths):
     """The 'default' configuration, clamped to what this build compiled.
 
     A build that pins an axis -- e.g. -D'GEMM_AR_FOR_EACH_UNROLL(F)=F(16)' --
@@ -78,7 +84,7 @@ def reference_config(M, splits, unrolls, depths):
         return want if want in avail else avail[0]
 
     return (pick(DEFAULT_COMP_SM, splits),
-            pick(default_ar_unroll(M), unrolls),
+            pick((default_ar_unroll(M), 0), variants),
             pick(DEFAULT_SIGNAL_DEPTH, depths))
 
 
@@ -194,14 +200,17 @@ def main():
     # in GEMM_AR_FOR_EACH_COMP_SM. Reading it from the module keeps the bench
     # from asking for a split that would TORCH_CHECK at launch.
     COMP_SM_SPLITS = list(mod.compiled_comp_sm_splits())
-    AR_UNROLLS = list(mod.compiled_ar_unrolls())
+    # (ar_unroll, try_vec) pairs. try_vec=1 is the vectorised AR inner loop,
+    # whose useful unroll range is 8x lower than the scalar path's -- the two
+    # lists are paired rather than crossed, so this is one axis, not two.
+    AR_VARIANTS = [tuple(v) for v in mod.compiled_ar_variants()]
     SIGNAL_DEPTHS = list(mod.compiled_signal_depths())
     # Only sweep strategies that were actually instantiated -- a build can drop
     # one to halve the kernel count once it has been settled.
     _enabled = set(mod.compiled_strategies())
     STRATEGIES = tuple(st for st in ALL_STRATEGIES if st.value in _enabled)
     NUM_BLOCKS = mod.num_blocks()
-    n_fused = (len(STRATEGIES) * len(COMP_SM_SPLITS) * len(AR_UNROLLS)
+    n_fused = (len(STRATEGIES) * len(COMP_SM_SPLITS) * len(AR_VARIANTS)
               * len(SIGNAL_DEPTHS))
     if is_chief:
         print(f"comp/comm SM splits compiled in (of {NUM_BLOCKS} blocks): "
@@ -209,13 +218,13 @@ def main():
               flush=True)
         print("signal strategies compiled in: "
               + ", ".join(st.name for st in STRATEGIES), flush=True)
-        print(f"AR unroll factors compiled in: "
-              + ", ".join(str(u) for u in AR_UNROLLS), flush=True)
+        print(f"AR unroll variants compiled in (v = vectorised): "
+              + ", ".join(variant_tag(v) for v in AR_VARIANTS), flush=True)
         print(f"signal pipeline depths compiled in: "
               + ", ".join(str(d) for d in SIGNAL_DEPTHS), flush=True)
         print(f"{n_fused} fused configurations "
               f"({len(STRATEGIES)} strategies x {len(COMP_SM_SPLITS)} splits "
-              f"x {len(AR_UNROLLS)} unrolls x {len(SIGNAL_DEPTHS)} depths)",
+              f"x {len(AR_VARIANTS)} unroll variants x {len(SIGNAL_DEPTHS)} depths)",
               flush=True)
 
     for n in SHAPES:
@@ -249,14 +258,15 @@ def main():
         # Full cross-product only at the smallest shape; the per-check host
         # comparison of an MxN tensor is far too slow to repeat at M=32768.
         if n == SHAPES[0]:
-            configs_to_check = [(sm, un, sd) for sm in COMP_SM_SPLITS
-                                for un in AR_UNROLLS for sd in SIGNAL_DEPTHS]
+            configs_to_check = [(sm, var, sd) for sm in COMP_SM_SPLITS
+                                for var in AR_VARIANTS for sd in SIGNAL_DEPTHS]
         else:
             configs_to_check = [
-                reference_config(n, COMP_SM_SPLITS, AR_UNROLLS, SIGNAL_DEPTHS)]
+                reference_config(n, COMP_SM_SPLITS, AR_VARIANTS, SIGNAL_DEPTHS)]
         check_epochs = {st: 0 for st in STRATEGIES}
-        for strategy, (comp_sm, unroll, depth) in (
+        for strategy, (comp_sm, variant, depth) in (
                 (st, cfg) for st in STRATEGIES for cfg in configs_to_check):
+            unroll, try_vec = variant
             # Unlike the timed loop, the outputs ARE cleared between strategies.
             # Both write every element, so leaving the previous strategy's result
             # in place would let a strategy that writes nothing still pass the
@@ -276,10 +286,11 @@ def main():
             check_epochs[strategy] += 1
             mod.gemm_ar_intranode_blackwell(
                 A, B, C_dbuf, barriers[strategy], C_final,
-                check_epochs[strategy], strategy.value, comp_sm, unroll, depth)
+                check_epochs[strategy], strategy.value, comp_sm, unroll, depth,
+                try_vec)
             torch.cuda.synchronize()
 
-            tag = f"{strategy.name}/{comp_sm}/u{unroll}/d{depth}"
+            tag = f"{strategy.name}/{comp_sm}/{variant_tag(variant)}/d{depth}"
             gemm_correctness_check = check_close(
                 f"gemm M={M} [{tag}]", C_dbuf.data_, local_ref_cpu)
 
@@ -400,7 +411,7 @@ def main():
         # pays module load and cudaFuncSetAttribute.
         for strategy in STRATEGIES:
             for comp_sm in COMP_SM_SPLITS:
-                for unroll in AR_UNROLLS:
+                for unroll, try_vec in AR_VARIANTS:
                     for depth in SIGNAL_DEPTHS:
                         for _ in range(WARMUP):
                             sync_ranks()
@@ -408,7 +419,7 @@ def main():
                             mod.gemm_ar_intranode_blackwell(
                                 A, B, C_dbuf, barriers[strategy], C_final,
                                 epochs[strategy], strategy.value, comp_sm,
-                                unroll, depth)
+                                unroll, depth, try_vec)
 
         for run in cutlass_runs.values():
             for _ in range(WARMUP):
@@ -442,10 +453,10 @@ def main():
         # alone -- so splits share a strategy's barrier and epoch counter, which
         # keeps rising monotonically across all of them.
         conditions = ([BASELINE]
-                      + [("fused", st, sm, un, sd)
+                      + [("fused", st, sm, var, sd)
                          for st in STRATEGIES
                          for sm in COMP_SM_SPLITS
-                         for un in AR_UNROLLS
+                         for var in AR_VARIANTS
                          for sd in SIGNAL_DEPTHS]
                       + [CUTLASS_CONDS[v] for v in sorted(cutlass_runs)])
         # Use at most MAX_ORDERS of the Williams rotations. Using all n of them
@@ -497,12 +508,13 @@ def main():
                     run()
                     e.record()
                 else:
-                    _, strategy, comp_sm, unroll, depth = cond
+                    _, strategy, comp_sm, (unroll, try_vec), depth = cond
                     epochs[strategy] += 1
                     s.record()
                     mod.gemm_ar_intranode_blackwell(
                         A, B, C_dbuf, barriers[strategy], C_final,
-                        epochs[strategy], strategy.value, comp_sm, unroll, depth)
+                        epochs[strategy], strategy.value, comp_sm, unroll,
+                        depth, try_vec)
                     e.record()
                 samples[cond].append((s, e))
 
@@ -517,11 +529,11 @@ def main():
         baseline_ms = median_then_max_cuda(
             elapsed_ms(samples[BASELINE]), label="cublas+nccl")
         fused_stats = {
-            (st, sm, un, sd): stats_then_max_cuda(
-                elapsed_ms(samples[("fused", st, sm, un, sd)]),
-                label=f"fused[{st.name}/{sm}/u{un}/d{sd}]")
+            (st, sm, var, sd): stats_then_max_cuda(
+                elapsed_ms(samples[("fused", st, sm, var, sd)]),
+                label=f"fused[{st.name}/{sm}/{variant_tag(var)}/d{sd}]")
             for st in STRATEGIES for sm in COMP_SM_SPLITS
-            for un in AR_UNROLLS for sd in SIGNAL_DEPTHS
+            for var in AR_VARIANTS for sd in SIGNAL_DEPTHS
         }
         fused_ms = {k: v[0] for k, v in fused_stats.items()}
         cutlass_all = {
@@ -553,13 +565,13 @@ def main():
             print(f"  -- sweep: strategy / comp:comm of {NUM_BLOCKS} / "
                   f"AR unroll / signal depth --",
                   flush=True)
-            for (st, sm, un, sd), ms in sorted(fused_ms.items(), key=lambda kv: kv[1]):
-                tag = f"{st.name}/{sm}:{NUM_BLOCKS - sm}/u{un}/d{sd}"
+            for (st, sm, var, sd), ms in sorted(fused_ms.items(), key=lambda kv: kv[1]):
+                tag = f"{st.name}/{sm}:{NUM_BLOCKS - sm}/{variant_tag(var)}/d{sd}"
                 line = (f"  {tag:<24}: {ms:8.3f} ms  ({tflops(ms):7.1f} TFLOP/s)  "
                         f"{baseline_ms / ms:6.3f}x vs cublas+nccl")
                 if cutlass_ms is not None and ms > 0:
                     line += f"  {cutlass_ms / ms:6.3f}x vs cutlass"
-                line += f"  +/-{fused_stats[(st, sm, un, sd)][1]:4.1f}%"
+                line += f"  +/-{fused_stats[(st, sm, var, sd)][1]:4.1f}%"
                 print(line, flush=True)
 
             best = min(fused_ms, key=fused_ms.get)
@@ -587,18 +599,19 @@ def main():
                   f"{len(tied)} within resolution of the best", flush=True)
             if len(tied) > 1:
                 names = ", ".join(
-                    f"{k[0].name}/{k[1]}:{NUM_BLOCKS - k[1]}/u{k[2]}/d{k[3]}"
+                    f"{k[0].name}/{k[1]}:{NUM_BLOCKS - k[1]}/{variant_tag(k[2])}/d{k[3]}"
                     for k in tied[:6])
                 more = f" (+{len(tied) - 6} more)" if len(tied) > 6 else ""
                 print(f"  tied for best : {names}{more}", flush=True)
-            ref_sm, ref_un, ref_sd = reference_config(
-                M, COMP_SM_SPLITS, AR_UNROLLS, SIGNAL_DEPTHS)
-            baseline_cfg = (best[0], ref_sm, ref_un, ref_sd)
+            ref_sm, ref_var, ref_sd = reference_config(
+                M, COMP_SM_SPLITS, AR_VARIANTS, SIGNAL_DEPTHS)
+            baseline_cfg = (best[0], ref_sm, ref_var, ref_sd)
             msg = (f"  best: {best[0].name} @ {best[1]}:{NUM_BLOCKS - best[1]} "
-                   f"unroll={best[2]} depth={best[3]} = {best_ms:.3f} ms")
+                   f"unroll={best[2][0]}{' vec' if best[2][1] else ''} "
+                   f"depth={best[3]} = {best_ms:.3f} ms")
             if baseline_cfg in fused_ms and fused_ms[baseline_cfg] > 0:
                 msg += (f"  ({fused_ms[baseline_cfg] / best_ms:.3f}x vs the "
-                        f"{ref_sm}/u{ref_un}/d{ref_sd} reference)")
+                        f"{ref_sm}/{variant_tag(ref_var)}/d{ref_sd} reference)")
             if cutlass_all and best_ms > 0:
                 # Judge against the strongest cutlass variant at this shape, not
                 # just LDMC -- lamport is a real alternative a reader would run,
@@ -619,6 +632,14 @@ def main():
                     print(f"  push vs pull  : {push_best / pull_best:8.3f}x "
                           f"(>1 means PULL is faster; best config of each)",
                           flush=True)
+
+            # The question the vec path was added to answer, as one number.
+            scalar = [v for k, v in fused_ms.items() if not k[2][1]]
+            vec = [v for k, v in fused_ms.items() if k[2][1]]
+            if scalar and vec and min(vec) > 0:
+                print(f"  scalar vs vec : {min(scalar) / min(vec):8.3f}x "
+                      f"(>1 means the vectorised AR is faster; best config "
+                      f"of each)", flush=True)
 
         del C_dbuf, barriers, C_final, A, B
         cutlass_runs.clear()
