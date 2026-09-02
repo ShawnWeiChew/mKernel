@@ -31,6 +31,10 @@ else
     $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
 endif
 
+undefine BACKEND
+undefine BACKEND_DEFINES
+undefine BACKEND_LIBS
+
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
 #   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
@@ -38,7 +42,7 @@ GPU ?= hopper
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
     ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
-    DEFAULT_CUDA_HOME := /usr/local/cuda-13.2
+    DEFAULT_CUDA_HOME := /usr/local/cuda-13.1
     # conda forces a host compiler through NVCC_PREPEND_FLAGS/CXX on some boxes,
     # which makes nvcc miss system headers; pin the system g++.
     CCBIN             := -ccbin /usr/bin/g++
@@ -178,7 +182,7 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots
+	test-slot-math plots ag-gemm-kda-mla run-ag-gemm-kda-mla
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -187,4 +191,13 @@ gemm-ar-blackwell : $(BUILD)/libgemm_ar_blackwell.so
 
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+run-ag-gemm-kda-mla : ag-gemm-kda-mla
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_kda_mla_bench.py
+
+ag-gemm-kda-mla : $(BUILD)/libag_gemm_kda_mla.so
+
+$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
