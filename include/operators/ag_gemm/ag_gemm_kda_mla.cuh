@@ -1,0 +1,138 @@
+#pragma once
+
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+#include "comm/comm.cuh"
+#include "comm/multimem.cuh"
+#include "common/cuda_checks.cuh"
+#include "common/tk_common_util.cuh"
+#include "common/tk_types_shared_st.cuh"
+#include "common/types.cuh"
+#include "dist/dbuf_buffer_bridge.cuh"
+#include "dist/distributed_buffer.cuh"
+#include "dist/local_tensor.cuh"
+#include "dist/parallel_buffer.cuh"
+#include "dist/tma.cuh"
+#include "memory/tk_ops_group_group.cuh"
+#include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
+
+namespace ag_gemm_kda_mla {
+
+template <int _COL_BLOCK>
+struct fused_globals;
+
+template <int _COL_BLOCK>
+void launch_ag_gemm_kda_mla(const fused_globals<_COL_BLOCK>& G);
+
+struct config {
+    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+
+    // not sure if I want to use a warp specialized or sm specialized strategy yet
+    static constexpr int NUM_BLOCKS = 148;
+    static constexpr int CONSUMER_WARPS = 1;
+    static constexpr int PRODUCER_WARPS = 1;
+    static constexpr int EPILOGUE_WARPS = 4;
+    static constexpr int NUM_CLUSTERS =
+        2;  // will try to use 2-CTA as much as possible for instructions that cleanly divide it
+
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 1;
+    // this is the number of epilogue stages that can be in flight at any time
+    static constexpr int EPILOGUE_PIPELINE_STAGES = 1;
+    // this is the number of partitions for the epilogue tile in SMEM
+    static constexpr int EPILOGUE_C_TILES = 1;
+};
+
+static constexpr int DEFAULT_COL_BLOCK = 128;
+
+// for M < 512, this should be 128
+template <int _COL_BLOCK>
+struct fused_globals {
+    // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
+    // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
+    // comparable utilization with only 2 KB. The vllm / cutlass one uses copy engine, but even the
+    // largest tile size with TP = 8 is only 4096 * 64 * 2 = 500 KB
+
+    // TODO: load, in a ring like fashion, the data necessary from the target GMEM into SMEM
+    // for correctness first, we can just load from the same peer every time
+
+    // NOTE: potential problem with this is that the load is never cached in local L2, which may be
+    // why it is not used if that is teh case, then fine grained cudaMemcpyAsync, which will be
+    // dispatched to run on a separate stream will be better
+    static constexpr int ROW_BLOCK = 128;
+    static constexpr int COL_BLOCK = _COL_BLOCK;
+    static constexpr int RED_BLOCK = 64;
+
+    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
+    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / config::NUM_CLUSTERS>;
+
+    using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
+    // for smem staging
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / config::EPILOGUE_C_TILES>;
+
+    static constexpr int DYNAMIC_SHARED_MEMORY =
+        (sizeof(A_tile) + sizeof(B_tile)) * config::PRODUCER_CONSUMER_PIPELINE_STAGES +
+        sizeof(C_tile) * config::EPILOGUE_PIPELINE_STAGES + 1024;
+    static_assert(DYNAMIC_SHARED_MEMORY <= 227 * 1024, "SMEM allocation too large");
+
+    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
+    using A_distributed_tensor =
+        dist::distributed_tensor<A_local_tensor, config::NUM_DEVICES, true>;
+    using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
+    using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
+
+    A_distributed_tensor A;
+    B_local_tensor B;
+    C_local_tensor C;
+
+    int dev_idx;
+    int M;
+    int N;
+    static constexpr int K = 7168;
+
+    struct pipeline_inputs {
+        A_tile A;
+        B_tile B;
+    };
+
+    struct pipeline_outputs {
+        C_tile C;
+    };
+};
+
+template <int _COL_BLOCK>
+__host__ inline fused_globals<_COL_BLOCK> ag_gemm_kda_mla_make_globals(
+    dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N) {
+    using fg = fused_globals<_COL_BLOCK>;
+
+    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N};
+}
+
+void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
+    const int dev_idx = A.local_rank_;
+    c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    const int M = C.size(0), K = B.size(0), N = B.size(1);
+
+    if (M <= 512) {
+        using fg = fused_globals<128>;
+        fg globals = ag_gemm_kda_mla_make_globals<128>(A, B, C, dev_idx, M, N);
+        launch_ag_gemm_kda_mla<128>(globals);
+    } else {
+        using fg = fused_globals<256>;
+        fg globals = ag_gemm_kda_mla_make_globals<256>(A, B, C, dev_idx, M, N);
+        launch_ag_gemm_kda_mla<256>(globals);
+    }
+}
+};  // namespace ag_gemm_kda_mla
