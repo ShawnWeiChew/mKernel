@@ -43,6 +43,297 @@
 
 using namespace kittens;
 
-namespace ag_gemm_mla_kda {};
+namespace ag_gemm_kda_mla {
+
+// use snake-like pattern, but without the safety path for odd numbered shapes referenced from:
+// https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
+template <int SUPERGROUP_WIDTH = 4>
+__device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
+                                                                   int num_cols,
+                                                                   int tile_idx) {
+    const int supergroup_numel = num_rows * SUPERGROUP_WIDTH;
+    const int supergroup_idx = tile_idx / supergroup_numel;
+
+    const int row_idx = (tile_idx % supergroup_numel) / SUPERGROUP_WIDTH;
+    const int col_idx = supergroup_idx * SUPERGROUP_WIDTH + tile_idx % SUPERGROUP_WIDTH;
+
+    // TODO: might have to add in the unsafe region handling?
+    return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
+};
+
+template <int _ROW_BLOCK, int _COL_BLOCK>
+__device__ __forceinline__ void ag_gemm_kda_mla(fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+
+    const int cta_rank = cluster_ctarank();
+    const int warp_id = warpid();
+    const int warpgroup_id = warpgroupid();
+
+    // TODO: do something to fold the uneven tail
+    constexpr int num_comp_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
+    const int num_col_tiles = G.N / fg::COL_BLOCK;
+    const int num_row_tiles = G.M / fg::ROW_BLOCK;
+    const int num_tiles_total = num_row_tiles * num_col_tiles;
+    const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
+
+    fg::pipeline_inputs(&inputs_smem)[fg::PRODUCER_CONSUMER_PIPELINE_STAGES] =
+        smem_allocator.allocate<fg::pipeline_inputs, fg::PRODUCER_CONSUMER_PIPELINE_STAGES>();
+    fg::C_tile(&C_smem)[fg::EPILOGUE_PIPELINE_STAGES] =
+        smem_allocator.allocate<fg::C_tile, fg::EPILOGUE_PIPELINE_STAGES>();
+
+    __shared__ semaphore tma_load[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
+    __shared__ semaphore mma_finish[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
+
+    __shared__ semaphore epilogue_ready[fg::MMA_PIPELINE_STAGES];
+    __shared__ semaphore epilogue_tmem_finished[fg::MMA_PIPELINE_STAGES];
+
+    __shared__ semaphore tmem_finished;
+
+    __shared__ uint32_t tmem_addr;
+    tensor_allocator<1, fg::NUM_CLUSTERS> tm_alloc{};
+
+    uint32_t phasebits = fg::PHASE_BITS_INIT;
+
+    const int num_row_tiles = G.M / fg::ROW_BLOCK;
+    const int num_row_tiles_per_device = num_row_tiles / fg::NUM_DEVICES;
+
+    if (warp_id == 0 && elect_warp_leader()) {
+#pragma unroll
+        for (int i = 0; i < fg::PRODUCER_CONSUMER_PIPELINE_STAGES; i++) {
+            // tma finish has to be broadcasted to mma warp
+            init_semaphore(tma_load[i], 0, 2);
+            // mma warp will broadcast finish
+            init_semaphore(mma_finish[i], 0, 1);
+        }
+
+#pragma unroll
+        for (int i = 0; i < fg::MMA_PIPELINE_STAGES; i++) {
+            init_semaphore(epilogue_ready[i], 0, 1);
+            // tmem finish has to be broadcasted back
+            init_semaphore(epilogue_tmem_finished[i], WARPGROUP_WARPS * fg::NUM_CLUSTERS);
+        }
+
+        init_semaphore(tmem_finished, 1);
+    } else if (warp_id == 1) {
+        tm_alloc.provision(tmem_addr);
+    }
+
+    tensor_before_thread_sync();
+    __syncthreads();
+    tensor_after_thread_sync();
+    tm_alloc.set_addr(tmem_addr);
+
+    // flush to ensure the mbarriers are visible
+    everyone::tma::cluster::sync();
+
+    auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
+        for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
+            fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+
+            wait(mma_finish[input_stage_id], (phasebits >> 0 & 0b1));
+            tma::cluster::expect_bytes(tma_load[input_stage_id],
+                                       sizeof(fg::A_tile) + sizeof(fg::B_tile));
+
+            tma::cluster::load_async(B_smem,
+                                     G.B,
+                                     {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
+                                     tma_load[input_stage_id],
+                                     (uint16_t)(1 << cta_rank),
+                                     0);
+
+            // TODO: check indexing
+            int target_device = tile_row_idx / num_row_tiles_per_device;
+            int row_in_device = tile_row_idx % num_row_tiles_per_device;
+            tma::cluster::load_async(A_smem,
+                                     G.A[target_device],
+                                     {row_in_device, iter_k},
+                                     tma_load[input_stage_id],
+                                     (uint16_t)(1 << cta_rank),
+                                     0);
+
+            input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
+            if (input_stage_id == 0) {
+                phasebits ^= 0b1;
+            }
+        }
+    };
+    auto consume = [&](typename fg::C_tt_tile* tmem, int& input_stage_id, int& epilogue_stage_id) {
+        wait(epilogue_tmem_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
+
+        {
+            fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+
+            mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
+            if (input_stage_id == 0) {
+                phasebits ^= (1 << 1);
+            }
+        }
+
+        for (int iter_k = 1; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
+            fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+            wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+
+            mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
+            if (input_stage_id == 0) {
+                phasebits ^= (1 << 1);
+            }
+        }
+
+        kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[epilogue_stage_id]);
+        epilogue_stage_id = (epilogue_stage_id + 1) % fg::EPILOGUE_PIPELINE_STAGES;
+
+        if (epilogue_stage_id == 0) {
+            phasebits ^= (1 << 2);
+        }
+    };
+
+    auto epilogue = [&](int tile_row_idx,
+                        int tile_col_idx,
+                        typename fg::C_tt_tile* tmem,
+                        int& epilogue_stage_id) {
+        const auto& C_out = G.C_dist[G.dev_idx];
+        constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::EPILOGUE_C_TILES;
+        rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::EPILOGUE_C_TILES];
+
+        wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
+
+#pragma unroll
+        for (int i = 0; i < fg::EPILOGUE_C_TILES; i++) {
+            warpgroup::load_async(
+                c_reg[i],
+                // TODO: review this indexing
+                tmem[0].template subtile<tt<float, fg::ROW_BLOCK, C_CHUNK_COLS>>(i * C_CHUNK_COLS));
+        }
+
+        tensor_load_wait();
+
+        if (elect_warp_leader()) {
+            tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
+        }
+
+#pragma unroll
+        for (int i = 0; i < fg::EPILOGUE_C_TILES; i++) {
+            // need to know that there is at least 1 slot of smem in C tile that is free
+            dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
+            warpgroup::sync(1);
+            // this already does the swizzle inside it
+            warpgroup::store(C_smem[epilogue_stage_id][i % fg::EPILOGUE_PIPELINE_STAGES], c_reg[i]);
+            warpgroup::sync(1);
+
+            if (warpgroup::laneid() == 0) {
+                // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
+                // column coordinate counts chunks, not COL_BLOCK tiles.
+                dist::tma::store_async(C_out,
+                                       C_smem[epilogue_stage_id][i % fg::EPILOGUE_PIPELINE_STAGES],
+                                       {tile_row_idx, tile_col_idx * fg::EPILOGUE_C_TILES + i});
+            }
+        }
+
+        epilogue_stage_id = (epilogue_stage_id + 1) % fg::EPILOGUE_PIPELINE_STAGES;
+        if (epilogue_stage_id == 0) {
+            phasebits ^= (0b1 << 4);
+        }
+    };
+
+    if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
+        if (warp_id == 4) {
+            if (elect_warp_leader()) {
+                int input_stage_id = 0;
+                for (int tile_id = cluster_idx; tile_id < num_tiles_total;
+                     tile_id += num_comp_clusters) {
+                    // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
+                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx(
+                        num_row_tiles / fg::NUM_CLUSTERS, num_col_tiles, tile_id);
+
+                    load((tile_id / num_row_tiles_per_device) * num_row_tiles_per_device +
+                             tile_row_idx,
+                         tile_col_idx,
+                         input_stage_id);
+                }
+            }
+        } else if (warp_id == 5) {
+            if (cta_rank == 0 && elect_warp_leader()) {
+                int input_stage_id = 0;
+                int epilogue_stage_id = 0;
+
+                // TODO: modify size based on col block size
+                fg::C_tt_tile tmem[2];
+                tmem[0] = tm_alloc.template allocate<fg::C_tt_tile>(0);
+                tmem[1] = tm_alloc.template allocate<fg::C_tt_tile>();
+
+                for (int tile_id = cluster_idx; tile_id < num_tiles_total;
+                     tile_id += num_comp_clusters) {
+                    consume(tmem, input_stage_id, epilogue_stage_id);
+                }
+            }
+        }
+    } else {
+        int epilogue_stage_id = 0;
+        fg::C_tt_tile tmem[1];
+        tmem[0] = tm_alloc.template allocate<fg::C_tt_tile>(0);
+
+        for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
+            // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
+            auto [tile_row_idx, tile_col_idx] =
+                calculate_tile_idx(num_row_tiles / fg::NUM_CLUSTERS, num_col_tiles, tile_id);
+
+            epilogue((tile_id / num_row_tiles_per_device) * num_row_tiles_per_device + tile_row_idx,
+                     tile_col_idx,
+                     tmem,
+                     epilogue_stage_id);
+        }
+
+        // deallocate tmem
+        tensor_before_thread_sync();
+        group<config::EPILOGUE_WARPS>::sync(1);
+
+        if (group<config::EPILOGUE_WARPS>::warpid() == 0) {
+            if (elect_warp_leader()) {
+                tma::cluster::arrive(tmem_finished, 1 - cta_rank);
+            }
+            // Only reach here if we finish with our tmem. Other party as well
+            wait(tmem_finished, 0);
+            tm_alloc.deprovision();
+        }
+    }
+}
+
+template <int _ROW_BLOCK, int _COL_BLOCK>
+__global__ __forceinline__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_CLUSTERS,
+                                            1,
+                                            1)
+    __launch_bounds__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_THREADS, 1) void fused_kernel_stub(
+        const __grid_constant__ ag_gemm_kda_mla::fused_globals<_ROW_BLOCK, _COL_BLOCK> G) {
+    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK>(G);
+}
+
+template <int _ROW_BLOCK, int _COL_BLOCK>
+inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+    constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
+    constexpr int num_threads = fg::NUM_THREADS;
+    constexpr int grid = fg::NUM_BLOCKS;
+
+    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK>;
+
+    MKERNEL_CUDACHECK(
+        cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
+}
+};  // namespace ag_gemm_kda_mla
 
 #include "operators/ag_gemm/ag_gemm_kda_mla_session.cuh"

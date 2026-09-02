@@ -25,35 +25,40 @@
 
 namespace ag_gemm_kda_mla {
 
-template <int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK>
 struct fused_globals;
 
-template <int _COL_BLOCK>
-void launch_ag_gemm_kda_mla(const fused_globals<_COL_BLOCK>& G);
+template <int _ROW_BLOCK, int _COL_BLOCK>
+void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G);
 
-struct config {
+static constexpr int DEFAULT_ROW_BLOCK = 128;
+static constexpr int DEFAULT_COL_BLOCK = 128;
+
+// for M < 512, this should be 128
+template <int _ROW_BLOCK, int _COL_BLOCK>
+struct fused_globals {
+    // config items
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 
     // not sure if I want to use a warp specialized or sm specialized strategy yet
     static constexpr int NUM_BLOCKS = 148;
     static constexpr int CONSUMER_WARPS = 1;
     static constexpr int PRODUCER_WARPS = 1;
-    static constexpr int EPILOGUE_WARPS = 4;
+    static constexpr int EPILOGUE_WARPGROUPS = 1;
+    static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
     static constexpr int NUM_CLUSTERS =
         2;  // will try to use 2-CTA as much as possible for instructions that cleanly divide it
+    static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
+    // this is pipelining along the reduction dimension
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 1;
+    // this is pipelining among different MMAs
+    static constexpr int MMA_PIPELINE_STAGES = 2;
     // this is the number of epilogue stages that can be in flight at any time
-    static constexpr int EPILOGUE_PIPELINE_STAGES = 1;
+    static constexpr int EPILOGUE_PIPELINE_STAGES = 2;
     // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int EPILOGUE_C_TILES = 1;
-};
+    static constexpr int EPILOGUE_C_TILES = 8;
 
-static constexpr int DEFAULT_COL_BLOCK = 128;
-
-// for M < 512, this should be 128
-template <int _COL_BLOCK>
-struct fused_globals {
     // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
     // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
     // comparable utilization with only 2 KB. The vllm / cutlass one uses copy engine, but even the
@@ -65,25 +70,24 @@ struct fused_globals {
     // NOTE: potential problem with this is that the load is never cached in local L2, which may be
     // why it is not used if that is teh case, then fine grained cudaMemcpyAsync, which will be
     // dispatched to run on a separate stream will be better
-    static constexpr int ROW_BLOCK = 128;
+    static constexpr int ROW_BLOCK = _ROW_BLOCK;
     static constexpr int COL_BLOCK = _COL_BLOCK;
     static constexpr int RED_BLOCK = 64;
 
     using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
-    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / config::NUM_CLUSTERS>;
+    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / NUM_CLUSTERS>;
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
     // for smem staging
-    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / config::EPILOGUE_C_TILES>;
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / EPILOGUE_C_TILES>;
 
     static constexpr int DYNAMIC_SHARED_MEMORY =
-        (sizeof(A_tile) + sizeof(B_tile)) * config::PRODUCER_CONSUMER_PIPELINE_STAGES +
-        sizeof(C_tile) * config::EPILOGUE_PIPELINE_STAGES + 1024;
+        (sizeof(A_tile) + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
+        sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
     static_assert(DYNAMIC_SHARED_MEMORY <= 227 * 1024, "SMEM allocation too large");
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
-    using A_distributed_tensor =
-        dist::distributed_tensor<A_local_tensor, config::NUM_DEVICES, true>;
+    using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
 
@@ -104,12 +108,25 @@ struct fused_globals {
     struct pipeline_outputs {
         C_tile C;
     };
+
+    /*
+     * bit 0: TMA producer -- starts with 1 (PRODUCER WARP)
+     * bit 1: TMA consumer -- starts with 0 (CONSUMER WARP)
+     * bit 2: TMEM producer -- starts with 1 (CONSUMER WARP)
+     * bit 3: TMEM consumer -- starts with 0 (EPILOGUE WARP)
+     */
+    static constexpr int TMA_PRODUCER_BIT = 0b1;
+    static constexpr int TMA_CONSUMER_BIT = 0b00;
+    static constexpr int TMEM_PROUCER_BIT = 0b100;
+    static constexpr int TMEM_CONSUMER_BIT = 0b0000;
+    static constexpr int PHASE_BITS_INIT =
+        TMA_PRODUCER_BIT | TMA_CONSUMER_BIT | TMEM_PROUCER_BIT | TMEM_CONSUMER_BIT;
 };
 
-template <int _COL_BLOCK>
-__host__ inline fused_globals<_COL_BLOCK> ag_gemm_kda_mla_make_globals(
+template <int _ROW_BLOCK, int _COL_BLOCK>
+__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
     dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N) {
-    using fg = fused_globals<_COL_BLOCK>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
 
     return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
@@ -126,13 +143,13 @@ void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
     const int M = C.size(0), K = B.size(0), N = B.size(1);
 
     if (M <= 512) {
-        using fg = fused_globals<128>;
-        fg globals = ag_gemm_kda_mla_make_globals<128>(A, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<128>(globals);
+        using fg = fused_globals<128, 128>;
+        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N);
+        launch_ag_gemm_kda_mla<128, 128>(globals);
     } else {
-        using fg = fused_globals<256>;
-        fg globals = ag_gemm_kda_mla_make_globals<256>(A, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<256>(globals);
+        using fg = fused_globals<128, 256>;
+        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N);
+        launch_ag_gemm_kda_mla<128, 256>(globals);
     }
 }
 };  // namespace ag_gemm_kda_mla
