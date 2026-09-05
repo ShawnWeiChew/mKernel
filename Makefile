@@ -31,6 +31,10 @@ else
     $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
 endif
 
+undefine BACKEND
+undefine BACKEND_DEFINES
+undefine BACKEND_LIBS
+
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
 #   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
@@ -38,7 +42,7 @@ GPU ?= hopper
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
     ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
-    DEFAULT_CUDA_HOME := /usr/local/cuda-13.2
+    DEFAULT_CUDA_HOME := /usr/local/cuda-13.1
     # conda forces a host compiler through NVCC_PREPEND_FLAGS/CXX on some boxes,
     # which makes nvcc miss system headers; pin the system g++.
     CCBIN             := -ccbin /usr/bin/g++

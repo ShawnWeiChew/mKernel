@@ -157,7 +157,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                                      0);
 
             tma::cluster::load_async(A_smem,
-                                     G.A[target_device],
+                                     G.A[(target_device + G.dev_idx) % fg::NUM_DEVICES],
                                      {tile_row_idx, iter_k},
                                      tma_load[input_stage_id],
                                      (uint16_t)(1 << cta_rank),
@@ -311,7 +311,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             auto [local_tile_row, tile_col_idx] = calculate_tile_idx(
                 cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
-            const int target_device = tile_id / cluster_tiles_per_device;
+            const int target_device = (tile_id / cluster_tiles_per_device + G.dev_idx) % fg::NUM_DEVICES;
             const int local_cta_row = local_tile_row * fg::NUM_CLUSTERS + cta_rank;
             epilogue(target_device * row_tiles_per_device + local_cta_row,
                      tile_col_idx,
