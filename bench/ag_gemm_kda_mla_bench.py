@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="output .npz path (default: plots/ag_gemm_kda_mla_trace_rank<N>.npz)",
     )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="dump the .npz but skip rendering the PDF",
+    )
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
@@ -90,6 +95,22 @@ def parse_args() -> argparse.Namespace:
 
 def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
+
+
+def logical_n_for(world_size: int) -> int:
+    """Projection width before kernel padding, for the ranks we support.
+
+    Shared by the correctness sweep and the profile run so a trace can never
+    record a different N than the one it actually ran.
+    """
+    if world_size == 8:
+        return LOGICAL_N
+    if world_size == 4:
+        return (4 * 12288 + 96) // 4 + 128
+    raise RuntimeError(
+        f"logical projection width is only defined for 4 or 8 ranks; "
+        f"got {world_size}"
+    )
 
 
 def padded_n_for_m(m: int, logical_n: int) -> int:
@@ -125,6 +146,25 @@ def benchmark_cuda(
     return float(rank_ms.item())
 
 
+def render_trace(npz_path: str) -> None:
+    """Render the freshly dumped trace to a PDF beside it.
+
+    Import-time failure is not fatal: the .npz is the artifact, and it can
+    always be rendered later on a machine that has matplotlib.
+    """
+    try:
+        sys.path.insert(0, str(HERE.parent / "plots"))
+        import render_timings
+    except ImportError as exc:  # pragma: no cover - matplotlib not installed
+        print(
+            f"  (skipping PDF: {exc}. Render later with "
+            f"`python3 plots/render_timings.py {npz_path}`)",
+            flush=True,
+        )
+        return
+    render_timings.render_trace(npz_path)
+
+
 def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
                 local_world_size: int) -> int:
     """Capture one instrumented iteration and dump it as a .npz trace.
@@ -142,7 +182,8 @@ def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
 
     m = args.profile_m
     local_m = m // local_world_size
-    padded_n = padded_n_for_m(m)
+    logical_n = logical_n_for(local_world_size)
+    padded_n = padded_n_for_m(m, logical_n)
     device = torch.device(f"cuda:{local_rank}")
     is_dumper = rank == args.profile_rank
 
@@ -161,7 +202,7 @@ def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
     )
     A_kernel.data_.copy_(A_local)
     B_kernel = torch.zeros((K, padded_n), device=device, dtype=torch.bfloat16)
-    B_kernel[:, :LOGICAL_N].normal_(0.0, K**-0.25)
+    B_kernel[:, :logical_n].normal_(0.0, K**-0.25)
     C_kernel = torch.zeros((m, padded_n), device=device, dtype=torch.bfloat16)
 
     # Warm up with a null ring: EMIT short-circuits on a null buffer, so these
@@ -210,7 +251,7 @@ def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
         world_size=local_world_size,
         problem_m=m,
         local_m=local_m,
-        problem_n=LOGICAL_N,
+        problem_n=logical_n,
         padded_n=padded_n,
         problem_k=K,
         kernel_ms=kernel_ms,
@@ -229,6 +270,18 @@ def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
             f"larger PROFILE_EVENTS.",
             flush=True,
         )
+    if not bool(mod.TIMING_FINE):
+        print(
+            "  WARNING: this .so was built PROFILE_COARSE=1, so the per-K-step "
+            "spans (mma: wait tma, prod: wait stage) are absent. Tile-level "
+            "spans alone run back to back and render as a solid band -- "
+            "rebuild with plain `make PROFILE=1` to see the waiting.",
+            flush=True,
+        )
+
+    if not args.no_render:
+        render_trace(out_path)
+
     dist.barrier()
     return 0
 
@@ -248,13 +301,10 @@ def main() -> int:
     world_size = dist.get_world_size()
     is_chief = rank == 0
 
-    if world_size == 4:
-        LOGICAL_N = (4 * 12288 + 96) // 4 + 128
-    elif world_size != 8:
-        raise RuntimeError(
-            f"This correctness test fixes the logical projection width at "
-            f"{LOGICAL_N}, which assumes 8 ranks; got {world_size}."
-        )
+    # Local name on purpose: the 4-rank layout differs from the module-level
+    # 8-rank default. logical_n_for() is the single source of truth so the
+    # profile path cannot disagree with the correctness sweep.
+    logical_n = logical_n_for(world_size)
 
     if local_world_size != world_size:
         raise RuntimeError(
@@ -275,7 +325,7 @@ def main() -> int:
             raise ValueError(f"global M={m} is not divisible by {world_size=}")
 
         local_m = m // world_size
-        padded_n = padded_n_for_m(m, LOGICAL_N)
+        padded_n = padded_n_for_m(m, logical_n)
 
         # Reference tensors retain the original, unpadded problem shapes.
         torch.manual_seed(42 + rank)
@@ -285,10 +335,10 @@ def main() -> int:
         ) / (K**0.25)
         A_ref = torch.empty((m, K), device="cuda", dtype=torch.bfloat16)
         B_ref = torch.randn(
-            (K, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (K, logical_n), device="cuda", dtype=torch.bfloat16
         ) / (K**0.25)
         C_ref = torch.empty(
-            (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (m, logical_n), device="cuda", dtype=torch.bfloat16
         )
 
         dist.all_gather_into_tensor(A_ref, A_ref_local)
@@ -308,7 +358,7 @@ def main() -> int:
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
         )
-        B_kernel[:, :LOGICAL_N].copy_(B_ref)
+        B_kernel[:, :logical_n].copy_(B_ref)
         C_kernel = torch.zeros(
             (m, padded_n), device="cuda", dtype=torch.bfloat16
         )
@@ -320,8 +370,8 @@ def main() -> int:
         # Ignore the padded output columns and compare the original 6284-wide
         # result against the unpadded PyTorch reference.
         is_correct = check_close(
-            f"ag-gemm-kda-mla M={m} N={LOGICAL_N} padded_n={padded_n}",
-            C_kernel[:, :LOGICAL_N],
+            f"ag-gemm-kda-mla M={m} N={logical_n} padded_n={padded_n}",
+            C_kernel[:, :logical_n],
             C_ref,
         )
         all_correct = all_correct and is_correct
@@ -329,7 +379,7 @@ def main() -> int:
         if is_chief:
             status = "passed :)" if is_correct else "FAILED :("
             print(
-                f"M={m} local_m={local_m} N={LOGICAL_N} "
+                f"M={m} local_m={local_m} N={logical_n} "
                 f"padded_n={padded_n}: {status}",
                 flush=True,
             )
@@ -355,7 +405,7 @@ def main() -> int:
     # is emitted until the complete correctness suite has passed.
     for m in GLOBAL_M:
         local_m = m // world_size
-        padded_n = padded_n_for_m(m, LOGICAL_N)
+        padded_n = padded_n_for_m(m, logical_n)
 
         torch.manual_seed(42 + rank)
         torch.cuda.manual_seed(42 + rank)
@@ -364,10 +414,10 @@ def main() -> int:
         ) / (K**0.25)
         A_ref = torch.empty((m, K), device="cuda", dtype=torch.bfloat16)
         B_ref = torch.randn(
-            (K, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (K, logical_n), device="cuda", dtype=torch.bfloat16
         ) / (K**0.25)
         C_ref = torch.empty(
-            (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (m, logical_n), device="cuda", dtype=torch.bfloat16
         )
 
         A_kernel = mod.DistBuffer(
@@ -381,7 +431,7 @@ def main() -> int:
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
         )
-        B_kernel[:, :LOGICAL_N].copy_(B_ref)
+        B_kernel[:, :logical_n].copy_(B_ref)
         C_kernel = torch.zeros(
             (m, padded_n), device="cuda", dtype=torch.bfloat16
         )
@@ -401,7 +451,7 @@ def main() -> int:
 
         if is_chief:
             print(
-                f"M={m} local_m={local_m} N={LOGICAL_N} "
+                f"M={m} local_m={local_m} N={logical_n} "
                 f"padded_n={padded_n}\n"
                 f"  {'cuBLAS + NCCL':<17} {baseline_ms:8.3f} ms  "
                 f"(1.000x, 100.0%)\n"

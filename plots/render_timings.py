@@ -3,6 +3,13 @@
 
     python3 plots/render_timings.py plots/ag_gemm_kda_mla_trace_rank0.npz
 
+The output is two stacked panels, because one linear time axis cannot show
+both scales in this kernel: the launch is milliseconds long while the pipeline
+structure is microseconds wide.
+
+  overview  every CTA, the whole launch. Load imbalance and the tail.
+  detail    a few CTAs over an auto-selected window. Who is waiting on whom.
+
 Traces are self-describing (they carry their own event/role name maps), so an
 old .npz still renders after the kernel's enum has grown, and you can iterate
 on colors and labels without re-running the kernel.
@@ -26,37 +33,62 @@ from matplotlib.patches import Patch  # noqa: E402
 # inside one CTA, so each gets its own row rather than overlapping bars.
 #
 #   (lane, begin_event, end_event, color, label, pair_by)
-TILE_PHASES = [
-    ("PROD", "PROD_TILE_BEGIN", "PROD_TILE_DONE", "#3b82f6", "prod: load tile", "payload"),
+# Leaf phases: each brackets exactly one call, so within a role they partition
+# the warp's time into wait vs work with nothing unaccounted for.
+PROD_LEAVES = [
+    ("PROD/k", "PROD_K_BEGIN", "PROD_K_STAGE_READY", "#dc2626", "prod: wait stage", "payload"),
+    ("PROD/k", "PROD_K_STAGE_READY", "PROD_K_ISSUED", "#60a5fa", "prod: issue tma", "payload"),
+]
+MMA_LEAVES = [
     ("MMA", "MMA_TILE_BEGIN", "MMA_TMEM_READY", "#ef4444", "mma: wait tmem", "payload"),
-    ("MMA", "MMA_TMEM_READY", "MMA_TILE_DONE", "#10b981", "mma: issue mma", "payload"),
+    ("MMA/k", "MMA_K_BEGIN", "MMA_K_INPUT_READY", "#f97316", "mma: wait tma", "payload"),
+    ("MMA/k", "MMA_K_INPUT_READY", "MMA_K_ISSUED", "#059669", "mma: issue mma-k", "payload"),
+]
+EPI_LEAVES = [
     ("EPI", "EPI_TILE_BEGIN", "EPI_MMA_READY", "#f59e0b", "epi: wait mma", "payload"),
     ("EPI", "EPI_MMA_READY", "EPI_TMEM_LOADED", "#8b5cf6", "epi: tmem -> reg", "payload"),
     ("EPI", "EPI_TMEM_LOADED", "EPI_TILE_DONE", "#0891b2", "epi: store C", "payload"),
     ("EPI", "EPI_DRAIN_BEGIN", "EPI_DRAIN_DONE", "#64748b", "epi: drain", "payload"),
 ]
+LEAF_PHASES = PROD_LEAVES + MMA_LEAVES + EPI_LEAVES
 
-# Only present when the .so was built with PROFILE_FINE=1.
-FINE_PHASES = [
-    ("PROD/k", "PROD_K_BEGIN", "PROD_K_STAGE_READY", "#fca5a5", "prod: wait stage", "payload"),
-    ("PROD/k", "PROD_K_STAGE_READY", "PROD_K_ISSUED", "#93c5fd", "prod: issue tma", "payload"),
-    ("MMA/k", "MMA_K_BEGIN", "MMA_K_INPUT_READY", "#fdba74", "mma: wait tma", "payload"),
-    ("MMA/k", "MMA_K_INPUT_READY", "MMA_K_ISSUED", "#6ee7b7", "mma: issue mma-k", "payload"),
+# Containers wrap a whole K reduction, so they cover ~100% of the timeline with
+# no gaps and cannot show waiting. Kept for the per-tile statistics in the
+# summary table; never drawn.
+CONTAINER_PHASES = [
+    ("CTA", "CTA_BEGIN", "CTA_END", "#cbd5e1", "cta: alive", "payload"),
+    ("PROD", "PROD_TILE_BEGIN", "PROD_TILE_DONE", "#3b82f6", "prod: load tile", "payload"),
+    ("MMA", "MMA_TMEM_READY", "MMA_TILE_DONE", "#10b981", "mma: issue mma", "payload"),
 ]
 
-CTA_PHASE = [("CTA", "CTA_BEGIN", "CTA_END", "#cbd5e1", "cta: alive", "payload")]
+# (title, phases) for the occupancy panels, one per warp role.
+ROLE_GROUPS = [
+    ("producer warp (TMA loads)", PROD_LEAVES),
+    ("mma warp (tcgen05 issue)", MMA_LEAVES),
+    ("epilogue warpgroup", EPI_LEAVES),
+]
 
-LANE_ORDER = ["CTA", "PROD", "PROD/k", "MMA", "MMA/k", "EPI"]
+LANE_ORDER = ["PROD/k", "MMA", "MMA/k", "EPI"]
 
-ROLE_SHIFT = 28  # payload layout is (role << 28) | sequence
+# The build flag that supplies each phase group, named in the missing-event
+# warning so a blank lane points at its own fix.
+FINE_EVENT_HINT = (
+    "built with PROFILE_COARSE=1 -- rebuild with `make PROFILE=1` for these"
+)
+
+FIG_WIDTH_IN = 18.0
+DPI = 130
+PIXELS = FIG_WIDTH_IN * DPI
+
+DEFAULT_DETAIL_BLOCKS = 8
 
 
-def parse_block_filter(spec: str | None, num_blocks: int) -> set[int]:
+def parse_block_filter(spec, num_blocks):
     """"0-15,20" -> {0..15, 20}. None means every block."""
     if not spec:
         return set(range(num_blocks))
-    blocks: set[int] = set()
-    for part in spec.split(","):
+    blocks = set()
+    for part in str(spec).split(","):
         part = part.strip()
         if not part:
             continue
@@ -69,15 +101,18 @@ def parse_block_filter(spec: str | None, num_blocks: int) -> set[int]:
 
 
 def build_spans(records, name_to_id, phases, block_filter):
-    """Pair begin/end events into (lane, block, start_ns, dur_ns, color, label).
+    """Pair begin/end events into per-phase span arrays.
 
-    Fully vectorized per phase: no Python loop over records.
+    Returns (spans, missing) where each span entry is
+    (lane, blocks, starts_ns, durs_ns, color, label) and `missing` names the
+    phases whose events are absent from the trace entirely.
     """
+    missing = []
     if records.shape[0] == 0:
-        return []
+        return [], [p[4] for p in phases]
     rec = records[np.isin(records[:, 0], np.fromiter(block_filter, np.int64))]
     if rec.shape[0] == 0:
-        return []
+        return [], [p[4] for p in phases]
     blk = rec[:, 0].astype(np.int64)
     ts = rec[:, 1].astype(np.int64)
     eid = rec[:, 2].astype(np.int64)
@@ -88,10 +123,12 @@ def build_spans(records, name_to_id, phases, block_filter):
         sid = name_to_id.get(start_name)
         eid_v = name_to_id.get(end_name)
         if sid is None or eid_v is None:
+            missing.append(label)
             continue
         s_mask = eid == sid
         e_mask = eid == eid_v
         if not s_mask.any() or not e_mask.any():
+            missing.append(label)
             continue
 
         if mode == "payload":
@@ -125,6 +162,7 @@ def build_spans(records, name_to_id, phases, block_filter):
                 t0_l.append(sts[j[valid]])
                 t1_l.append(ets[valid])
             if not b_l:
+                missing.append(label)
                 continue
             b_out = np.concatenate(b_l)
             t0 = np.concatenate(t0_l)
@@ -136,23 +174,77 @@ def build_spans(records, name_to_id, phases, block_filter):
         # Drop zero/negative spans: a begin and end inside one globaltimer tick,
         # or a stray end with no begin. Negatives render as inside-out bars.
         keep = durs > 0
-        n = int(keep.sum())
-        if n == 0:
+        if not keep.any():
+            missing.append(label)
             continue
-        spans.append(
-            (lane, b_out[keep], t0[keep], durs[keep], color, label)
-        )
-    return spans
+        spans.append((lane, b_out[keep], t0[keep], durs[keep], color, label))
+    return spans, missing
 
 
-def summarize(spans, kernel_ms):
-    """Per-phase n / mean / p50 / max, the first thing worth checking."""
+def clip_spans(spans, lo_ns, hi_ns):
+    """Clip spans to [lo, hi]. A span crossing the window is truncated, not
+    dropped -- otherwise a long bar spanning the whole window disappears."""
+    out = []
+    for lane, b, t0, dur, color, label in spans:
+        t1 = t0 + dur
+        keep = (t1 > lo_ns) & (t0 < hi_ns)
+        if not keep.any():
+            continue
+        cs = np.clip(t0[keep], lo_ns, hi_ns)
+        ce = np.clip(t1[keep], lo_ns, hi_ns)
+        d = ce - cs
+        nz = d > 0
+        if not nz.any():
+            continue
+        out.append((lane, b[keep][nz], cs[nz], d[nz], color, label))
+    return out
+
+
+def auto_window(spans, t_lo, t_hi, target_bars=45.0):
+    """Pick a detail window wide enough to hold ~`target_bars` of the finest
+    recurring phase, centred midway through the launch.
+
+    The finest phase is what sets readability: a window sized off the coarse
+    phases leaves the interesting ones sub-pixel.
+    """
+    medians = [
+        float(np.median(dur))
+        for _, _, _, dur, _, _ in spans
+        if dur.size >= 8 and float(np.median(dur)) >= 500.0  # ignore <0.5us
+    ]
+    total = t_hi - t_lo
+    if not medians:
+        width = total
+    else:
+        width = min(total, max(min(medians) * target_bars, 20_000.0))
+    centre = t_lo + total * 0.5
+    lo = max(t_lo, centre - width / 2)
+    return lo, min(t_hi, lo + width)
+
+
+def pick_detail_blocks(spans, n):
+    """Prefer contiguous blocks that carry MMA spans -- the MMA warp only runs
+    on cta_rank 0, so an arbitrary slice can miss it entirely."""
+    all_blocks = set()
+    mma_blocks = set()
+    for lane, b, _, _, _, _ in spans:
+        u = set(int(x) for x in np.unique(b))
+        all_blocks |= u
+        if lane.startswith("MMA"):
+            mma_blocks |= u
+    if not all_blocks:
+        return set()
+    start = min(mma_blocks) if mma_blocks else min(all_blocks)
+    ordered = sorted(x for x in all_blocks if x >= start)
+    return set(ordered[:n])
+
+
+def summarize(spans, kernel_ms, missing):
     lines = [
         f"{'phase':<20}{'n':>9}{'mean us':>10}{'p50 us':>10}{'max us':>10}"
         f"{'total us':>11}"
     ]
-    span_min = None
-    span_max = None
+    span_min = span_max = None
     for _, _, t0, durs, _, label in spans:
         us = durs / 1000.0
         lines.append(
@@ -172,20 +264,79 @@ def summarize(spans, kernel_ms):
                 f"launch wall time   {kernel_ms:8.3f} ms  "
                 f"({gap:+.1f}% outside instrumented spans)"
             )
+    if missing:
+        lines.append("")
+        lines.append(
+            f"WARNING: no events in this trace for: {', '.join(missing)}"
+        )
+        if any(m.endswith(("wait stage", "issue tma", "wait tma", "issue mma-k"))
+               for m in missing):
+            lines.append(f"         the K-step phases are {FINE_EVENT_HINT}")
     return "\n".join(lines)
 
 
-def plot(spans, out_path, title, group_by):
-    """One PolyCollection per (color, label) keeps 100k+ bars fast to draw."""
-    if not spans:
-        print("no spans to draw")
-        return
+def subpixel_report(spans, window_ns, label):
+    """Name the phases that cannot be seen at this zoom, with the fix."""
+    us_per_px = (window_ns / 1000.0) / PIXELS
+    invisible = []
+    for _, _, _, dur, _, lab in spans:
+        med_us = float(np.median(dur)) / 1000.0
+        if med_us < us_per_px:
+            invisible.append((lab, med_us))
+    if not invisible:
+        return None
+    body = ", ".join(f"{lab} (p50 {v:.3f}us)" for lab, v in invisible)
+    return (
+        f"NOTE: on the {label} panel 1 px = {us_per_px:.3f} us, so these are "
+        f"sub-pixel and will not render: {body}\n"
+        f"      zoom in with --tmin/--tmax (us, relative to trace start)."
+    )
 
-    # Row assignment. Rows are keyed by (lane, block); group_by decides whether
-    # lanes or CTAs are the outer sort key.
+
+def coverage(a, b, edges):
+    """Exact time covered by spans [a,b) inside each bin of `edges`.
+
+    O(n log n + bins) instead of bins x spans: S(x) = total span-time before x
+    is closed-form from sorted starts/ends, and each bin is a difference of S.
+    Exactness matters -- snapping short spans to a grid would erase precisely
+    the sub-microsecond phases this panel exists to show.
+    """
+    a_s = np.sort(a)
+    order_b = np.argsort(b)
+    b_s = b[order_b]
+    a_by_b = a[order_b]
+    z = np.zeros(1)
+    cum_a = np.concatenate([z, np.cumsum(a_s)])
+    cum_dur_b = np.concatenate([z, np.cumsum(b_s - a_by_b)])
+    cum_a_by_b = np.concatenate([z, np.cumsum(a_by_b)])
+    ia = np.searchsorted(a_s, edges, side="left")   # #{a < x}
+    ib = np.searchsorted(b_s, edges, side="right")  # #{b <= x}
+    S = cum_dur_b[ib] + (ia - ib) * edges - (cum_a[ia] - cum_a_by_b[ib])
+    return np.diff(S)
+
+
+def occupancy_stack(spans, edges, origin):
+    """Per-phase mean number of CTAs inside that phase, per time bin.
+
+    Everything is shifted to `origin` first: %globaltimer values are ~1e15 ns,
+    and cumsum-ing 350k of them overflows float64's significant digits, which
+    silently turns the whole panel into noise.
+    """
+    rel_edges = edges - origin
+    width = np.diff(rel_edges)
+    out = []
+    for _, _, t0, dur, color, label in spans:
+        a = t0.astype(np.float64) - origin
+        out.append((label, color, coverage(a, a + dur, rel_edges) / width))
+    return out
+
+
+def assign_rows(spans, group_by):
     keys = set()
     for lane, blocks, _, _, _, _ in spans:
         keys.update((lane, int(b)) for b in np.unique(blocks))
+    if not keys:
+        return {}, 0
 
     def lane_rank(lane):
         return LANE_ORDER.index(lane) if lane in LANE_ORDER else len(LANE_ORDER)
@@ -195,31 +346,31 @@ def plot(spans, out_path, title, group_by):
     else:
         ordered = sorted(keys, key=lambda k: (k[1], lane_rank(k[0])))
 
-    row = {}
-    y = 0
-    prev_group = None
+    row, y, prev = {}, 0, None
     for key in ordered:
         group = key[0] if group_by == "role" else key[1]
-        if prev_group is not None and group != prev_group:
+        if prev is not None and group != prev:
             y += 2  # blank rows between groups
         row[key] = y
         y += 1
-        prev_group = group
+        prev = group
+    return row, y
 
-    fig, ax = plt.subplots(figsize=(18, max(4, y * 0.11)))
 
-    t_zero = min(t0.min() for _, _, t0, _, _, _ in spans)
+def draw_panel(ax, spans, group_by, t_lo, t_hi, title, show_lane_labels=True):
+    """One PolyCollection per label keeps 100k+ bars fast to draw."""
+    row, nrows = assign_rows(spans, group_by)
     by_label = {}
     for lane, blocks, t0, durs, color, label in spans:
         ys = np.array([row[(lane, int(b))] for b in blocks], dtype=np.float64)
-        xs = (t0 - t_zero) / 1000.0
+        xs = (t0 - t_lo) / 1000.0
         ws = durs / 1000.0
-        entry = by_label.setdefault(label, [color, [], [], []])
-        entry[1].append(ys)
-        entry[2].append(xs)
-        entry[3].append(ws)
+        e = by_label.setdefault(label, [color, [], [], []])
+        e[1].append(ys)
+        e[2].append(xs)
+        e[3].append(ws)
 
-    h = 0.8
+    h = 0.82
     for label, (color, ys_l, xs_l, ws_l) in by_label.items():
         ys = np.concatenate(ys_l)
         xs = np.concatenate(xs_l)
@@ -233,7 +384,7 @@ def plot(spans, out_path, title, group_by):
             ],
             axis=1,
         )
-        # Rasterized: a vector PDF of 500k bars is either 100 MB or unscrollable.
+        # Rasterized: a vector PDF of 100k+ bars is either huge or unscrollable.
         ax.add_collection(
             PolyCollection(
                 verts,
@@ -244,13 +395,13 @@ def plot(spans, out_path, title, group_by):
             )
         )
 
-    if group_by == "role":
+    if show_lane_labels and group_by == "role":
         for lane in LANE_ORDER:
             ys = [v for (ln, _), v in row.items() if ln == lane]
             if not ys:
                 continue
             ax.text(
-                -0.015,
+                -0.012,
                 (min(ys) + max(ys)) / 2,
                 lane,
                 transform=ax.get_yaxis_transform(),
@@ -260,11 +411,20 @@ def plot(spans, out_path, title, group_by):
                 fontsize=9,
             )
 
+    ax.set_xlim(0, (t_hi - t_lo) / 1000.0)
+    ax.set_ylim(nrows, -1)  # inverted: first CTA on top
+    ax.set_yticks([])
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_title(title, fontsize=10, loc="left")
+    return by_label
+
+
+def legend_handles(spans, by_label):
     counts, totals = {}, {}
     for _, _, _, durs, _, label in spans:
         counts[label] = counts.get(label, 0) + durs.size
         totals[label] = totals.get(label, 0.0) + durs.sum() / 1000.0
-    handles = [
+    return [
         Patch(
             facecolor=by_label[label][0],
             label=f"{label} (n={counts[label]} "
@@ -272,83 +432,106 @@ def plot(spans, out_path, title, group_by):
         )
         for label in by_label
     ]
-    ax.legend(handles=handles, loc="upper right", fontsize=8, ncol=2)
-
-    x_max = max(
-        float(((t0 - t_zero) + durs).max()) for _, _, t0, durs, _, _ in spans
-    )
-    ax.set_xlim(0, x_max / 1000.0)
-    ax.set_ylim(y, -1)  # inverted: first CTA on top
-    ax.set_xlabel("time (us)")
-    # Lane labels already sit in the left margin; pad the axis label past them.
-    ax.set_ylabel(
-        "CTA (block id)" if group_by == "role" else "block / lane",
-        labelpad=34 if group_by == "role" else 4,
-    )
-    ax.set_yticks([])
-    ax.grid(axis="x", alpha=0.3)
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
-    plt.close(fig)
-    print(f"wrote {out_path}")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("trace", type=Path, help="path to a .npz trace")
-    ap.add_argument("--out", type=Path, default=None, help="output PDF/PNG")
-    ap.add_argument(
-        "--blocks", default=None, help='block filter, e.g. "0-15,20"'
-    )
-    ap.add_argument(
-        "--level",
-        choices=["tile", "fine", "both"],
-        default="both",
-        help=(
-            "which spans to draw: tile-level phases, the per-reduction-step "
-            "phases, or both on separate rows (default: %(default)s)"
-        ),
-    )
-    ap.add_argument(
-        "--group-by",
-        choices=["role", "block"],
-        default="role",
-        help=(
-            "row order: all rows of a role together, or a CTA's roles "
-            "adjacent (default: %(default)s)"
-        ),
-    )
-    ap.add_argument(
-        "--no-cta-span",
-        action="store_true",
-        help="omit the whole-CTA lifetime bar",
-    )
-    args = ap.parse_args()
+def render_trace(
+    trace_path,
+    out_path=None,
+    blocks=None,
+    detail_blocks=None,
+    group_by="role",
+    tmin=None,
+    tmax=None,
+    bins=240,
+    quiet=False,
+    **_ignored,
+):
+    """Render a .npz trace to a PDF. Returns the output path.
 
-    data = np.load(args.trace, allow_pickle=False)
+    Two views, because a Gantt only works at one scale. Over a multi-millisecond
+    launch every span is either ~100% of the timeline (a solid band) or
+    sub-pixel (invisible), so the macro view is an occupancy stack instead:
+    how many CTAs are sitting in each phase, over time. The Gantt is kept for
+    an auto-selected window where individual bars are actually resolvable.
+    """
+    trace_path = Path(trace_path)
+    data = np.load(trace_path, allow_pickle=False)
     records = data["records"]
     name_to_id = {
-        str(n): int(i)
-        for n, i in zip(data["event_names"], data["event_ids"])
+        str(n): int(i) for n, i in zip(data["event_names"], data["event_ids"])
     }
-    num_blocks = int(data["num_blocks"]) if "num_blocks" in data else (
-        int(records[:, 0].max()) + 1 if records.size else 0
+    num_blocks = (
+        int(data["num_blocks"])
+        if "num_blocks" in data
+        else (int(records[:, 0].max()) + 1 if records.size else 0)
     )
     kernel_ms = float(data["kernel_ms"]) if "kernel_ms" in data else None
 
-    phases = []
-    if not args.no_cta_span:
-        phases += CTA_PHASE
-    if args.level in ("tile", "both"):
-        phases += TILE_PHASES
-    if args.level in ("fine", "both"):
-        phases += FINE_PHASES
+    keep_blocks = parse_block_filter(blocks, num_blocks)
+    leaves, missing = build_spans(records, name_to_id, LEAF_PHASES, keep_blocks)
+    containers, _ = build_spans(
+        records, name_to_id, CONTAINER_PHASES, keep_blocks
+    )
 
-    blocks = parse_block_filter(args.blocks, num_blocks)
-    spans = build_spans(records, name_to_id, phases, blocks)
+    log = [summarize(leaves + containers, kernel_ms, missing)]
+    if not leaves:
+        log.append("")
+        log.append(
+            "no leaf spans to draw -- only the tile containers are present, "
+            "and those cover the whole timeline with no gaps."
+        )
+        if not quiet:
+            print("\n".join(log))
+        return None
 
-    print(summarize(spans, kernel_ms))
+    all_spans = leaves + containers
+    t_lo = min(int(t0.min()) for _, _, t0, _, _, _ in all_spans)
+    t_hi = max(int((t0 + d).max()) for _, _, t0, d, _, _ in all_spans)
+
+    if tmin is not None or tmax is not None:
+        d_lo = t_lo + int((tmin or 0.0) * 1000)
+        d_hi = t_lo + int(tmax * 1000) if tmax is not None else t_hi
+    else:
+        d_lo, d_hi = auto_window(leaves, t_lo, t_hi)
+
+    d_blocks = (
+        parse_block_filter(detail_blocks, num_blocks)
+        if detail_blocks
+        else pick_detail_blocks(leaves, DEFAULT_DETAIL_BLOCKS)
+    )
+    detail = clip_spans(leaves, d_lo, d_hi)
+    if d_blocks:
+        keep = np.fromiter(d_blocks, np.int64)
+        detail = [
+            (lane, b[m], t0[m], d[m], c, lab)
+            for lane, b, t0, d, c, lab in detail
+            for m in [np.isin(b, keep)]
+            if m.any()
+        ]
+
+    if detail:
+        note = subpixel_report(detail, d_hi - d_lo, "detail")
+        if note:
+            log.append("")
+            log.append(note)
+
+    # --- figure ----------------------------------------------------------
+    groups = [
+        (title, [s for s in leaves if s[5] in {p[4] for p in phases}])
+        for title, phases in ROLE_GROUPS
+    ]
+    groups = [g for g in groups if g[1]]
+    _, n_det = assign_rows(detail, group_by) if detail else ({}, 0)
+    h_det = float(np.clip(n_det * 0.16, 3.0, 7.0)) if detail else 0.0
+    heights = [1.45] * len(groups) + ([h_det] if detail else [])
+
+    fig, axes = plt.subplots(
+        len(heights),
+        1,
+        figsize=(FIG_WIDTH_IN, sum(heights) + 1.8),
+        gridspec_kw={"height_ratios": heights},
+    )
+    axes = np.atleast_1d(axes)
 
     meta = []
     for key, fmt in (
@@ -359,10 +542,103 @@ def main() -> int:
     ):
         if key in data:
             meta.append(fmt.format(data[key]))
-    title = f"{args.trace.name}  " + "  ".join(meta)
+    fig.suptitle(f"{trace_path.name}   " + "   ".join(meta), fontsize=11)
 
-    out = args.out or args.trace.with_suffix(".pdf")
-    plot(spans, out, title, args.group_by)
+    edges = np.linspace(float(t_lo), float(t_hi), bins + 1)
+    x_us = (edges[:-1] + np.diff(edges) / 2 - t_lo) / 1000.0
+    for ax, (title, gspans) in zip(axes, groups):
+        stack = occupancy_stack(gspans, edges, float(t_lo))
+        ax.stackplot(
+            x_us,
+            *[v for _, _, v in stack],
+            colors=[c for _, c, _ in stack],
+            labels=[lab for lab, _, _ in stack],
+            edgecolor="none",
+        )
+        ax.set_xlim(0, (t_hi - t_lo) / 1000.0)
+        peak = max((v.max() for _, _, v in stack), default=1.0)
+        ax.set_ylim(0, peak * 1.45)
+        ax.set_ylabel("CTAs", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.set_title(title, fontsize=9, loc="left")
+        ax.legend(loc="upper right", fontsize=7, ncol=len(stack), framealpha=0.9)
+        ax.axvspan(
+            (d_lo - t_lo) / 1000.0,
+            (d_hi - t_lo) / 1000.0,
+            color="black",
+            alpha=0.10,
+            lw=0,
+        )
+    axes[len(groups) - 1].set_xlabel(
+        f"time (us) — shaded band is the detail window below", fontsize=9
+    )
+
+    if detail:
+        ax = axes[-1]
+        by_label = draw_panel(
+            ax,
+            detail,
+            group_by,
+            d_lo,
+            d_hi,
+            f"detail — CTAs {min(d_blocks)}..{max(d_blocks)}, "
+            f"t = {(d_lo - t_lo) / 1000.0:.1f}..{(d_hi - t_lo) / 1000.0:.1f} us "
+            f"(--tmin/--tmax to move)",
+        )
+        ax.set_xlabel(f"time (us), offset {(d_lo - t_lo) / 1000.0:.1f} us")
+        ax.legend(
+            handles=legend_handles(detail, by_label),
+            loc="lower right",
+            bbox_to_anchor=(1.0, 1.005),
+            fontsize=8,
+            ncol=5,
+            frameon=False,
+        )
+
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    out_path = Path(out_path) if out_path else trace_path.with_suffix(".pdf")
+    fig.savefig(out_path, dpi=DPI)
+    plt.close(fig)
+    log.append("")
+    log.append(f"wrote {out_path}")
+    if not quiet:
+        print("\n".join(log))
+    return out_path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("trace", type=Path, help="path to a .npz trace")
+    ap.add_argument("--out", type=Path, default=None, help="output PDF/PNG")
+    ap.add_argument("--blocks", default=None, help='overview filter, e.g. "0-15,20"')
+    ap.add_argument(
+        "--detail-blocks",
+        default=None,
+        help="blocks for the detail panel (default: first 8 with MMA activity)",
+    )
+    ap.add_argument(
+        "--tmin", type=float, default=None,
+        help="detail window start, us relative to trace start",
+    )
+    ap.add_argument(
+        "--tmax", type=float, default=None,
+        help="detail window end, us relative to trace start",
+    )
+    ap.add_argument("--group-by", choices=["role", "block"], default="role")
+    ap.add_argument(
+        "--bins", type=int, default=240, help="time bins in the occupancy panels"
+    )
+    args = ap.parse_args()
+    render_trace(
+        args.trace,
+        out_path=args.out,
+        blocks=args.blocks,
+        detail_blocks=args.detail_blocks,
+        group_by=args.group_by,
+        tmin=args.tmin,
+        tmax=args.tmax,
+        bins=args.bins,
+    )
     return 0
 
 

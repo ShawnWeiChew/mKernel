@@ -22,6 +22,15 @@
 #define PROFILE_EVENTS_PER_BLOCK 65536
 #endif
 
+// Per-reduction-step spans are ON by default. Tile-level spans alone are not
+// useful here: one tile covers the whole K reduction (~400 us), and successive
+// tiles run back to back, so every lane renders as one gapless band. The
+// waiting -- who is starved on whom -- only becomes visible at the K step.
+// Build with PROFILE_COARSE=1 to drop them and pay ~6 fewer emits per K step.
+#if !defined(PROFILE_COARSE) && !defined(PROFILE_TIMINGS_FINE)
+#define PROFILE_TIMINGS_FINE 1
+#endif
+
 namespace timings {
 
 struct TimingRecord {

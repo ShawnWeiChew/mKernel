@@ -13,7 +13,7 @@
 #   make plots     — regenerate TFLOPS bar charts under plots/
 #   make clean     — remove build/
 #
-#   make PROFILE=1 [PROFILE_FINE=1] run-ag-gemm-kda-mla-profile
+#   make PROFILE=1 run-ag-gemm-kda-mla-profile
 #                  — build the instrumented ag_gemm_kda_mla and dump a
 #                    one-iteration in-kernel timing trace, then render with
 #                    `python3 plots/render_timings.py <trace>.npz`
@@ -86,11 +86,10 @@ INTRA_NUM_DEVICES ?= 8
 COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
 
 # === In-kernel timing profile (see include/common/timings.cuh) ===
-#   make PROFILE=1 ag-gemm-kda-mla        — tile-level spans
-#   make PROFILE=1 PROFILE_FINE=1 ...     — plus per-reduction-step spans.
-#       Two extra emits land inside the producer's and MMA warp's critical
-#       path per K step (~100 ns each), so use it to zoom in after the
-#       tile-level trace has shown you where, not as the default.
+#   make PROFILE=1 ag-gemm-kda-mla        — tile-level AND per-K-step spans
+#   make PROFILE=1 PROFILE_COARSE=1 ...   — tile-level spans only. Rarely what
+#       you want: one tile spans the whole K reduction, and tiles run back to
+#       back, so the plot is a solid band with no waiting visible.
 #   make PROFILE=1 PROFILE_EVENTS=16384 . — shrink the per-CTA ring
 #       (default 65536 events/CTA = 155 MB of HBM across the 148-CTA grid)
 # PROFILE=0 (the default) leaves zero profile instructions in the SASS and
@@ -99,8 +98,8 @@ PROFILE ?= 0
 PROFILE_EVENTS ?= 65536
 ifeq ($(PROFILE),1)
     PROFILE_DEFINES := -DPROFILE_TIMINGS -DPROFILE_EVENTS_PER_BLOCK=$(PROFILE_EVENTS)
-    ifeq ($(PROFILE_FINE),1)
-        PROFILE_DEFINES += -DPROFILE_TIMINGS_FINE
+    ifeq ($(PROFILE_COARSE),1)
+        PROFILE_DEFINES += -DPROFILE_COARSE
     endif
     COMMON_DEFINES += $(PROFILE_DEFINES)
 endif
