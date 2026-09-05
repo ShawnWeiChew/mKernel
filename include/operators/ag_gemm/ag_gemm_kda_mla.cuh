@@ -93,8 +93,14 @@ struct fused_globals {
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
 
     A_distributed_tensor A;
+    A_local_tensor A_local_buf;
     B_local_tensor B;
     C_local_tensor C;
+
+    // Copy-engine completion is published into local HBM. There is one
+    // monotonically increasing epoch per source device.
+    uint32_t* A_copy_ready;
+    uint32_t A_copy_epoch;
 
     int dev_idx;
     int M;
@@ -126,30 +132,65 @@ struct fused_globals {
 
 template <int _ROW_BLOCK, int _COL_BLOCK>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
-    dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N) {
+    dist::ParallelBuffer& A,
+    const at::Tensor& A_local_buf,
+    const at::Tensor& B,
+    at::Tensor& C,
+    int dev_idx,
+    int M,
+    int N) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
 
-    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N};
+    return {
+        .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+        .A_local_buf = ::dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A_local_buf),
+        .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+        .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+        .A_copy_ready = nullptr,
+        .A_copy_epoch = 0,
+        .dev_idx = dev_idx,
+        .M = M,
+        .N = N};
 }
 
-void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_local_buf,
+                const at::Tensor& B,
+                at::Tensor& C) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
     const int M = C.size(0), N = B.size(1);
+    constexpr int K = fused_globals<128, 128>::K;
+
+    TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
+                "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
+    TORCH_CHECK(A.data_.dim() == 2, "A must be a 2D tensor");
+    TORCH_CHECK(A.data_.scalar_type() == at::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(A.data_.size(1) == K, "A's K dimension must be ", K);
+    TORCH_CHECK(A_local_buf.is_cuda() && A_local_buf.is_contiguous(),
+                "A_local_buf must be a contiguous CUDA tensor");
+    TORCH_CHECK(A_local_buf.device().index() == dev_idx,
+                "A_local_buf must be on A's local device");
+    TORCH_CHECK(A_local_buf.scalar_type() == at::kBFloat16,
+                "A_local_buf must be bfloat16");
+    TORCH_CHECK(A_local_buf.dim() == 2 && A_local_buf.size(0) == M &&
+                    A_local_buf.size(1) == A.data_.size(1),
+                "A_local_buf must have shape [global_M, K] = [",
+                M,
+                ", ",
+                A.data_.size(1),
+                "]");
+    TORCH_CHECK(M == A.data_.size(0) * A.local_world_size_,
+                "C's M dimension must equal A.local_M * world_size");
 
     if (M <= 512) {
         using fg = fused_globals<128, 128>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N);
+        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
         launch_ag_gemm_kda_mla<128, 128>(globals);
     } else {
         using fg = fused_globals<128, 256>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N);
+        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
         launch_ag_gemm_kda_mla<128, 256>(globals);
     }
 }

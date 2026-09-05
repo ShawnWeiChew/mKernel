@@ -48,6 +48,34 @@ using namespace kittens;
 
 namespace ag_gemm_kda_mla {
 
+namespace {
+
+// Process-lifetime resources, one set per local CUDA device. This extension
+// uses one host process per GPU, and launches are serialized by that process.
+struct ACopyPipelineState {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t main_pre_event = nullptr;
+    uint32_t* ready = nullptr;
+    uint32_t epoch = 0;
+    bool initialized = false;
+};
+
+ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
+
+inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
+    ACopyPipelineState& state = A_copy_states[dev_idx];
+    if (!state.initialized) {
+        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
+        MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
+        MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
+        MKERNEL_CUDACHECK(cudaMemset(state.ready, 0, INTRA_NUM_DEVICES * sizeof(uint32_t)));
+        state.initialized = true;
+    }
+    return state;
+}
+
+}  // namespace
+
 // traverse the grid in a snake like pattern to raise L2 cache reuse
 // https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
 template <int SUPERGROUP_WIDTH = 5>
@@ -141,6 +169,24 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     everyone::tma::cluster::sync();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
+        const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
+        const bool is_local = actual_target_device == G.dev_idx;
+
+        // The stream memory write executes on this GPU after the peer-to-local
+        // D2D copy. Both the payload and flag reside in local HBM, so GPU-scope
+        // acquire is sufficient for the consumer.
+        if (!is_local) {
+            while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
+                   G.A_copy_epoch) {
+                __nanosleep(64);
+            }
+        }
+
+        const typename fg::A_local_tensor& A_gmem =
+            is_local ? G.A[actual_target_device] : G.A_local_buf;
+        const int A_tile_row_idx =
+            is_local ? tile_row_idx : actual_target_device * row_tiles_per_device + tile_row_idx;
+
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
@@ -157,8 +203,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                                      0);
 
             tma::cluster::load_async(A_smem,
-                                     G.A[(target_device + G.dev_idx) % fg::NUM_DEVICES],
-                                     {tile_row_idx, iter_k},
+                                     A_gmem,
+                                     {A_tile_row_idx, iter_k},
                                      tma_load[input_stage_id],
                                      (uint16_t)(1 << cta_rank),
                                      0);
@@ -311,7 +357,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             auto [local_tile_row, tile_col_idx] = calculate_tile_idx(
                 cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
-            const int target_device = (tile_id / cluster_tiles_per_device + G.dev_idx) % fg::NUM_DEVICES;
+            const int target_device =
+                (tile_id / cluster_tiles_per_device + G.dev_idx) % fg::NUM_DEVICES;
             const int local_cta_row = local_tile_row * fg::NUM_CLUSTERS + cta_rank;
             epilogue(target_device * row_tiles_per_device + local_cta_row,
                      tile_col_idx,
@@ -351,6 +398,47 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+    ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
+
+    copy_state.epoch++;
+    if (copy_state.epoch == 0) {
+        // Zero is reserved for the process-startup not-ready state.
+        MKERNEL_CUDACHECK(cudaMemset(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t)));
+        copy_state.epoch = 1;
+    }
+
+    fg launch_G = G;
+    launch_G.A_copy_ready = copy_state.ready;
+    launch_G.A_copy_epoch = copy_state.epoch;
+
+    // Capture prior work on the caller's stream. On repeated invocations this
+    // prevents the copy stream from overwriting A_local_buf until the previous
+    // persistent kernel on the caller stream has finished consuming it.
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
+    MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
+
+    const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
+    const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+
+    // Stage one complete shard per remote device in the same ring order used
+    // by the persistent kernel. The local shard is read directly from G.A.
+    for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const auto* src = G.A[peer].raw_ptr;
+
+        MKERNEL_CUDACHECK(
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+
+        // Keep the default pre-write barrier: it publishes the copied shard
+        // before the completion epoch. The kernel-side load only needs GPU
+        // scope because it reads a flag and payload resident on this device.
+        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
+                                             copy_state.epoch,
+                                             CU_STREAM_WRITE_VALUE_DEFAULT));
+    }
+
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
@@ -360,7 +448,8 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
+    this_kernel<<<grid, num_threads, smem_size, stream>>>(launch_G);
+    MKERNEL_CUDACHECK(cudaGetLastError());
 }
 };  // namespace ag_gemm_kda_mla
 

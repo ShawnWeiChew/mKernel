@@ -153,6 +153,9 @@ def main() -> int:
             multicast=True,
         )
         A_kernel.data_.copy_(A_ref_local)
+        A_local_buf = torch.empty(
+            (m, K), device="cuda", dtype=torch.bfloat16
+        )
 
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
@@ -163,7 +166,7 @@ def main() -> int:
         )
 
         dist.barrier()
-        mod.ag_gemm_kda_mla(A_kernel, B_kernel, C_kernel)
+        mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
         torch.cuda.synchronize()
 
         # Ignore the padded output columns and compare the original 6284-wide
@@ -184,7 +187,7 @@ def main() -> int:
             )
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, B_kernel, C_kernel
+        del A_kernel, A_local_buf, B_kernel, C_kernel
         dist.barrier()
 
     if not all_correct:
@@ -227,6 +230,9 @@ def main() -> int:
             multicast=True,
         )
         A_kernel.data_.copy_(A_ref_local)
+        A_local_buf = torch.empty(
+            (m, K), device="cuda", dtype=torch.bfloat16
+        )
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
         )
@@ -242,7 +248,7 @@ def main() -> int:
             torch.mm(A_ref, B_ref, out=C_ref)
 
         def run_kernel() -> None:
-            mod.ag_gemm_kda_mla(A_kernel, B_kernel, C_kernel)
+            mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
 
         baseline_ms = benchmark_cuda(run_baseline, args.warmup, args.iters)
         kernel_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
@@ -261,7 +267,7 @@ def main() -> int:
             )
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, B_kernel, C_kernel
+        del A_kernel, A_local_buf, B_kernel, C_kernel
         dist.barrier()
 
     dist.destroy_process_group()
