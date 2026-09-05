@@ -14,6 +14,7 @@
 #include "common/cuda_checks.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_shared_st.cuh"
+#include "common/tk_types_tensor.cuh"
 #include "common/types.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "dist/distributed_buffer.cuh"
@@ -51,13 +52,13 @@ struct fused_globals {
     static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
     // this is pipelining along the reduction dimension
-    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 1;
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 7 : 5;
     // this is pipelining among different MMAs
-    static constexpr int MMA_PIPELINE_STAGES = 2;
+    static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
-    static constexpr int EPILOGUE_PIPELINE_STAGES = 2;
+    static constexpr int EPILOGUE_PIPELINE_STAGES = 3;
     // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int EPILOGUE_C_TILES = 8;
+    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 2 : 4;
 
     // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
     // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
@@ -78,8 +79,8 @@ struct fused_globals {
     using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / NUM_CLUSTERS>;
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
-    // for smem staging
-    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / EPILOGUE_C_TILES>;
+    // for smem staging -- keep at least
+    using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / C_TILE_DIVISOR>;
 
     static constexpr int DYNAMIC_SHARED_MEMORY =
         (sizeof(A_tile) + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
@@ -140,7 +141,7 @@ void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    const int M = C.size(0), K = B.size(0), N = B.size(1);
+    const int M = C.size(0), N = B.size(1);
 
     if (M <= 512) {
         using fg = fused_globals<128, 128>;
