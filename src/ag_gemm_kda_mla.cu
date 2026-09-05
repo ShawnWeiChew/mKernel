@@ -111,6 +111,13 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
 
     uint32_t phasebits = fg::PHASE_BITS_INIT;
 
+#ifdef PROFILE_TIMINGS
+    // One head per CTA: all three warp roles below write into this CTA's slot,
+    // so a per-warp head would alias their records on top of each other.
+    __shared__ uint32_t s_timing_head;
+    if (threadIdx.x == 0) s_timing_head = 0;
+#endif
+
     if (warp_id == 0 && elect_warp_leader()) {
 #pragma unroll
         for (int i = 0; i < fg::PRODUCER_CONSUMER_PIPELINE_STAGES; i++) {
@@ -140,12 +147,28 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::sync();
 
-    auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
+#ifdef PROFILE_TIMINGS
+    if (threadIdx.x == 0) {
+        EMIT(G.timings, &s_timing_head, EV_CTA_BEGIN, ::timings::ROLE_CTA, 0);
+    }
+#endif
+
+    auto load = [&](int tile_row_idx,
+                    int tile_col_idx,
+                    int target_device,
+                    int& input_stage_id,
+                    [[maybe_unused]] uint32_t& k_seq) {
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_PROD_K_BEGIN, ::timings::ROLE_PRODUCER, k_seq);
+#endif
             wait(mma_finish[input_stage_id], (phasebits >> 0 & 0b1));
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_PROD_K_STAGE_READY, ::timings::ROLE_PRODUCER, k_seq);
+#endif
             tma::cluster::expect_bytes(
                 tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
 
@@ -163,22 +186,46 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_PROD_K_ISSUED, ::timings::ROLE_PRODUCER, k_seq);
+            k_seq++;
+#endif
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= 0b1;
             }
         }
     };
-    auto consume = [&](typename fg::C_tt_tile* tmem, int& input_stage_id, int& epilogue_stage_id) {
+    auto consume = [&](typename fg::C_tt_tile* tmem,
+                       int& input_stage_id,
+                       int& epilogue_stage_id,
+                       [[maybe_unused]] int tile_id,
+                       [[maybe_unused]] uint32_t& k_seq) {
+#ifdef PROFILE_TIMINGS
+        EMIT(G.timings, &s_timing_head, EV_MMA_TILE_BEGIN, ::timings::ROLE_MMA, tile_id);
+#endif
         wait(epilogue_tmem_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
+#ifdef PROFILE_TIMINGS
+        EMIT(G.timings, &s_timing_head, EV_MMA_TMEM_READY, ::timings::ROLE_MMA, tile_id);
+#endif
 
         {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_BEGIN, ::timings::ROLE_MMA, k_seq);
+#endif
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_INPUT_READY, ::timings::ROLE_MMA, k_seq);
+#endif
 
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_ISSUED, ::timings::ROLE_MMA, k_seq);
+            k_seq++;
+#endif
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= (1 << 1);
@@ -188,10 +235,20 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         for (int iter_k = 1; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_BEGIN, ::timings::ROLE_MMA, k_seq);
+#endif
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_INPUT_READY, ::timings::ROLE_MMA, k_seq);
+#endif
 
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
+#ifdef PROFILE_TIMINGS_FINE
+            EMIT(G.timings, &s_timing_head, EV_MMA_K_ISSUED, ::timings::ROLE_MMA, k_seq);
+            k_seq++;
+#endif
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= (1 << 1);
@@ -199,6 +256,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         }
 
         kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[epilogue_stage_id]);
+#ifdef PROFILE_TIMINGS
+        EMIT(G.timings, &s_timing_head, EV_MMA_TILE_DONE, ::timings::ROLE_MMA, tile_id);
+#endif
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
 
         if (epilogue_stage_id == 0) {
@@ -210,12 +270,26 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                         int tile_col_idx,
                         typename fg::C_tt_tile* tmem,
                         int& epilogue_stage_id,
-                        int& epilogue_transfer_stage_id) {
+                        int& epilogue_transfer_stage_id,
+                        [[maybe_unused]] int tile_id) {
         const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
 
+#ifdef PROFILE_TIMINGS
+        // One emit per warpgroup, not per warp: four identical records would
+        // quadruple the trace for the same span.
+        const bool timing_leader = warpgroup::laneid() == 0;
+        if (timing_leader) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_TILE_BEGIN, ::timings::ROLE_EPILOGUE, tile_id);
+        }
+#endif
         wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_MMA_READY, ::timings::ROLE_EPILOGUE, tile_id);
+        }
+#endif
 
 #pragma unroll
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
@@ -227,6 +301,12 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         }
 
         tensor_load_wait();
+
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_TMEM_LOADED, ::timings::ROLE_EPILOGUE, tile_id);
+        }
+#endif
 
         if (elect_warp_leader()) {
             tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
@@ -253,6 +333,12 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                 (epilogue_transfer_stage_id + 1) % fg::EPILOGUE_PIPELINE_STAGES;
         }
 
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_TILE_DONE, ::timings::ROLE_EPILOGUE, tile_id);
+        }
+#endif
+
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
         if (epilogue_stage_id == 0) {
             phasebits ^= (0b1 << 3);
@@ -263,6 +349,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         if (warp_id == 4) {
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
+                [[maybe_unused]] uint32_t k_seq = 0;
                 for (int tile_id = cluster_idx;
                      tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
                      tile_id += num_comp_clusters) {
@@ -271,10 +358,25 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                         cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
                     int target_device = tile_id / cluster_tiles_per_device;
+#ifdef PROFILE_TIMINGS
+                    EMIT(G.timings,
+                         &s_timing_head,
+                         EV_PROD_TILE_BEGIN,
+                         ::timings::ROLE_PRODUCER,
+                         tile_id);
+#endif
                     load(local_row_id * fg::NUM_CLUSTERS + cta_rank,
                          tile_col_idx,
                          target_device,
-                         input_stage_id);
+                         input_stage_id,
+                         k_seq);
+#ifdef PROFILE_TIMINGS
+                    EMIT(G.timings,
+                         &s_timing_head,
+                         EV_PROD_TILE_DONE,
+                         ::timings::ROLE_PRODUCER,
+                         tile_id);
+#endif
                 }
             }
         } else if (warp_id == 5) {
@@ -288,10 +390,11 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                     tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
                 }
 
+                [[maybe_unused]] uint32_t k_seq = 0;
                 for (int tile_id = cluster_idx;
                      tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
                      tile_id += num_comp_clusters) {
-                    consume(tmem, input_stage_id, epilogue_stage_id);
+                    consume(tmem, input_stage_id, epilogue_stage_id, tile_id, k_seq);
                 }
             }
         }
@@ -317,8 +420,15 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                      tile_col_idx,
                      tmem,
                      epilogue_stage_id,
-                     epilogue_transfer_stage_id);
+                     epilogue_transfer_stage_id,
+                     tile_id);
         }
+
+#ifdef PROFILE_TIMINGS
+        if (warpgroup::laneid() == 0) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_DRAIN_BEGIN, ::timings::ROLE_EPILOGUE, 0);
+        }
+#endif
 
         // wait for store to complete before deallocation of tmem
         if (warpgroup::laneid() == 0) {
@@ -336,7 +446,19 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             wait(tmem_finished, 0);
             tm_alloc.deprovision();
         }
+
+#ifdef PROFILE_TIMINGS
+        if (warpgroup::laneid() == 0) {
+            EMIT(G.timings, &s_timing_head, EV_EPI_DRAIN_DONE, ::timings::ROLE_EPILOGUE, 0);
+        }
+#endif
     }
+
+#ifdef PROFILE_TIMINGS
+    if (threadIdx.x == 0) {
+        EMIT(G.timings, &s_timing_head, EV_CTA_END, ::timings::ROLE_CTA, 0);
+    }
+#endif
 }
 
 template <int _ROW_BLOCK, int _COL_BLOCK>

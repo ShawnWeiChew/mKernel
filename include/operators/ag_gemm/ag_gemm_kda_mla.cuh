@@ -22,9 +22,49 @@
 #include "dist/parallel_buffer.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "common/timings.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 
 namespace ag_gemm_kda_mla {
+
+#ifdef PROFILE_TIMINGS
+/**
+ * In-kernel timing events. Append-only: the values are the ABI of every .npz
+ * trace on disk, so renumbering makes historical traces unreadable.
+ *
+ * Three warp roles share one CTA (producer TMA warp, MMA warp, epilogue
+ * warpgroup), so each role tags its payload via timings::pack_payload.
+ * The *_K_* events are the fine-grained per-reduction-step spans, emitted
+ * only when PROFILE_TIMINGS_FINE is also defined.
+ */
+enum TimingEvent : uint32_t {
+    EV_CTA_BEGIN = 0,
+    EV_CTA_END = 1,
+
+    // producer warp (warp 4): drives the TMA loads of A and B
+    EV_PROD_TILE_BEGIN = 2,
+    EV_PROD_TILE_DONE = 3,
+    EV_PROD_K_BEGIN = 4,
+    EV_PROD_K_STAGE_READY = 5,  // mma_finish observed -> input stage reusable
+    EV_PROD_K_ISSUED = 6,
+
+    // mma warp (warp 5, cta_rank 0 only): issues the tcgen05 MMAs
+    EV_MMA_TILE_BEGIN = 7,
+    EV_MMA_TMEM_READY = 8,  // epilogue released the tmem accumulator
+    EV_MMA_TILE_DONE = 9,
+    EV_MMA_K_BEGIN = 10,
+    EV_MMA_K_INPUT_READY = 11,  // tma_load observed -> A/B in smem
+    EV_MMA_K_ISSUED = 12,
+
+    // epilogue warpgroup (warps 0-3)
+    EV_EPI_TILE_BEGIN = 13,
+    EV_EPI_MMA_READY = 14,     // epilogue_ready observed -> accumulator done
+    EV_EPI_TMEM_LOADED = 15,   // tmem -> registers complete
+    EV_EPI_TILE_DONE = 16,     // all C chunks staged and TMA store issued
+    EV_EPI_DRAIN_BEGIN = 17,
+    EV_EPI_DRAIN_DONE = 18,
+};
+#endif  // PROFILE_TIMINGS
 
 template <int _ROW_BLOCK, int _COL_BLOCK>
 struct fused_globals;
@@ -99,6 +139,9 @@ struct fused_globals {
     int dev_idx;
     int M;
     int N;
+#ifdef PROFILE_TIMINGS
+    ::timings::TimingRecord* timings;
+#endif
     static constexpr int K = 7168;
 
     struct pipeline_inputs {
@@ -126,18 +169,35 @@ struct fused_globals {
 
 template <int _ROW_BLOCK, int _COL_BLOCK>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
-    dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N) {
+    dist::ParallelBuffer& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    int dev_idx,
+    int M,
+    int N,
+    uint64_t timings_ptr = 0) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
 
+#ifndef PROFILE_TIMINGS
+    // Non-profile builds carry no ring; the pointer never reaches the device.
+    (void)timings_ptr;
+#endif
     return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .dev_idx = dev_idx,
             .M = M,
-            .N = N};
+            .N = N,
+#ifdef PROFILE_TIMINGS
+            .timings = reinterpret_cast<::timings::TimingRecord*>(timings_ptr)
+#endif
+    };
 }
 
-void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& B,
+                at::Tensor& C,
+                uint64_t timings_ptr = 0) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -145,11 +205,11 @@ void entrypoint(dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C) {
 
     if (M <= 512) {
         using fg = fused_globals<128, 128>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N);
+        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N, timings_ptr);
         launch_ag_gemm_kda_mla<128, 128>(globals);
     } else {
         using fg = fused_globals<128, 256>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N);
+        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N, timings_ptr);
         launch_ag_gemm_kda_mla<128, 256>(globals);
     }
 }

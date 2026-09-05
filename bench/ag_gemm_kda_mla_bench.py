@@ -12,6 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
+import timings_dump  # noqa: E402
 from common import check_close  # noqa: E402
 
 
@@ -24,6 +25,10 @@ LOGICAL_N = 6284
 
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
+
+# In-kernel timing profile (build with `make PROFILE=1 ag-gemm-kda-mla`).
+PROFILE_MODULE = "ag_gemm_kda_mla_profile"
+DEFAULT_PROFILE_M = 8192
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,11 +47,44 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ITERS,
         help="timed iterations per implementation (default: %(default)s)",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "capture an in-kernel timing trace instead of running the "
+            "correctness/benchmark sweep (needs `make PROFILE=1 "
+            "ag-gemm-kda-mla`)"
+        ),
+    )
+    parser.add_argument(
+        "--profile-m",
+        type=int,
+        default=DEFAULT_PROFILE_M,
+        help="global M to profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--profile-rank",
+        type=int,
+        default=0,
+        help=(
+            "which rank dumps its trace; %%globaltimer is not synchronized "
+            "across GPUs, so each rank's file is its own timeline "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--profile-out",
+        type=str,
+        default=None,
+        help="output .npz path (default: plots/ag_gemm_kda_mla_trace_rank<N>.npz)",
+    )
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
     if args.iters <= 0:
         parser.error("--iters must be positive")
+    if args.profile and args.profile_m % 8 != 0:
+        parser.error("--profile-m must be divisible by the world size (8)")
     return args
 
 
@@ -87,6 +125,114 @@ def benchmark_cuda(
     return float(rank_ms.item())
 
 
+def run_profile(args: argparse.Namespace, rank: int, local_rank: int,
+                local_world_size: int) -> int:
+    """Capture one instrumented iteration and dump it as a .npz trace.
+
+    Exactly one iteration: the per-CTA head restarts at 0 each launch, so a
+    second iteration would overwrite the first and collide on the
+    (block, payload) pairing key.
+    """
+    mod = load_module.load(PROFILE_MODULE)
+    if not hasattr(mod, "EVENTS_PER_BLOCK"):
+        raise RuntimeError(
+            f"{PROFILE_MODULE} was built without -DPROFILE_TIMINGS. "
+            "Run `make PROFILE=1 ag-gemm-kda-mla`."
+        )
+
+    m = args.profile_m
+    local_m = m // local_world_size
+    padded_n = padded_n_for_m(m)
+    device = torch.device(f"cuda:{local_rank}")
+    is_dumper = rank == args.profile_rank
+
+    torch.manual_seed(42 + rank)
+    torch.cuda.manual_seed(42 + rank)
+    A_local = torch.randn(
+        (local_m, K), device=device, dtype=torch.bfloat16
+    ) / (K**0.25)
+
+    A_kernel = mod.DistBuffer(
+        (local_m, K),
+        dtype=torch.bfloat16,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        multicast=True,
+    )
+    A_kernel.data_.copy_(A_local)
+    B_kernel = torch.zeros((K, padded_n), device=device, dtype=torch.bfloat16)
+    B_kernel[:, :LOGICAL_N].normal_(0.0, K**-0.25)
+    C_kernel = torch.zeros((m, padded_n), device=device, dtype=torch.bfloat16)
+
+    # Warm up with a null ring: EMIT short-circuits on a null buffer, so these
+    # launches leave the trace untouched while still warming caches and clocks.
+    for _ in range(args.warmup):
+        mod.ag_gemm_kda_mla(A_kernel, B_kernel, C_kernel, timings_ptr=0)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    num_blocks = mod.TIMING_NUM_BLOCKS
+    events_per_block = mod.EVENTS_PER_BLOCK
+    ring = timings_dump.allocate_ring(num_blocks, events_per_block, device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    mod.ag_gemm_kda_mla(
+        A_kernel, B_kernel, C_kernel, timings_ptr=ring.data_ptr()
+    )
+    end.record()
+    end.synchronize()
+    kernel_ms = start.elapsed_time(end)
+
+    if not is_dumper:
+        dist.barrier()
+        return 0
+
+    records, heads = timings_dump.unpack_ring(
+        ring, num_blocks, events_per_block
+    )
+    overflowed = int((heads >= events_per_block).sum())
+
+    out_path = args.profile_out or str(
+        HERE.parent / "plots" / f"ag_gemm_kda_mla_trace_rank{rank}.npz"
+    )
+    timings_dump.save_trace(
+        out_path,
+        records,
+        heads,
+        dict(mod.TIMING_EVENTS),
+        dict(mod.TIMING_ROLES),
+        events_per_block,
+        num_blocks=num_blocks,
+        fine=bool(mod.TIMING_FINE),
+        rank=rank,
+        world_size=local_world_size,
+        problem_m=m,
+        local_m=local_m,
+        problem_n=LOGICAL_N,
+        padded_n=padded_n,
+        problem_k=K,
+        kernel_ms=kernel_ms,
+    )
+    print(
+        f"wrote {out_path}\n"
+        f"  M={m} local_m={local_m} padded_n={padded_n} rank={rank}\n"
+        f"  {records.shape[0]} events from {int((heads > 0).sum())} CTAs, "
+        f"kernel {kernel_ms:.3f} ms",
+        flush=True,
+    )
+    if overflowed:
+        print(
+            f"  WARNING: {overflowed} CTA(s) hit the {events_per_block}-event "
+            f"cap; the tail of their timeline was dropped. Rebuild with a "
+            f"larger PROFILE_EVENTS.",
+            flush=True,
+        )
+    dist.barrier()
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     rank = int(os.environ["RANK"])
@@ -112,6 +258,11 @@ def main() -> int:
             "ag_gemm_kda_mla is an intra-node test and requires "
             "LOCAL_WORLD_SIZE == WORLD_SIZE"
         )
+
+    if args.profile:
+        status = run_profile(args, rank, local_rank, local_world_size)
+        dist.destroy_process_group()
+        return status
 
     mod = load_module.load("ag_gemm_kda_mla")
     all_correct = True

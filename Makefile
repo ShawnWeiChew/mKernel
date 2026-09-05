@@ -12,6 +12,11 @@
 #   make bench     — run wall-time bench across all 5 kernels
 #   make plots     — regenerate TFLOPS bar charts under plots/
 #   make clean     — remove build/
+#
+#   make PROFILE=1 [PROFILE_FINE=1] run-ag-gemm-kda-mla-profile
+#                  — build the instrumented ag_gemm_kda_mla and dump a
+#                    one-iteration in-kernel timing trace, then render with
+#                    `python3 plots/render_timings.py <trace>.npz`
 
 # === Backend selection ===
 #
@@ -75,6 +80,26 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 # (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
 INTRA_NUM_DEVICES ?= 8
 COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
+
+# === In-kernel timing profile (see include/common/timings.cuh) ===
+#   make PROFILE=1 ag-gemm-kda-mla        — tile-level spans
+#   make PROFILE=1 PROFILE_FINE=1 ...     — plus per-reduction-step spans.
+#       Two extra emits land inside the producer's and MMA warp's critical
+#       path per K step (~100 ns each), so use it to zoom in after the
+#       tile-level trace has shown you where, not as the default.
+#   make PROFILE=1 PROFILE_EVENTS=16384 . — shrink the per-CTA ring
+#       (default 65536 events/CTA = 155 MB of HBM across the 148-CTA grid)
+# PROFILE=0 (the default) leaves zero profile instructions in the SASS and
+# allocates no HBM for the ring; ship that build.
+PROFILE ?= 0
+PROFILE_EVENTS ?= 65536
+ifeq ($(PROFILE),1)
+    PROFILE_DEFINES := -DPROFILE_TIMINGS -DPROFILE_EVENTS_PER_BLOCK=$(PROFILE_EVENTS)
+    ifeq ($(PROFILE_FINE),1)
+        PROFILE_DEFINES += -DPROFILE_TIMINGS_FINE
+    endif
+    COMMON_DEFINES += $(PROFILE_DEFINES)
+endif
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
@@ -178,7 +203,8 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots ag-gemm-kda-mla run-ag-gemm-kda-mla
+	test-slot-math plots ag-gemm-kda-mla run-ag-gemm-kda-mla \
+	run-ag-gemm-kda-mla-profile
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -192,8 +218,28 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 run-ag-gemm-kda-mla : ag-gemm-kda-mla
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_kda_mla_bench.py
 
-ag-gemm-kda-mla : $(BUILD)/libag_gemm_kda_mla.so
+# PROFILE=1 emits a separate .so so the instrumented and shipping builds can
+# sit side by side in build/ without one shadowing the other.
+ifeq ($(PROFILE),1)
+AG_GEMM_KDA_MLA_NAME := ag_gemm_kda_mla_profile
+else
+AG_GEMM_KDA_MLA_NAME := ag_gemm_kda_mla
+endif
 
-$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+AG_GEMM_KDA_MLA_HEADERS := \
+	include/operators/ag_gemm/ag_gemm_kda_mla.cuh \
+	include/operators/ag_gemm/ag_gemm_kda_mla_session.cuh \
+	include/common/timings.cuh
+
+ag-gemm-kda-mla : $(BUILD)/lib$(AG_GEMM_KDA_MLA_NAME).so
+
+# `make PROFILE=1 run-ag-gemm-kda-mla-profile` builds the instrumented .so and
+# dumps a one-iteration trace from rank 0 (see bench/ag_gemm_kda_mla_bench.py).
+PROFILE_BENCH_ARGS ?=
+run-ag-gemm-kda-mla-profile : ag-gemm-kda-mla
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) \
+	    bench/ag_gemm_kda_mla_bench.py --profile $(PROFILE_BENCH_ARGS)
+
+$(BUILD)/lib$(AG_GEMM_KDA_MLA_NAME).so : $(SRC)/ag_gemm_kda_mla.cu $(AG_GEMM_KDA_MLA_HEADERS) Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_$(AG_GEMM_KDA_MLA_NAME) $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
