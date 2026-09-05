@@ -108,6 +108,13 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
 
+    if (warp_id == 0 && elect_warp_leader()) {
+        G.A[G.dev_idx].template prefetch_tma<typename fg::A_tile>();
+        G.A_local_buf.template prefetch_tma<typename fg::A_tile>();
+        G.B.template prefetch_tma<typename fg::B_tile>();
+        G.C.template prefetch_tma<typename fg::C_tile>();
+    }
+
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
     const int local_m = G.A.rows();
     const int row_tiles_per_device = local_m / fg::ROW_BLOCK;
@@ -290,9 +297,10 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             if (warpgroup::laneid() == 0) {
                 // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
                 // column coordinate counts chunks, not COL_BLOCK tiles.
-                dist::tma::store_async(C_out,
-                                       C_smem[epilogue_transfer_stage_id],
-                                       {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
+                dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                    C_out,
+                    C_smem[epilogue_transfer_stage_id],
+                    {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
             }
 
             epilogue_transfer_stage_id =
