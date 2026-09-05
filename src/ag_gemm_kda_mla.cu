@@ -50,7 +50,7 @@ namespace ag_gemm_kda_mla {
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
 // https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
-template <int SUPERGROUP_WIDTH = 4>
+template <int SUPERGROUP_WIDTH = 5>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
                                                                    int num_cols,
                                                                    int tile_idx) {

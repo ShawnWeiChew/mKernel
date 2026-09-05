@@ -1,6 +1,8 @@
+import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 import torch
 import torch.distributed as dist
@@ -20,6 +22,33 @@ K = 7168
 #   (4 * 12288 + 96) / 8 + 128 = 6284.
 LOGICAL_N = 6284
 
+DEFAULT_WARMUP = 5
+DEFAULT_ITERS = 20
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Correctness and performance test for ag_gemm_kda_mla"
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=DEFAULT_WARMUP,
+        help="warmup iterations per implementation (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=DEFAULT_ITERS,
+        help="timed iterations per implementation (default: %(default)s)",
+    )
+    args = parser.parse_args()
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iters <= 0:
+        parser.error("--iters must be positive")
+    return args
+
 
 def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
@@ -30,7 +59,36 @@ def padded_n_for_m(m: int) -> int:
     return round_up(LOGICAL_N, col_block)
 
 
+def benchmark_cuda(
+    run_once: Callable[[], None], warmup: int, iters: int
+) -> float:
+    """Return average CUDA time in ms, taking the slowest rank's result."""
+    for _ in range(warmup):
+        run_once()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        run_once()
+    end.record()
+    end.synchronize()
+    local_ms = start.elapsed_time(end) / iters
+
+    # End-to-end distributed latency is gated by the slowest rank. This
+    # reduction is outside the timed region for both implementations.
+    rank_ms = torch.tensor(local_ms, device="cuda", dtype=torch.float64)
+    dist.all_reduce(rank_ms, op=dist.ReduceOp.MAX)
+    dist.barrier()
+    return float(rank_ms.item())
+
+
 def main() -> int:
+    args = parse_args()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     local_world_size = int(
@@ -79,7 +137,7 @@ def main() -> int:
             (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
         )
 
-        dist.all_gather_into_tensor(A_ref, A_ref_local)
+        dist.all_gather_single(A_ref, A_ref_local)
         torch.mm(A_ref, B_ref, out=C_ref)
 
         # The modified implementation gets its own tensors. A already meets
@@ -126,8 +184,85 @@ def main() -> int:
         del A_kernel, B_kernel, C_kernel
         dist.barrier()
 
+    if not all_correct:
+        if is_chief:
+            print("Correctness checks failed; skipping benchmarks.", flush=True)
+        dist.destroy_process_group()
+        return 1
+
+    if is_chief:
+        print(
+            f"All correctness checks passed. Benchmarking with "
+            f"warmup={args.warmup}, iters={args.iters}...",
+            flush=True,
+        )
+
+    # Allocate fresh tensors for the benchmark pass so no performance result
+    # is emitted until the complete correctness suite has passed.
+    for m in GLOBAL_M:
+        local_m = m // world_size
+        padded_n = padded_n_for_m(m)
+
+        torch.manual_seed(42 + rank)
+        torch.cuda.manual_seed(42 + rank)
+        A_ref_local = torch.randn(
+            (local_m, K), device="cuda", dtype=torch.bfloat16
+        ) / (K**0.25)
+        A_ref = torch.empty((m, K), device="cuda", dtype=torch.bfloat16)
+        B_ref = torch.randn(
+            (K, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+        ) / (K**0.25)
+        C_ref = torch.empty(
+            (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+        )
+
+        A_kernel = mod.DistBuffer(
+            (local_m, K),
+            dtype=torch.bfloat16,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            multicast=True,
+        )
+        A_kernel.data_.copy_(A_ref_local)
+        B_kernel = torch.zeros(
+            (K, padded_n), device="cuda", dtype=torch.bfloat16
+        )
+        B_kernel[:, :LOGICAL_N].copy_(B_ref)
+        C_kernel = torch.zeros(
+            (m, padded_n), device="cuda", dtype=torch.bfloat16
+        )
+
+        def run_baseline() -> None:
+            # NCCL all-gather followed by a cuBLAS GEMM. Reusing C_ref keeps
+            # output allocation outside the timed region.
+            dist.all_gather_single(A_ref, A_ref_local)
+            torch.mm(A_ref, B_ref, out=C_ref)
+
+        def run_kernel() -> None:
+            mod.ag_gemm_kda_mla(A_kernel, B_kernel, C_kernel)
+
+        baseline_ms = benchmark_cuda(run_baseline, args.warmup, args.iters)
+        kernel_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
+        relative_performance = baseline_ms / kernel_ms
+
+        if is_chief:
+            print(
+                f"M={m} local_m={local_m} N={LOGICAL_N} "
+                f"padded_n={padded_n}\n"
+                f"  {'cuBLAS + NCCL':<17} {baseline_ms:8.3f} ms  "
+                f"(1.000x, 100.0%)\n"
+                f"  {'ag_gemm_kda_mla':<17} {kernel_ms:8.3f} ms  "
+                f"({relative_performance:6.3f}x, "
+                f"{relative_performance * 100:6.1f}% of baseline)",
+                flush=True,
+            )
+
+        del A_ref_local, A_ref, B_ref, C_ref
+        del A_kernel, B_kernel, C_kernel
+        dist.barrier()
+
     dist.destroy_process_group()
-    return 0 if all_correct else 1
+    return 0
 
 
 if __name__ == "__main__":
