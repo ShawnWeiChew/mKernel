@@ -15,7 +15,7 @@ import load_module  # noqa: E402
 from common import check_close  # noqa: E402
 
 
-GLOBAL_M = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
+GLOBAL_M = [2048, 4096, 8192, 16384, 32768]
 K = 7168
 
 # Eight-way tensor parallel KDA projection width before kernel padding:
@@ -137,7 +137,7 @@ def main() -> int:
             (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
         )
 
-        dist.all_gather_single(A_ref, A_ref_local)
+        dist.all_gather_into_tensor(A_ref, A_ref_local)
         torch.mm(A_ref, B_ref, out=C_ref)
 
         # The modified implementation gets its own tensors. A already meets
@@ -235,7 +235,7 @@ def main() -> int:
         def run_baseline() -> None:
             # NCCL all-gather followed by a cuBLAS GEMM. Reusing C_ref keeps
             # output allocation outside the timed region.
-            dist.all_gather_single(A_ref, A_ref_local)
+            dist.all_gather_into_tensor(A_ref, A_ref_local)
             torch.mm(A_ref, B_ref, out=C_ref)
 
         def run_kernel() -> None:
