@@ -42,6 +42,8 @@
 #include "memory/tk_ops_group_util_util.cuh"
 // clang-format on
 
+// MAJOR TODO: think about how to deal with bad shapes!
+
 using namespace kittens;
 
 namespace ag_gemm_kda_mla {
