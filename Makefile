@@ -201,3 +201,61 @@ ag-gemm-kda-mla : $(BUILD)/libag_gemm_kda_mla.so
 $(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+# === In-kernel timing profile ===
+#
+# Same source, built with -DPROFILE_TIMINGS into a *separate* .so and module
+# name, so a profile build never shadows the shipping one -- keep both around
+# and let the bench pick. Without the flag every emit, the event enum and the
+# TimingRecord* on fused_globals preprocess away, so the shipping cubin carries
+# no profiling instructions at all.
+#
+# EVENTS_PER_BLOCK is the per-CTA cap on emits. The ring costs
+# NUM_BLOCKS * EVENTS_PER_BLOCK * 16B (148 * 65536 * 16B = 155 MB at the
+# default). Bump it if the trace shows every CTA truncating at the same x --
+# M=32768 needs 131072.
+EVENTS_PER_BLOCK ?= 65536
+
+GEMM_AR_BLACKWELL_HEADERS := \
+	include/operators/gemm_ar/gemm_ar_blackwell.cuh \
+	include/operators/gemm_ar/gemm_ar_blackwell_session.cuh \
+	include/common/timings.cuh
+
+$(BUILD)/libgemm_ar_blackwell.so : $(GEMM_AR_BLACKWELL_HEADERS)
+
+gemm-ar-blackwell-profile : $(BUILD)/libgemm_ar_blackwell_profile.so
+
+$(BUILD)/libgemm_ar_blackwell_profile.so : $(SRC)/gemm_ar_blackwell.cu \
+		$(GEMM_AR_BLACKWELL_HEADERS) Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) \
+	    -DPROFILE_TIMINGS -DMKERNEL_EVENTS_PER_BLOCK=$(EVENTS_PER_BLOCK) \
+	    -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell_profile \
+	    $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+# The profile drivers spawn their own ranks, so these are just `python ...`.
+PROFILE_ARGS ?=
+run-gemm-ar-blackwell-profile : gemm-ar-blackwell-profile
+	$(PYTHON) bench/gemm_ar_blackwell_profile.py $(PROFILE_ARGS)
+
+AG_GEMM_KDA_MLA_HEADERS := \
+	include/operators/ag_gemm/ag_gemm_kda_mla.cuh \
+	include/operators/ag_gemm/ag_gemm_kda_mla_session.cuh \
+	include/common/timings.cuh
+
+$(BUILD)/libag_gemm_kda_mla.so : $(AG_GEMM_KDA_MLA_HEADERS)
+
+ag-gemm-kda-mla-profile : $(BUILD)/libag_gemm_kda_mla_profile.so
+
+$(BUILD)/libag_gemm_kda_mla_profile.so : $(SRC)/ag_gemm_kda_mla.cu \
+		$(AG_GEMM_KDA_MLA_HEADERS) Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) \
+	    -DPROFILE_TIMINGS -DMKERNEL_EVENTS_PER_BLOCK=$(EVENTS_PER_BLOCK) \
+	    -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla_profile \
+	    $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+run-ag-gemm-kda-mla-profile : ag-gemm-kda-mla-profile
+	$(PYTHON) bench/ag_gemm_kda_mla_profile.py $(PROFILE_ARGS)
+
+.PHONY: gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
+	ag-gemm-kda-mla-profile run-ag-gemm-kda-mla-profile

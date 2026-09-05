@@ -20,6 +20,7 @@
 #include "comm/comm.cuh"
 #include "comm/multimem.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/timings.cuh"
 #include "common/tk_common_base_types.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_register_rt.cuh"
@@ -75,6 +76,14 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
 }
 
 }  // namespace
+#ifdef PROFILE_TIMINGS
+// Payload discriminators, matching the role branch at the bottom of the kernel:
+// warps 0-3 are the epilogue warpgroup (its leader stamps), warp 4 loads, warp 5
+// issues the MMA.
+static constexpr int PROFILE_EPILOGUE_WARP = 0;
+static constexpr int PROFILE_PRODUCER_WARP = 4;
+static constexpr int PROFILE_CONSUMER_WARP = 5;
+#endif
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
 // https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
@@ -114,6 +123,11 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         G.B.template prefetch_tma<typename fg::B_tile>();
         G.C.template prefetch_tma<typename fg::C_tile>();
     }
+    // Zero the CTA's ring head and make it visible before anyone emits. One
+    // lane per warp stamps SETUP_BEGIN; the renderer drops the warps that are
+    // not plotted rows, so this costs a handful of records per CTA.
+    MKERNEL_TIMING_PROLOGUE();
+    MKERNEL_EMIT_IF(elect_warp_leader(), G.timings, warp_id, EV_SETUP_BEGIN, 0);
 
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
     const int local_m = G.A.rows();
@@ -175,6 +189,20 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::sync();
 
+    MKERNEL_EMIT_IF(elect_warp_leader(), G.timings, warp_id, EV_SETUP_DONE, 0);
+
+    // Sequence numbers for the payload. They only have to be unique per
+    // (warp, event pair), so the producer's steps and the consumer's tiles can
+    // use independent counters.
+    MKERNEL_TIMING_ONLY(uint32_t prod_step_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t mma_tile_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t mma_step_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t epi_tile_seq = 0;)
+    // Which tile the consumer is on, published by its loop so consume() can tell
+    // a local A tile from one pulled over NVLink. Profile-only: the shipping
+    // build never computes it.
+    MKERNEL_TIMING_ONLY(int mma_tile_id = 0;)
+
     auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
         const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
         const bool is_local = actual_target_device == G.dev_idx;
@@ -198,7 +226,14 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            MKERNEL_EMIT(G.timings, PROFILE_PRODUCER_WARP, EV_LOAD_STEP_BEGIN, prod_step_seq);
+
             wait(mma_finish[input_stage_id], (phasebits >> 0 & 0b1));
+
+            // Gap to LOAD_STEP_BEGIN is the producer stalled on the ring: the
+            // consumer has not drained this stage yet.
+            MKERNEL_EMIT(G.timings, PROFILE_PRODUCER_WARP, EV_LOAD_MMA_FREE, prod_step_seq);
+
             tma::cluster::expect_bytes(
                 tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
 
@@ -216,6 +251,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
+            MKERNEL_EMIT(G.timings, PROFILE_PRODUCER_WARP, EV_LOAD_TMA_ISSUED, prod_step_seq);
+            MKERNEL_TIMING_ONLY(prod_step_seq++;)
+
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= 0b1;
@@ -223,14 +261,36 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         }
     };
     auto consume = [&](typename fg::C_tt_tile* tmem, int& input_stage_id, int& epilogue_stage_id) {
+        // target_device 0 means A[(0 + dev_idx) % N] -- this device's own slice.
+        // Anything else is an NVLink read, and the wait below is where that
+        // latency lands.
+        MKERNEL_TIMING_ONLY(const uint32_t inputs_ev = (mma_tile_id / cluster_tiles_per_device) != 0
+                                ? EV_MMA_INPUTS_REMOTE
+                                : EV_MMA_INPUTS_LOCAL;)
+
+        MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_TILE_BEGIN, mma_tile_seq);
+
         wait(epilogue_tmem_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
+
+        // Gap to MMA_TILE_BEGIN is the mainloop blocked on the epilogue: this
+        // TMEM stage has not been drained yet.
+        MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_TMEM_FREE, mma_tile_seq);
+        MKERNEL_TIMING_ONLY(mma_tile_seq++;)
 
         {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_STEP_BEGIN, mma_step_seq);
+
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, inputs_ev, mma_step_seq);
+
             mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_ISSUED, mma_step_seq);
+            MKERNEL_TIMING_ONLY(mma_step_seq++;)
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -241,9 +301,20 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         for (int iter_k = 1; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_STEP_BEGIN, mma_step_seq);
+
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
+            // Gap to MMA_STEP_BEGIN is the MMA starved of inputs. Split local vs
+            // remote: a remote bar that is much longer is the all-gather failing
+            // to hide behind the compute.
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, inputs_ev, mma_step_seq);
+
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, EV_MMA_ISSUED, mma_step_seq);
+            MKERNEL_TIMING_ONLY(mma_step_seq++;)
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -268,7 +339,19 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
 
+        // One row per epilogue warpgroup, stamped by its leader -- which is also
+        // the lane that issues the TMA store, so every phase closes on the same
+        // thread that opened it.
+        MKERNEL_TIMING_ONLY(const bool epi_leader = (warpgroup::laneid() == 0);)
+
+        MKERNEL_EMIT_IF(
+            epi_leader, G.timings, PROFILE_EPILOGUE_WARP, EV_EPI_TILE_BEGIN, epi_tile_seq);
+
         wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
+
+        // Gap to EPI_TILE_BEGIN is the epilogue waiting on the mainloop.
+        MKERNEL_EMIT_IF(
+            epi_leader, G.timings, PROFILE_EPILOGUE_WARP, EV_EPI_MMA_DONE, epi_tile_seq);
 
 #pragma unroll
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
@@ -280,6 +363,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         }
 
         tensor_load_wait();
+
+        MKERNEL_EMIT_IF(
+            epi_leader, G.timings, PROFILE_EPILOGUE_WARP, EV_EPI_TMEM_READ, epi_tile_seq);
 
         if (elect_warp_leader()) {
             tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
@@ -306,6 +392,12 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             epilogue_transfer_stage_id =
                 (epilogue_transfer_stage_id + 1) % fg::EPILOGUE_PIPELINE_STAGES;
         }
+
+        // Every chunk is staged to SMEM and its TMA store issued; the stores
+        // themselves stay in flight until the drain after the tile loop.
+        MKERNEL_EMIT_IF(
+            epi_leader, G.timings, PROFILE_EPILOGUE_WARP, EV_EPI_SMEM_WRITTEN, epi_tile_seq);
+        MKERNEL_TIMING_ONLY(epi_tile_seq++;)
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
         if (epilogue_stage_id == 0) {
@@ -345,6 +437,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                 for (int tile_id = cluster_idx;
                      tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
                      tile_id += num_comp_clusters) {
+                    MKERNEL_TIMING_ONLY(mma_tile_id = tile_id;)
                     consume(tmem, input_stage_id, epilogue_stage_id);
                 }
             }

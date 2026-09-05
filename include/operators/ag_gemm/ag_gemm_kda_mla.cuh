@@ -12,6 +12,7 @@
 #include "comm/comm.cuh"
 #include "comm/multimem.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/timings.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_shared_st.cuh"
 #include "common/tk_types_tensor.cuh"
@@ -34,6 +35,59 @@ void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G);
 
 static constexpr int DEFAULT_ROW_BLOCK = 128;
 static constexpr int DEFAULT_COL_BLOCK = 128;
+
+#ifdef PROFILE_TIMINGS
+// Append-only: these values are the ABI of every saved .npz. Renumbering makes
+// historical traces decode as the wrong phases.
+//
+// Unlike gemm_ar_blackwell there is no comm/comp SM split here -- every CTA is
+// a compute CTA and the all-gather rides inside the producer's A load, which
+// TMAs straight out of a peer's buffer. So the interesting comm signal is not a
+// separate band but the *latency* the consumer sees waiting on that load, which
+// is why MMA_INPUTS splits local from remote.
+enum TimingEvent : uint32_t {
+    // Shared prologue (semaphore init, TMEM provisioning, cluster sync).
+    EV_SETUP_BEGIN = 0,
+    EV_SETUP_DONE = 1,
+
+    // Producer warp: one pipeline step per K block.
+    EV_LOAD_STEP_BEGIN = 2,  // top of the step, before waiting on the ring slot
+    EV_LOAD_MMA_FREE = 3,    // mma_finish observed: the stage is free to refill
+    EV_LOAD_TMA_ISSUED = 4,  // A (possibly remote) + B loads issued
+
+    // Consumer (MMA) warp.
+    EV_MMA_TILE_BEGIN = 5,      // top of an output tile
+    EV_MMA_TMEM_FREE = 6,       // epilogue released this TMEM stage
+    EV_MMA_STEP_BEGIN = 7,      // top of a K step
+    EV_MMA_INPUTS_LOCAL = 8,    // tma_load observed, A came from this device
+    EV_MMA_INPUTS_REMOTE = 9,   // tma_load observed, A came over NVLink
+    EV_MMA_ISSUED = 10,         // mm2/mma2 issued
+
+    // Epilogue warpgroup.
+    EV_EPI_TILE_BEGIN = 11,     // top of an output tile
+    EV_EPI_MMA_DONE = 12,       // epilogue_ready observed: the mainloop is done
+    EV_EPI_TMEM_READ = 13,      // accumulator drained TMEM -> registers
+    EV_EPI_SMEM_WRITTEN = 14,   // all chunks staged to SMEM and stores issued
+};
+
+// Kept beside the enum so the pybind export and the enum cannot diverge.
+#define AG_GEMM_KDA_MLA_TIMING_EVENTS(X) \
+    X(SETUP_BEGIN)                       \
+    X(SETUP_DONE)                        \
+    X(LOAD_STEP_BEGIN)                   \
+    X(LOAD_MMA_FREE)                     \
+    X(LOAD_TMA_ISSUED)                   \
+    X(MMA_TILE_BEGIN)                    \
+    X(MMA_TMEM_FREE)                     \
+    X(MMA_STEP_BEGIN)                    \
+    X(MMA_INPUTS_LOCAL)                  \
+    X(MMA_INPUTS_REMOTE)                 \
+    X(MMA_ISSUED)                        \
+    X(EPI_TILE_BEGIN)                    \
+    X(EPI_MMA_DONE)                      \
+    X(EPI_TMEM_READ)                     \
+    X(EPI_SMEM_WRITTEN)
+#endif  // PROFILE_TIMINGS
 
 // for M < 512, this should be 128
 template <int _ROW_BLOCK, int _COL_BLOCK>
@@ -107,6 +161,13 @@ struct fused_globals {
     int N;
     static constexpr int K = 7168;
 
+#ifdef PROFILE_TIMINGS
+    // NUM_BLOCKS * EVENTS_PER_BLOCK records, partitioned by blockIdx.x so CTAs
+    // never contend. Null on an unprofiled launch, which short-circuits the
+    // store in emit_timing_impl.
+    ::mkernel_timings::TimingRecord* timings;
+#endif
+
     struct pipeline_inputs {
         A_tile A;
         B_tile B;
@@ -132,6 +193,7 @@ struct fused_globals {
 
 template <int _ROW_BLOCK, int _COL_BLOCK>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
+<<<<<<< HEAD
     dist::ParallelBuffer& A,
     const at::Tensor& A_local_buf,
     const at::Tensor& B,
@@ -139,8 +201,14 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globa
     int dev_idx,
     int M,
     int N) {
+=======
+    dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N,
+    uint64_t timings_ptr) {
+>>>>>>> b55e6f8 (add more profiling)
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+    (void)timings_ptr;
 
+<<<<<<< HEAD
     return {
         .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
         .A_local_buf = ::dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A_local_buf),
@@ -157,6 +225,31 @@ void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C) {
+=======
+    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+#ifdef PROFILE_TIMINGS
+            .timings = reinterpret_cast<::mkernel_timings::TimingRecord*>(timings_ptr),
+#endif
+    };
+}
+
+// COL_BLOCK is picked here, and the profiler needs it to size its expectations;
+// keep the threshold in one place so Python can ask rather than guess.
+__host__ inline int ag_gemm_kda_mla_col_block(int M) { return M <= 512 ? 128 : 256; }
+
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& B,
+                at::Tensor& C,
+                // Device pointer to a NUM_BLOCKS * EVENTS_PER_BLOCK ring of
+                // TimingRecords, or 0. Ignored unless built with
+                // -DPROFILE_TIMINGS, so the signature is the same either way.
+                const uint64_t timings_ptr = 0) {
+>>>>>>> b55e6f8 (add more profiling)
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -184,13 +277,21 @@ void entrypoint(dist::ParallelBuffer& A,
     TORCH_CHECK(M == A.data_.size(0) * A.local_world_size_,
                 "C's M dimension must equal A.local_M * world_size");
 
-    if (M <= 512) {
+    if (ag_gemm_kda_mla_col_block(M) == 128) {
         using fg = fused_globals<128, 128>;
+<<<<<<< HEAD
         fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
         launch_ag_gemm_kda_mla<128, 128>(globals);
     } else {
         using fg = fused_globals<128, 256>;
         fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+=======
+        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N, timings_ptr);
+        launch_ag_gemm_kda_mla<128, 128>(globals);
+    } else {
+        using fg = fused_globals<128, 256>;
+        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N, timings_ptr);
+>>>>>>> b55e6f8 (add more profiling)
         launch_ag_gemm_kda_mla<128, 256>(globals);
     }
 }

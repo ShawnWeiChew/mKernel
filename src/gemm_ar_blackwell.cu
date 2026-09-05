@@ -14,6 +14,7 @@
 #include "comm/comm.cuh"
 #include "comm/multimem.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/timings.cuh"
 #include "common/tk_common_base_types.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_register_rt.cuh"
@@ -60,6 +61,12 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
+
+    // Zero the CTA's ring head and make it visible before anyone emits. One
+    // lane per warp stamps SETUP_BEGIN; the renderer drops the warps that are
+    // not plotted rows, so this costs a handful of records per CTA.
+    MKERNEL_TIMING_PROLOGUE();
+    MKERNEL_EMIT_IF(elect_warp_leader(), G.timings, warp_id, EV_SETUP_BEGIN, 0);
 
     if (warp_id == 0 && elect_warp_leader()) {
         G.A.prefetch_tma<fused_globals::A_tile>();
@@ -133,11 +140,27 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::sync();
 
+    MKERNEL_EMIT_IF(elect_warp_leader(), G.timings, warp_id, EV_SETUP_DONE, 0);
+
+    // Sequence numbers for the payload. They only have to be unique per
+    // (warp, event pair), so the producer's steps and the consumer's tiles can
+    // use independent counters.
+    MKERNEL_TIMING_ONLY(uint32_t prod_step_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t mma_tile_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t mma_step_seq = 0;)
+    MKERNEL_TIMING_ONLY(uint32_t epi_tile_seq = 0;)
+
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
         for (int i = 0; i < G.K / fused_globals::RED_BLOCK; i++) {
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            MKERNEL_EMIT(G.timings, config::PRODUCER_WARP_ID, EV_LOAD_STEP_BEGIN, prod_step_seq);
+
             wait(mma_finish[input_stage_id], (phasebits >> config::PHASE_BIT_MMA_FINISH) & 0b1);
+
+            // Gap to LOAD_STEP_BEGIN is the producer stalled on the ring: the
+            // consumers have not drained this stage yet.
+            MKERNEL_EMIT(G.timings, config::PRODUCER_WARP_ID, EV_LOAD_MMA_FREE, prod_step_seq);
 
             tma::cluster::expect_bytes(tma_load[input_stage_id],
                                        sizeof(fused_globals::A_tile) * config::CONSUMER_WARPS +
@@ -164,6 +187,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
+            MKERNEL_EMIT(G.timings, config::PRODUCER_WARP_ID, EV_LOAD_TMA_ISSUED, prod_step_seq);
+            MKERNEL_TIMING_ONLY(prod_step_seq++;)
+
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
                 phasebits ^= (1 << config::PHASE_BIT_MMA_FINISH);
@@ -172,16 +198,32 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     };
 
     auto consume = [&](int& input_stage_id, fused_globals::C_tt_tile* tmem, const int consumer_id) {
+        MKERNEL_TIMING_ONLY(const int mma_warp = config::FIRST_CONSUMER_WARP_ID + consumer_id;)
+
+        MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_TILE_BEGIN, mma_tile_seq);
+
         wait(epilogue_tmem_finished[consumer_id],
              (phasebits >> (config::PHASE_BIT_EPILOGUE_FINISHED + consumer_id)) & 0b1);
+
+        // Gap to MMA_TILE_BEGIN is the mainloop blocked on the epilogue: the
+        // previous tile's accumulator has not been drained out of TMEM yet.
+        MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_TMEM_FREE, mma_tile_seq);
+        MKERNEL_TIMING_ONLY(mma_tile_seq++;)
 
         {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_STEP_BEGIN, mma_step_seq);
+
             wait(tma_load[input_stage_id], (phasebits >> config::PHASE_BIT_TMA_LOAD) & 0b1);
 
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_INPUTS_READY, mma_step_seq);
+
             mm2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_ISSUED, mma_step_seq);
+            MKERNEL_TIMING_ONLY(mma_step_seq++;)
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
 
@@ -194,9 +236,18 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             fused_globals::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             fused_globals::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_STEP_BEGIN, mma_step_seq);
+
             wait(tma_load[input_stage_id], (phasebits >> config::PHASE_BIT_TMA_LOAD) & 0b1);
 
+            // Gap to MMA_STEP_BEGIN is the MMA starved of inputs -- the
+            // producer's TMA for this stage has not landed.
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_INPUTS_READY, mma_step_seq);
+
             mma2_AB(tmem[0], A_smem, B_smem, mma_finish[input_stage_id]);
+
+            MKERNEL_EMIT(G.timings, mma_warp, EV_MMA_ISSUED, mma_step_seq);
+            MKERNEL_TIMING_ONLY(mma_step_seq++;)
 
             input_stage_id = (input_stage_id + 1) % fused_globals::PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -216,8 +267,18 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                         fused_globals::C_tt_tile* tmem,
                         const int warpgroup_id,
                         bool is_last_tile) {
+        // One row per epilogue warpgroup, stamped by its leader -- which is
+        // also the lane that issues the TMA store and the comm signal, so every
+        // phase below closes on the same thread that opened it.
+        MKERNEL_TIMING_ONLY(const bool epi_leader = (warpgroup::laneid() == 0);)
+
+        MKERNEL_EMIT_IF(epi_leader, G.timings, warp_id, EV_EPI_TILE_BEGIN, epi_tile_seq);
+
         wait(epilogue_ready[warpgroup_id],
              (phasebits >> (config::PHASE_BIT_EPILOGUE_READY + warpgroup_id)) & 0b1);
+
+        // Gap to EPI_TILE_BEGIN is the epilogue waiting on the mainloop.
+        MKERNEL_EMIT_IF(epi_leader, G.timings, warp_id, EV_EPI_MMA_DONE, epi_tile_seq);
 
         const auto& C_out = G.C_dist[G.dev_idx];
         constexpr int C_CHUNK_COLS = fused_globals::COL_BLOCK / fused_globals::EPILOGUE_STAGES;
@@ -237,6 +298,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
         tensor_load_wait();
         warpgroup::sync(epilogue_barrier);
+
+        MKERNEL_EMIT_IF(epi_leader, G.timings, warp_id, EV_EPI_TMEM_READ, epi_tile_seq);
 
         // signal tmem empty
         if (elect_warp_leader()) {
@@ -261,6 +324,10 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                     {tile_row_idx, tile_col_idx * fused_globals::EPILOGUE_STAGES + i});
             }
         }
+
+        // Every chunk is staged to SMEM and its TMA store issued; the stores
+        // themselves are still in flight until store_async_wait() below.
+        MKERNEL_EMIT_IF(epi_leader, G.timings, warp_id, EV_EPI_SMEM_WRITTEN, epi_tile_seq);
 
         // Same single-accumulator ring as the consumer side: epilogue_ready
         // completes once per output tile, so this flips every iteration.
@@ -325,6 +392,11 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
             dist::tma::store_async_wait();
 
+            // Gap to EPI_SMEM_WRITTEN is the epilogue draining its TMA stores
+            // into the distributed C buffer.
+            MKERNEL_EMIT_IF(
+                warpgroup::laneid() == 0, G.timings, warp_id, EV_EPI_STORE_DONE, epi_tile_seq);
+
             // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
             // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
             // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
@@ -346,7 +418,14 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                     comm::atomic_u32::release_store_gpu(
                         &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
                 }
+
+                // This tile is now visible to the comm CTAs. Line it up against
+                // the AR_SIGNAL_SEEN of whichever comm CTA claims it to read the
+                // GEMM -> all-reduce handoff latency straight off the Gantt.
+                MKERNEL_EMIT(G.timings, warp_id, EV_EPI_SIGNALLED, epi_tile_seq);
             }
+
+            MKERNEL_TIMING_ONLY(epi_tile_seq++;)
         }
 
         // Every epilogue warp has to be done reading TMEM before this CTA tells
@@ -382,6 +461,13 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
 template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     using config = config_t<_NUM_COMP_SM>;
+
+    // Comm CTAs get one plotted row each, stamped by thread 0, so the warp
+    // discriminator is always 0 here -- the block id is what separates them.
+    MKERNEL_TIMING_PROLOGUE();
+    MKERNEL_EMIT_IF(threadIdx.x == 0, G.timings, 0, EV_SETUP_BEGIN, 0);
+    MKERNEL_TIMING_ONLY(uint32_t ar_tile_seq = 0;)
+
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
@@ -396,9 +482,13 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     static_assert(config::NUM_DEVICES >= NUM_DEVICES_PER_TILE,
                   "Intranode design was not made for < 4 devices");
 
+    MKERNEL_EMIT_IF(threadIdx.x == 0, G.timings, 0, EV_SETUP_DONE, 0);
+
     const int tile_id_stride = config::NUM_DEVICES * config::NUM_COMM_SM;
     for (int tile_id = G.dev_idx + comm_block_idx * config::NUM_DEVICES; tile_id < num_tiles_total;
          tile_id += tile_id_stride) {
+        MKERNEL_EMIT_IF(threadIdx.x == 0, G.timings, 0, EV_AR_TILE_BEGIN, ar_tile_seq);
+
         // 4 devices handle 1 comp tile, stacked vertically, since completions come in 512 * 256
         // groups
         const int comm_level_tile_id = tile_id / NUM_DEVICES_PER_TILE;
@@ -427,6 +517,11 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
                             G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
                 } while (val < (int)G.epoch);
             }
+
+            // Gap to AR_TILE_BEGIN is the all-reduce idle, waiting for the GEMM
+            // to publish this tile. That white space is the overlap this kernel
+            // exists to close.
+            MKERNEL_EMIT(G.timings, 0, EV_AR_SIGNAL_SEEN, ar_tile_seq);
         }
         __syncthreads();
 
@@ -435,6 +530,11 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         pipelined_ar_tile<AR_UNROLL,
                           fused_globals::ROW_BLOCK / config::CONSUMER_WARPS,
                           fused_globals::COL_BLOCK>(G, row_base, col_base);
+
+        // No __syncthreads() closes the tile, so this is thread 0's view. Every
+        // thread does the same strided work, so it tracks the CTA closely.
+        MKERNEL_EMIT_IF(threadIdx.x == 0, G.timings, 0, EV_AR_TILE_DONE, ar_tile_seq);
+        MKERNEL_TIMING_ONLY(ar_tile_seq++;)
     }
 }
 

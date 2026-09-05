@@ -11,6 +11,7 @@
 
 #include "comm/comm.cuh"
 #include "common/cuda_checks.cuh"
+#include "common/timings.cuh"
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_shared_st.cuh"
 #include "common/types.cuh"
@@ -108,6 +109,92 @@ enum GemmToArSignalStrategy {
     PULL = 1,  // write to own buffer, host will poll with multimem
 };
 
+// Launch configuration per M, as a single list so the dispatch switch below and
+// the NUM_COMP_SM the profiler reports back to Python cannot drift apart. The
+// comp/comm split is what tells the renderer which blocks are GEMM CTAs and
+// which are all-reduce CTAs, so a stale copy would mislabel every row.
+//
+// X(M, SUPERGROUP_WIDTH, AR_UNROLL, SIGNAL_STRATEGY, NUM_COMP_SM)
+//
+// AR_UNROLL 43 at M=32768 is the ceiling: (128*256/2) 4-byte register loads
+// over 384 threads is 42.67 operations per thread, so a higher unroll is inert.
+#define GEMM_AR_BLACKWELL_CONFIGS(X)                          \
+    X(2048, 4, 16, GemmToArSignalStrategy::PULL, 108)         \
+    X(4096, 4, 16, GemmToArSignalStrategy::PULL, 108)         \
+    X(8192, 8, 16, GemmToArSignalStrategy::PULL, 100)         \
+    X(16384, 8, 16, GemmToArSignalStrategy::PULL, 100)        \
+    X(32768, 8, 43, GemmToArSignalStrategy::PUSH, 140)
+
+// -1 for an M the dispatch switch does not handle.
+__host__ inline int gemm_ar_blackwell_num_comp_sm(int M) {
+    switch (M) {
+#define GEMM_AR_BLACKWELL_CASE_COMP_SM(M_, SG_, UNROLL_, SIGNAL_, COMP_SM_) \
+    case (M_):                                                             \
+        return COMP_SM_;
+        GEMM_AR_BLACKWELL_CONFIGS(GEMM_AR_BLACKWELL_CASE_COMP_SM)
+#undef GEMM_AR_BLACKWELL_CASE_COMP_SM
+        default:
+            return -1;
+    }
+}
+
+#ifdef PROFILE_TIMINGS
+// Append-only: these values are the ABI of every saved .npz. Renumbering makes
+// historical traces decode as the wrong phases.
+enum TimingEvent : uint32_t {
+    // Shared prologue (semaphore init, TMEM provisioning, cluster sync).
+    EV_SETUP_BEGIN = 0,
+    EV_SETUP_DONE = 1,
+
+    // Producer warp: one pipeline step per K block.
+    EV_LOAD_STEP_BEGIN = 2,   // top of the step, before waiting on the ring slot
+    EV_LOAD_MMA_FREE = 3,     // mma_finish observed: the stage is free to refill
+    EV_LOAD_TMA_ISSUED = 4,   // A/B cluster loads issued for the stage
+
+    // Consumer (MMA) warps.
+    EV_MMA_TILE_BEGIN = 5,    // top of an output tile
+    EV_MMA_TMEM_FREE = 6,     // epilogue released the accumulator
+    EV_MMA_STEP_BEGIN = 7,    // top of a K step
+    EV_MMA_INPUTS_READY = 8,  // tma_load observed for the stage
+    EV_MMA_ISSUED = 9,        // mm2/mma2 issued
+
+    // Epilogue warpgroups.
+    EV_EPI_TILE_BEGIN = 10,    // top of an output tile
+    EV_EPI_MMA_DONE = 11,      // epilogue_ready observed: the mainloop is done
+    EV_EPI_TMEM_READ = 12,     // accumulator drained TMEM -> registers
+    EV_EPI_SMEM_WRITTEN = 13,  // all chunks staged to SMEM and their TMA stores issued
+    EV_EPI_STORE_DONE = 14,    // TMA stores drained to the distributed buffer
+    EV_EPI_SIGNALLED = 15,     // comp -> comm barrier written
+
+    // Comm (all-reduce) CTAs.
+    EV_AR_TILE_BEGIN = 16,   // top of a comm tile, before polling the barrier
+    EV_AR_SIGNAL_SEEN = 17,  // the GEMM signal for this tile landed
+    EV_AR_TILE_DONE = 18,    // multimem reduce + store for the tile finished
+};
+
+// Kept beside the enum so the pybind export and the enum cannot diverge.
+#define GEMM_AR_BLACKWELL_TIMING_EVENTS(X)  \
+    X(SETUP_BEGIN)                          \
+    X(SETUP_DONE)                           \
+    X(LOAD_STEP_BEGIN)                      \
+    X(LOAD_MMA_FREE)                        \
+    X(LOAD_TMA_ISSUED)                      \
+    X(MMA_TILE_BEGIN)                       \
+    X(MMA_TMEM_FREE)                        \
+    X(MMA_STEP_BEGIN)                       \
+    X(MMA_INPUTS_READY)                     \
+    X(MMA_ISSUED)                           \
+    X(EPI_TILE_BEGIN)                       \
+    X(EPI_MMA_DONE)                         \
+    X(EPI_TMEM_READ)                        \
+    X(EPI_SMEM_WRITTEN)                     \
+    X(EPI_STORE_DONE)                       \
+    X(EPI_SIGNALLED)                        \
+    X(AR_TILE_BEGIN)                        \
+    X(AR_SIGNAL_SEEN)                       \
+    X(AR_TILE_DONE)
+#endif  // PROFILE_TIMINGS
+
 struct fused_globals {
     static constexpr int PIPELINE_STAGES = 4;
     // NOTE: this would hide the smem -> gmem stores behind the rmem -> smem stores. It is likely
@@ -166,6 +253,13 @@ struct fused_globals {
     // used so that launches can be chained together
     int epoch;
 
+#ifdef PROFILE_TIMINGS
+    // NUM_BLOCKS * EVENTS_PER_BLOCK records, partitioned by blockIdx.x so CTAs
+    // never contend. Null on an unprofiled launch, which short-circuits the
+    // store in emit_timing_impl.
+    ::mkernel_timings::TimingRecord* timings;
+#endif
+
     struct pipeline_inputs {
         A_tile A[config::CONSUMER_WARPS];
         B_tile B;
@@ -185,7 +279,9 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
                                                              int M,
                                                              int N,
                                                              int K,
-                                                             int epoch) {
+                                                             int epoch,
+                                                             uint64_t timings_ptr) {
+    (void)timings_ptr;
     return {
         .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),
         .B = ::dist::local_tensor_from_tensor<fused_globals::B_local_tensor>(B),
@@ -199,7 +295,11 @@ __host__ inline fused_globals gemm_ar_blackwell_make_globals(const at::Tensor& A
         .M = M,
         .N = N,
         .K = K,
-        .epoch = epoch};
+        .epoch = epoch,
+#ifdef PROFILE_TIMINGS
+        .timings = reinterpret_cast<::mkernel_timings::TimingRecord*>(timings_ptr),
+#endif
+    };
 }
 
 void entrypoint(const at::Tensor& A,
@@ -207,41 +307,29 @@ void entrypoint(const at::Tensor& A,
                 dist::ParallelBuffer& C,
                 dist::ParallelBuffer& barrier,
                 dist::ParallelBuffer& C_final,
-                const int epoch) {
+                const int epoch,
+                // Device pointer to a NUM_BLOCKS * EVENTS_PER_BLOCK ring of
+                // TimingRecords, or 0. Ignored unless built with
+                // -DPROFILE_TIMINGS, so the signature is the same either way and
+                // the bench does not need two call sites.
+                const uint64_t timings_ptr = 0) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
     const int M = A.size(0), K = A.size(1), N = B.size(1);
 
-    fused_globals G =
-        gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
+    fused_globals G = gemm_ar_blackwell_make_globals(
+        A, B, C, barrier, C_final, dev_idx, M, N, K, epoch, timings_ptr);
 
     // int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM
     switch (M) {
-        case (2048): {
-            launch_fused_gemm_ar_blackwell<4, 16, GemmToArSignalStrategy::PULL, 108>(G);
-            break;
-        }
-        case (4096): {
-            launch_fused_gemm_ar_blackwell<4, 16, GemmToArSignalStrategy::PULL, 108>(G);
-            break;
-        }
-        case (8192): {
-            launch_fused_gemm_ar_blackwell<8, 16, GemmToArSignalStrategy::PULL, 100>(G);
-            break;
-        }
-        case (16384): {
-            launch_fused_gemm_ar_blackwell<8, 16, GemmToArSignalStrategy::PULL, 100>(G);
-            break;
-        }
-        case (32768): {
-            // 43 is the maximum unroll factor here because
-            // Number of 4 byte register lds (128*256 / 2)
-            // Number of oeprations per thread = (128*256 / 2) / 384 = 42.67 (so any higher has no
-            // effect)
-            launch_fused_gemm_ar_blackwell<8, 43, GemmToArSignalStrategy::PUSH, 140>(G);
-            break;
-        }
+#define GEMM_AR_BLACKWELL_CASE_LAUNCH(M_, SG_, UNROLL_, SIGNAL_, COMP_SM_) \
+    case (M_): {                                                          \
+        launch_fused_gemm_ar_blackwell<SG_, UNROLL_, SIGNAL_, COMP_SM_>(G);\
+        break;                                                            \
+    }
+        GEMM_AR_BLACKWELL_CONFIGS(GEMM_AR_BLACKWELL_CASE_LAUNCH)
+#undef GEMM_AR_BLACKWELL_CASE_LAUNCH
     }
 }
 };  // namespace gemm_ar_intranode_blackwell
