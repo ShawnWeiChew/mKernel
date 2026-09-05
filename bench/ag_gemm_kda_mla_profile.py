@@ -134,6 +134,9 @@ def run(args):
         local_world_size=world_size, multicast=True,
     )
     A_kernel.data_.copy_(A_local)
+    # Landing buffer for the copy-engine all-gather: every device's A shard,
+    # stacked, so shape is [global_M, K] -- not the local shard's [local_m, K].
+    A_local_buf = torch.empty((M, K), device="cuda", dtype=torch.bfloat16)
     B = torch.zeros((K, padded_n), device="cuda", dtype=torch.bfloat16)
     B[:, :LOGICAL_N].copy_(
         torch.randn((K, LOGICAL_N), device="cuda", dtype=torch.bfloat16) / (K**0.25)
@@ -144,7 +147,7 @@ def run(args):
     # Warmup with a null ring: pointer 0 short-circuits the store in
     # emit_timing_impl, so these launches leave the buffer untouched.
     for _ in range(WARMUP):
-        mod.ag_gemm_kda_mla(A_kernel, B, C, 0)
+        mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B, C, 0)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -157,7 +160,7 @@ def run(args):
     dist.barrier()
 
     start.record()
-    mod.ag_gemm_kda_mla(A_kernel, B, C, ring.data_ptr())
+    mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B, C, ring.data_ptr())
     end.record()
     torch.cuda.synchronize()
     kernel_ms = start.elapsed_time(end)
