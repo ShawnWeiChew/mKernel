@@ -68,6 +68,14 @@ enum TimingEvent : uint32_t {
     EV_EPI_MMA_DONE = 12,       // epilogue_ready observed: the mainloop is done
     EV_EPI_TMEM_READ = 13,      // accumulator drained TMEM -> registers
     EV_EPI_SMEM_WRITTEN = 14,   // all chunks staged to SMEM and stores issued
+
+    // Copy engine handoff. A cudaMemcpyAsync executes no instrumentable device
+    // code, so it cannot stamp itself -- but the producer blocks on the flag the
+    // copy stream writes, and that spin *is* on %globaltimer like everything
+    // else. Emitted once per (CTA, source device): the first wait is the real
+    // one, later tiles from the same peer find the flag already set.
+    EV_ACOPY_WAIT_BEGIN = 15,   // about to spin on A_copy_ready[peer]
+    EV_ACOPY_READY = 16,        // peer's shard is visible in A_local_buf
 };
 
 // Kept beside the enum so the pybind export and the enum cannot diverge.
@@ -86,7 +94,9 @@ enum TimingEvent : uint32_t {
     X(EPI_TILE_BEGIN)                    \
     X(EPI_MMA_DONE)                      \
     X(EPI_TMEM_READ)                     \
-    X(EPI_SMEM_WRITTEN)
+    X(EPI_SMEM_WRITTEN)                  \
+    X(ACOPY_WAIT_BEGIN)                  \
+    X(ACOPY_READY)
 #endif  // PROFILE_TIMINGS
 
 // for M < 512, this should be 128
@@ -193,22 +203,17 @@ struct fused_globals {
 
 template <int _ROW_BLOCK, int _COL_BLOCK>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
-<<<<<<< HEAD
     dist::ParallelBuffer& A,
     const at::Tensor& A_local_buf,
     const at::Tensor& B,
     at::Tensor& C,
     int dev_idx,
     int M,
-    int N) {
-=======
-    dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int dev_idx, int M, int N,
+    int N,
     uint64_t timings_ptr) {
->>>>>>> b55e6f8 (add more profiling)
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
     (void)timings_ptr;
 
-<<<<<<< HEAD
     return {
         .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
         .A_local_buf = ::dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A_local_buf),
@@ -218,22 +223,9 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globa
         .A_copy_epoch = 0,
         .dev_idx = dev_idx,
         .M = M,
-        .N = N};
-}
-
-void entrypoint(dist::ParallelBuffer& A,
-                const at::Tensor& A_local_buf,
-                const at::Tensor& B,
-                at::Tensor& C) {
-=======
-    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N,
+        .N = N,
 #ifdef PROFILE_TIMINGS
-            .timings = reinterpret_cast<::mkernel_timings::TimingRecord*>(timings_ptr),
+        .timings = reinterpret_cast<::mkernel_timings::TimingRecord*>(timings_ptr),
 #endif
     };
 }
@@ -243,13 +235,13 @@ void entrypoint(dist::ParallelBuffer& A,
 __host__ inline int ag_gemm_kda_mla_col_block(int M) { return M <= 512 ? 128 : 256; }
 
 void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                // Device pointer to a NUM_BLOCKS * EVENTS_PER_BLOCK ring of
-                // TimingRecords, or 0. Ignored unless built with
-                // -DPROFILE_TIMINGS, so the signature is the same either way.
+                // Device pointer to a ring of TimingRecords, or 0. Ignored
+                // unless built with -DPROFILE_TIMINGS, so the signature is the
+                // same either way.
                 const uint64_t timings_ptr = 0) {
->>>>>>> b55e6f8 (add more profiling)
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -279,19 +271,13 @@ void entrypoint(dist::ParallelBuffer& A,
 
     if (ag_gemm_kda_mla_col_block(M) == 128) {
         using fg = fused_globals<128, 128>;
-<<<<<<< HEAD
-        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
+        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(
+            A, A_local_buf, B, C, dev_idx, M, N, timings_ptr);
         launch_ag_gemm_kda_mla<128, 128>(globals);
     } else {
         using fg = fused_globals<128, 256>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-=======
-        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, B, C, dev_idx, M, N, timings_ptr);
-        launch_ag_gemm_kda_mla<128, 128>(globals);
-    } else {
-        using fg = fused_globals<128, 256>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, B, C, dev_idx, M, N, timings_ptr);
->>>>>>> b55e6f8 (add more profiling)
+        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(
+            A, A_local_buf, B, C, dev_idx, M, N, timings_ptr);
         launch_ag_gemm_kda_mla<128, 256>(globals);
     }
 }

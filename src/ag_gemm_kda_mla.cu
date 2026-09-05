@@ -202,6 +202,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     // a local A tile from one pulled over NVLink. Profile-only: the shipping
     // build never computes it.
     MKERNEL_TIMING_ONLY(int mma_tile_id = 0;)
+    // One bit per source device: only the first wait on a peer is a real stall,
+    // so only that one is stamped and the payload can just be the peer id.
+    MKERNEL_TIMING_ONLY(uint32_t acopy_seen = 0;)
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
         const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
@@ -211,10 +214,22 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         // D2D copy. Both the payload and flag reside in local HBM, so GPU-scope
         // acquire is sufficient for the consumer.
         if (!is_local) {
+            MKERNEL_TIMING_ONLY(
+                const bool acopy_first = (acopy_seen & (1u << actual_target_device)) == 0u;)
+            MKERNEL_EMIT_IF(acopy_first, G.timings, PROFILE_PRODUCER_WARP,
+                            EV_ACOPY_WAIT_BEGIN, actual_target_device);
+
             while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
                    G.A_copy_epoch) {
                 __nanosleep(64);
             }
+
+            // Earliest ACOPY_READY across CTAs is the copy's completion on the
+            // same clock as every other record -- the copy engine's own timeline
+            // observed from the compute side.
+            MKERNEL_EMIT_IF(acopy_first, G.timings, PROFILE_PRODUCER_WARP,
+                            EV_ACOPY_READY, actual_target_device);
+            MKERNEL_TIMING_ONLY(acopy_seen |= (1u << actual_target_device);)
         }
 
         const typename fg::A_local_tensor& A_gmem =

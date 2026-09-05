@@ -194,7 +194,15 @@ PHASES_GEMM_AR = {
 # different event for a local vs a remote A tile so the two can be told apart.
 # A long "wait A (remote)" next to a short "wait A (local)" is the all-gather
 # failing to hide behind the compute -- the whole question this kernel poses.
-AG_PRODUCER_PHASES = SETUP_PHASES + [
+# The copy engine cannot stamp itself, so this span is the producer's spin on the
+# flag the copy stream writes: it starts when the kernel first needs a peer's
+# shard and ends when that shard lands. A short bar means the copy was already
+# hidden behind earlier work; a long one means the kernel outran it.
+AG_COPY_PHASES = [
+    ("ACOPY_WAIT_BEGIN", "ACOPY_READY", WAIT["store"], "copy: wait A shard", "payload"),
+]
+
+AG_PRODUCER_PHASES = SETUP_PHASES + AG_COPY_PHASES + [
     ("LOAD_STEP_BEGIN", "LOAD_MMA_FREE", WAIT["ring"], "prod: wait ring slot", "payload"),
     ("LOAD_MMA_FREE", "LOAD_TMA_ISSUED", WORK["tma"], "prod: issue tma", "payload"),
 ]
