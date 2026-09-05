@@ -199,8 +199,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     MKERNEL_TIMING_ONLY(uint32_t mma_step_seq = 0;)
     MKERNEL_TIMING_ONLY(uint32_t epi_tile_seq = 0;)
     // Which tile the consumer is on, published by its loop so consume() can tell
-    // a local A tile from one pulled over NVLink. Profile-only: the shipping
-    // build never computes it.
+    // this device's own A shard from a peer's staged one. Profile-only: the
+    // shipping build never computes it.
     MKERNEL_TIMING_ONLY(int mma_tile_id = 0;)
     // One bit per source device: only the first wait on a peer is a real stall,
     // so only that one is stamped and the payload can just be the peer id.
@@ -276,9 +276,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         }
     };
     auto consume = [&](typename fg::C_tt_tile* tmem, int& input_stage_id, int& epilogue_stage_id) {
-        // target_device 0 means A[(0 + dev_idx) % N] -- this device's own slice.
-        // Anything else is an NVLink read, and the wait below is where that
-        // latency lands.
+        // target_device 0 means this device's own A slice; anything else is a
+        // peer's shard, staged into A_local_buf by the copy engine. The wait
+        // below is where any shortfall in that staging would land.
         MKERNEL_TIMING_ONLY(const uint32_t inputs_ev = (mma_tile_id / cluster_tiles_per_device) != 0
                                 ? EV_MMA_INPUTS_REMOTE
                                 : EV_MMA_INPUTS_LOCAL;)
@@ -321,9 +321,9 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
 
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
-            // Gap to MMA_STEP_BEGIN is the MMA starved of inputs. Split local vs
-            // remote: a remote bar that is much longer is the all-gather failing
-            // to hide behind the compute.
+            // Gap to MMA_STEP_BEGIN is the MMA starved of inputs. Split by shard
+            // origin: a peer-shard bar much longer than an own-shard one means
+            // the compute has outrun the copy engine's staging.
             MKERNEL_EMIT(G.timings, PROFILE_CONSUMER_WARP, inputs_ev, mma_step_seq);
 
             mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);

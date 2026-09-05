@@ -230,7 +230,8 @@ def run(args):
              f"{num_blocks} CTAs  ({kernel_ms:.3f} ms)")
     written = tt.plot(records, pdf, name_to_id, num_comp_sm=num_blocks,
                       layout=warp_layout, title=title, collapse=args.collapse,
-                      rows_per_role=args.rows_per_role, phases_by_role=phases)
+                      rows_per_role=args.rows_per_role, phases_by_role=phases,
+                      marker_events=tt.MARKER_EVENTS.get(KERNEL_NAME, ()))
     print(f"wrote {written}" if written else "nothing to plot")
 
     dist.barrier()

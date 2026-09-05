@@ -115,7 +115,7 @@ WAIT = {
     "mainloop": "#14532d",   # epilogue  -- dark green
     "store": "#134e4a",      # epilogue  -- dark teal
     "signal": "#581c87",     # comm      -- purple; the headline stall
-    "a_remote": "#0c4a6e",   # ag_gemm   -- dark sky; A pulled over NVLink
+    "a_remote": "#0c4a6e",   # ag_gemm   -- dark sky; A from a peer's shard
 }
 WORK = {
     "tma": "#fdba74",        # producer  -- light orange
@@ -137,6 +137,24 @@ CANVAS = "#ffffff"
 # Collapsed mode (--collapse) throws hue away entirely and draws exactly two
 # colors, which is the shortest path to "how much of this kernel is waiting".
 COLLAPSED = {"wait": "#1e3a8a", "work": "#f97316", "setup": SETUP_COLOR}
+# Copy-engine waits stay their own colour even when collapsed: they are a
+# different kind of stall from a compute-pipeline one, and they are usually so
+# short that merging them into the generic wait navy hides them completely.
+COLLAPSED_COPY = "#06b6d4"
+
+# A span shorter than this fraction of the x-range is widened to it *for
+# drawing only* -- the legend and the summary always report true durations. A
+# 391 ns copy wait in a 405 us trace is 0.002 of a pixel, so without a floor a
+# real event renders as nothing at all and reads as "it never happened".
+MIN_BAR_FRAC = 0.0012
+
+# Instants worth a full-height rule rather than a bar, per kernel. The copy
+# engine cannot stamp itself, so the moment a shard lands is the one thing the
+# trace can say about it precisely -- and it matters far more than the width of
+# the sub-microsecond spin that observed it.
+MARKER_EVENTS = {
+    "ag_gemm_kda_mla": [("ACOPY_READY", "#0891b2", "A shard from peer {seq} ready")],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +206,15 @@ PHASES_GEMM_AR = {
     "comm": COMM_PHASES,
 }
 
-# ag_gemm_kda_mla has no comm CTAs: every block computes, and the all-gather
-# rides inside the producer's A load, which TMAs out of a peer's buffer. So the
-# comm cost shows up as *latency* on the consumer's wait, and the kernel emits a
-# different event for a local vs a remote A tile so the two can be told apart.
-# A long "wait A (remote)" next to a short "wait A (local)" is the all-gather
-# failing to hide behind the compute -- the whole question this kernel poses.
+# ag_gemm_kda_mla has no comm CTAs: every block computes. The all-gather is
+# staged by the copy engine into A_local_buf, so both A sources are local HBM
+# reads by the time the MMA sees them -- the split below says which *shard* a
+# tile came from, not which device it was read from. The event names still say
+# LOCAL/REMOTE because renaming them would stop older traces decoding; the
+# labels are what carry the current meaning.
+#
+# The two bars being about equal is the copy engine keeping up. A peer-shard bar
+# much longer than an own-shard one means the compute has outrun the staging.
 # The copy engine cannot stamp itself, so this span is the producer's spin on the
 # flag the copy stream writes: it starts when the kernel first needs a peer's
 # shard and ends when that shard lands. A short bar means the copy was already
@@ -209,8 +230,8 @@ AG_PRODUCER_PHASES = SETUP_PHASES + AG_COPY_PHASES + [
 
 AG_MMA_PHASES = SETUP_PHASES + [
     ("MMA_TILE_BEGIN", "MMA_TMEM_FREE", WAIT["tmem"], "mma: wait tmem", "payload"),
-    ("MMA_STEP_BEGIN", "MMA_INPUTS_LOCAL", WAIT["tma"], "mma: wait A (local)", "payload"),
-    ("MMA_STEP_BEGIN", "MMA_INPUTS_REMOTE", WAIT["a_remote"], "mma: wait A (remote)", "payload"),
+    ("MMA_STEP_BEGIN", "MMA_INPUTS_LOCAL", WAIT["tma"], "mma: wait A (own shard)", "payload"),
+    ("MMA_STEP_BEGIN", "MMA_INPUTS_REMOTE", WAIT["a_remote"], "mma: wait A (peer shard)", "payload"),
     # Same colour and label from either input event, so the two merge into one
     # legend entry and one draw call.
     ("MMA_INPUTS_LOCAL", "MMA_ISSUED", WORK["mma"], "mma: issue mma", "payload"),
@@ -611,7 +632,8 @@ def parse_blocks(spec: str):
 # Render
 # ---------------------------------------------------------------------------
 def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
-         max_height=60.0, collapse=False, rows_per_role=None, phases_by_role=None):
+         max_height=60.0, collapse=False, rows_per_role=None, phases_by_role=None,
+         marker_events=()):
     """One Y-row per active (block, warp), grouped by role, as PolyCollections.
 
     collapse=True throws hue away and draws exactly two colours -- dark navy for
@@ -661,14 +683,20 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
     by_color = {}
     for b, w, start, dur, color, label in spans:
         if collapse:
-            kind = PHASE_KIND.get(label, "work")
-            color, label = COLLAPSED[kind], kind
+            if label.startswith("copy:"):
+                color, label = COLLAPSED_COPY, "copy wait"
+            else:
+                kind = PHASE_KIND.get(label, "work")
+                color, label = COLLAPSED[kind], kind
         by_color.setdefault((color, label), []).append(
             (row_to_y[(b, w)], start / 1000.0, dur / 1000.0)
         )
+    xmax_us = max((s[2] + s[3]) for s in spans) / 1000.0
+    min_w = xmax_us * MIN_BAR_FRAC
     for (color, label), bars in by_color.items():
         arr = np.asarray(bars, dtype=np.float64)
         ys, xs, ws = arr[:, 0], arr[:, 1], arr[:, 2]
+        ws = np.maximum(ws, min_w)   # drawing floor only; stats use true widths
         h = 0.85
         verts = np.stack(
             [
@@ -705,9 +733,26 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
         )
         ax.axhline(hi + 1, color="#d4d4d8", lw=0.6)
 
+    # Full-height rules at the marker instants, earliest observation per payload.
+    for ev_name, mcolor, fmt in marker_events:
+        mid = name_to_id.get(ev_name)
+        if mid is None:
+            continue
+        sel = records[:, 2] == mid
+        if not sel.any():
+            continue
+        mts = records[sel, 1]
+        mseq = records[sel, 3].astype(np.int64) & SEQ_MASK
+        for sq in np.unique(mseq):
+            t_us = mts[mseq == sq].min() / 1000.0
+            ax.axvline(t_us, color=mcolor, lw=1.1, ls="--", alpha=0.9, zorder=5)
+            ax.text(t_us, -0.5, " " + fmt.format(seq=int(sq)), color=mcolor,
+                    fontsize=7, rotation=90, va="top", ha="left", zorder=6)
+
     counts, totals = {}, {}
     for _, _, _, dur, _, label in spans:
-        key = PHASE_KIND.get(label, "work") if collapse else label
+        key = ("copy wait" if label.startswith("copy:") else PHASE_KIND.get(label, "work")) \
+            if collapse else label
         totals[key] = totals.get(key, 0) + dur / 1000.0
         counts[key] = counts.get(key, 0) + 1
 
@@ -717,7 +762,8 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
     ordered = sorted(
         by_color,
         key=lambda cl: (
-            kind_rank.get(cl[1] if collapse else PHASE_KIND.get(cl[1], "work"), 3),
+            kind_rank.get("wait" if cl[1] == "copy wait"
+                          else cl[1] if collapse else PHASE_KIND.get(cl[1], "work"), 3),
             -totals[cl[1]],
         ),
     )
@@ -737,8 +783,7 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
               ncol=1 if collapse else 3,
               title="dark + cool = waiting      hot = working", title_fontsize=8)
 
-    xmax = max((s[2] + s[3]) for s in spans) / 1000.0
-    ax.set_xlim(0, xmax)
+    ax.set_xlim(0, xmax_us)
     ax.set_ylim(y, -1)  # inverted: block 0 on top
     ax.set_xlabel("time (us)")
     ax.set_ylabel("")
@@ -822,7 +867,7 @@ def main(argv=None):
     written = plot(
         records, out, name_to_id, num_comp_sm=num_comp_sm, layout=layout,
         title=title, collapse=args.collapse, rows_per_role=args.rows_per_role,
-        phases_by_role=phases,
+        phases_by_role=phases, marker_events=MARKER_EVENTS.get(kernel, ()),
     )
     print(f"wrote {written}" if written else "nothing to plot")
     return 0

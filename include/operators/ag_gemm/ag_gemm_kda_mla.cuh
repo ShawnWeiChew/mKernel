@@ -41,10 +41,11 @@ static constexpr int DEFAULT_COL_BLOCK = 128;
 // historical traces decode as the wrong phases.
 //
 // Unlike gemm_ar_blackwell there is no comm/comp SM split here -- every CTA is
-// a compute CTA and the all-gather rides inside the producer's A load, which
-// TMAs straight out of a peer's buffer. So the interesting comm signal is not a
-// separate band but the *latency* the consumer sees waiting on that load, which
-// is why MMA_INPUTS splits local from remote.
+// a compute CTA. The all-gather is staged by the copy engine into A_local_buf,
+// so MMA_INPUTS_LOCAL/REMOTE now distinguish which *shard* a tile came from
+// (this device's own, or a peer's staged copy) rather than which device it was
+// read from: both are local HBM reads by the time the MMA sees them. The names
+// are kept as-is because they are the ABI of every trace saved so far.
 enum TimingEvent : uint32_t {
     // Shared prologue (semaphore init, TMEM provisioning, cluster sync).
     EV_SETUP_BEGIN = 0,
@@ -59,8 +60,8 @@ enum TimingEvent : uint32_t {
     EV_MMA_TILE_BEGIN = 5,      // top of an output tile
     EV_MMA_TMEM_FREE = 6,       // epilogue released this TMEM stage
     EV_MMA_STEP_BEGIN = 7,      // top of a K step
-    EV_MMA_INPUTS_LOCAL = 8,    // tma_load observed, A came from this device
-    EV_MMA_INPUTS_REMOTE = 9,   // tma_load observed, A came over NVLink
+    EV_MMA_INPUTS_LOCAL = 8,    // tma_load observed, A is this device's own shard
+    EV_MMA_INPUTS_REMOTE = 9,   // tma_load observed, A is a peer's staged shard
     EV_MMA_ISSUED = 10,         // mm2/mma2 issued
 
     // Epilogue warpgroup.
