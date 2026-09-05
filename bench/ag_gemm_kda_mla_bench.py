@@ -92,9 +92,9 @@ def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
-def padded_n_for_m(m: int) -> int:
+def padded_n_for_m(m: int, logical_n: int) -> int:
     col_block = 128 if m < 4096 else 256
-    return round_up(LOGICAL_N, col_block)
+    return round_up(logical_n, col_block)
 
 
 def benchmark_cuda(
@@ -248,11 +248,14 @@ def main() -> int:
     world_size = dist.get_world_size()
     is_chief = rank == 0
 
-    if world_size != 8:
+    if world_size == 4:
+        LOGICAL_N = (4 * 12288 + 96) // 4 + 128
+    elif world_size != 8:
         raise RuntimeError(
             f"This correctness test fixes the logical projection width at "
             f"{LOGICAL_N}, which assumes 8 ranks; got {world_size}."
         )
+
     if local_world_size != world_size:
         raise RuntimeError(
             "ag_gemm_kda_mla is an intra-node test and requires "
@@ -272,7 +275,7 @@ def main() -> int:
             raise ValueError(f"global M={m} is not divisible by {world_size=}")
 
         local_m = m // world_size
-        padded_n = padded_n_for_m(m)
+        padded_n = padded_n_for_m(m, LOGICAL_N)
 
         # Reference tensors retain the original, unpadded problem shapes.
         torch.manual_seed(42 + rank)
@@ -352,7 +355,7 @@ def main() -> int:
     # is emitted until the complete correctness suite has passed.
     for m in GLOBAL_M:
         local_m = m // world_size
-        padded_n = padded_n_for_m(m)
+        padded_n = padded_n_for_m(m, LOGICAL_N)
 
         torch.manual_seed(42 + rank)
         torch.cuda.manual_seed(42 + rank)
