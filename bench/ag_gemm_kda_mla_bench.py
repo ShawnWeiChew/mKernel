@@ -394,6 +394,11 @@ def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
+def gemm_tflops(m: int, n: int, k: int, elapsed_ms: float) -> float:
+    """Return GEMM throughput using 2*M*N*K floating-point operations."""
+    return 2.0 * m * n * k / (elapsed_ms * 1.0e9)
+
+
 def padded_n_for_m(m: int, logical_n: int) -> int:
     col_block = 128 if m < 4096 else 256
     return round_up(logical_n, col_block)
@@ -620,7 +625,9 @@ def main() -> int:
                             mark += " (matches mKernel tile)"
                         print(
                             f"    [autotune] mma_tiler_mn={tiler}: "
-                            f"{tune_ms:8.3f} ms{mark}",
+                            f"{tune_ms:8.3f} ms  "
+                            f"{gemm_tflops(m, padded_n, K, tune_ms):8.2f} "
+                            f"TFLOP/s{mark}",
                             flush=True,
                         )
 
@@ -746,7 +753,9 @@ def main() -> int:
                             mark = " <- best" if comm_sms == tk_comm_sms else ""
                             print(
                                 f"    [autotune] num_comm_sms={comm_sms}: "
-                                f"{tune_ms:8.3f} ms{mark}",
+                                f"{tune_ms:8.3f} ms  "
+                                f"{gemm_tflops(m, padded_n, K, tune_ms):8.2f} "
+                                f"TFLOP/s{mark}",
                                 flush=True,
                             )
 
@@ -781,28 +790,39 @@ def main() -> int:
                 f"M={m} local_m={local_m} N={LOGICAL_N} "
                 f"padded_n={padded_n}\n"
                 f"  {'NCCL all-gather':<26} {all_gather_ms:8.3f} ms\n"
-                f"  {f'cuBLAS N={LOGICAL_N}':<26} {cublas_logical_ms:8.3f} ms\n"
-                f"  {f'cuBLAS N={padded_n}':<26} {cublas_padded_ms:8.3f} ms\n"
+                f"  {f'cuBLAS N={LOGICAL_N}':<26} {cublas_logical_ms:8.3f} ms  "
+                f"{gemm_tflops(m, LOGICAL_N, K, cublas_logical_ms):8.2f} "
+                f"TFLOP/s\n"
+                f"  {f'cuBLAS N={padded_n}':<26} {cublas_padded_ms:8.3f} ms  "
+                f"{gemm_tflops(m, padded_n, K, cublas_padded_ms):8.2f} "
+                f"TFLOP/s\n"
                 f"  {f'cuBLAS + NCCL N={LOGICAL_N}':<26} "
-                f"{baseline_logical_ms:8.3f} ms\n"
+                f"{baseline_logical_ms:8.3f} ms  "
+                f"{gemm_tflops(m, LOGICAL_N, K, baseline_logical_ms):8.2f} "
+                f"TFLOP/s\n"
                 f"  {f'cuBLAS + NCCL N={padded_n}':<26} "
-                f"{baseline_padded_ms:8.3f} ms  (matched baseline)",
+                f"{baseline_padded_ms:8.3f} ms  "
+                f"{gemm_tflops(m, padded_n, K, baseline_padded_ms):8.2f} "
+                f"TFLOP/s  (matched baseline)",
                 flush=True,
             )
             if cutlass_ms is not None:
                 print(
                     f"  {'CUTLASS AG-GEMM':<26} {cutlass_ms:8.3f} ms  "
+                    f"{gemm_tflops(m, padded_n, K, cutlass_ms):8.2f} TFLOP/s  "
                     f"({baseline_padded_ms / cutlass_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             if tk_ms is not None:
                 print(
                     f"  {'ThunderKittens AG-GEMM':<26} {tk_ms:8.3f} ms  "
+                    f"{gemm_tflops(m, padded_n, K, tk_ms):8.2f} TFLOP/s  "
                     f"({baseline_padded_ms / tk_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             kernel_line = (
                 f"  {'ag_gemm_kda_mla':<26} {kernel_ms:8.3f} ms  "
+                f"{gemm_tflops(m, padded_n, K, kernel_ms):8.2f} TFLOP/s  "
                 f"({relative_performance:6.3f}x vs matched, "
                 f"{logical_relative_performance:6.3f}x vs logical)"
             )
