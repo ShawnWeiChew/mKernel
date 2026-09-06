@@ -76,15 +76,6 @@ def _load_cutlass_example():
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist")
 
-    # A source checkout contains the CuTeDSL package under python/CuTeDSL/. Let the
-    # benchmark use that checkout directly rather than requiring a separate
-    # editable install.
-    root = os.environ.get(_CUTLASS_ENV_ROOT)
-    if root:
-        cutlass_python = str(Path(root).expanduser() / "python" / "CuTeDSL")
-        if cutlass_python not in sys.path:
-            sys.path.insert(0, cutlass_python)
-
     spec = importlib.util.spec_from_file_location(
         "cutlass_distributed_all_gather_gemm_blackwell", path
     )
@@ -122,11 +113,29 @@ def _run_cutlass_once(
     for its standalone CLI but not for an embedded benchmark. Temporarily make
     that teardown a no-op so all candidates and mKernel share one process group.
     """
+    example = _load_cutlass_example()
+    import contextlib
+    import io
+
     import cutlass
 
-    example = _load_cutlass_example()
+    # Upstream's standalone __main__ defines this module global after parsing
+    # torchrun's rank. Imported run() still references it when constructing
+    # streams and walking the ring, but __main__ is not executed by our loader.
+    # Supply the same value explicitly for the embedded path.
+    example.local_rank = int(os.environ["LOCAL_RANK"])
+
     destroy_process_group = dist.destroy_process_group
+    can_implement = example.PersistentDenseGemmKernel.can_implement
+
+    def quiet_can_implement(*args, **kwargs):
+        # Upstream prints MNKL unconditionally from every rank. It is not a
+        # tuning result and obscures the per-candidate timing emitted below.
+        with contextlib.redirect_stdout(io.StringIO()):
+            return can_implement(*args, **kwargs)
+
     dist.destroy_process_group = lambda *args, **kwargs: None
+    example.PersistentDenseGemmKernel.can_implement = quiet_can_implement
     try:
         time_us = example.run(
             mnkl=(m, n, k, 1),
@@ -146,6 +155,7 @@ def _run_cutlass_once(
             use_cold_l2=False,
         )
     finally:
+        example.PersistentDenseGemmKernel.can_implement = can_implement
         dist.destroy_process_group = destroy_process_group
     torch.cuda.synchronize()
     return float(time_us) / 1000.0
