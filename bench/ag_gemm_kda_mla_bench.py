@@ -88,6 +88,8 @@ def benchmark_cuda(
 
 
 def main() -> int:
+    # The four-rank configuration selects a different projection width.
+    global LOGICAL_N
     args = parse_args()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -241,28 +243,57 @@ def main() -> int:
             (m, padded_n), device="cuda", dtype=torch.bfloat16
         )
 
-        def run_baseline() -> None:
-            # NCCL all-gather followed by a cuBLAS GEMM. Reusing C_ref keeps
-            # output allocation outside the timed region.
+        def run_all_gather() -> None:
             dist.all_gather_into_tensor(A_ref, A_ref_local)
+
+        def run_cublas_logical() -> None:
             torch.mm(A_ref, B_ref, out=C_ref)
+
+        def run_cublas_padded() -> None:
+            torch.mm(A_ref, B_kernel, out=C_kernel)
+
+        def run_baseline_logical() -> None:
+            run_all_gather()
+            run_cublas_logical()
+
+        def run_baseline_padded() -> None:
+            run_all_gather()
+            run_cublas_padded()
 
         def run_kernel() -> None:
             mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
 
-        baseline_ms = benchmark_cuda(run_baseline, args.warmup, args.iters)
+        all_gather_ms = benchmark_cuda(run_all_gather, args.warmup, args.iters)
+        cublas_logical_ms = benchmark_cuda(
+            run_cublas_logical, args.warmup, args.iters
+        )
+        cublas_padded_ms = benchmark_cuda(
+            run_cublas_padded, args.warmup, args.iters
+        )
+        baseline_logical_ms = benchmark_cuda(
+            run_baseline_logical, args.warmup, args.iters
+        )
+        baseline_padded_ms = benchmark_cuda(
+            run_baseline_padded, args.warmup, args.iters
+        )
         kernel_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
-        relative_performance = baseline_ms / kernel_ms
+        relative_performance = baseline_padded_ms / kernel_ms
+        logical_relative_performance = baseline_logical_ms / kernel_ms
 
         if is_chief:
             print(
                 f"M={m} local_m={local_m} N={LOGICAL_N} "
                 f"padded_n={padded_n}\n"
-                f"  {'cuBLAS + NCCL':<17} {baseline_ms:8.3f} ms  "
-                f"(1.000x, 100.0%)\n"
-                f"  {'ag_gemm_kda_mla':<17} {kernel_ms:8.3f} ms  "
-                f"({relative_performance:6.3f}x, "
-                f"{relative_performance * 100:6.1f}% of baseline)",
+                f"  {'NCCL all-gather':<26} {all_gather_ms:8.3f} ms\n"
+                f"  {f'cuBLAS N={LOGICAL_N}':<26} {cublas_logical_ms:8.3f} ms\n"
+                f"  {f'cuBLAS N={padded_n}':<26} {cublas_padded_ms:8.3f} ms\n"
+                f"  {f'cuBLAS + NCCL N={LOGICAL_N}':<26} "
+                f"{baseline_logical_ms:8.3f} ms\n"
+                f"  {f'cuBLAS + NCCL N={padded_n}':<26} "
+                f"{baseline_padded_ms:8.3f} ms  (matched baseline)\n"
+                f"  {'ag_gemm_kda_mla':<26} {kernel_ms:8.3f} ms  "
+                f"({relative_performance:6.3f}x vs matched, "
+                f"{logical_relative_performance:6.3f}x vs logical)",
                 flush=True,
             )
 
