@@ -633,7 +633,7 @@ def parse_blocks(spec: str):
 # ---------------------------------------------------------------------------
 def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
          max_height=60.0, collapse=False, rows_per_role=None, phases_by_role=None,
-         marker_events=()):
+         marker_events=(), copy_spans=None):
     """One Y-row per active (block, warp), grouped by role, as PolyCollections.
 
     collapse=True throws hue away and draws exactly two colours -- dark navy for
@@ -651,6 +651,9 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
         return None
 
     records = records.copy()
+    # copy_spans arrive in absolute %globaltimer ns, so keep the origin before
+    # the axis is zeroed -- reading it back afterwards would give 0.
+    time_origin = int(records[:, 1].min())
     records[:, 1] -= records[:, 1].min()  # zero the time axis
 
     spans = spans_for_all_roles(records, name_to_id, num_comp_sm, layout, phases_by_role)
@@ -733,6 +736,25 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
         )
         ax.axhline(hi + 1, color="#d4d4d8", lw=0.6)
 
+    # The copy engine, drawn as real spans rather than inferred from the spin.
+    # These come from CUDA events on the copy stream (the engine runs no device
+    # code, so it cannot stamp itself) and are anchored onto this clock by the
+    # driver. One lane per peer, stacked just above the first role band.
+    if copy_spans is not None and len(copy_spans):
+        base = time_origin
+        lanes = sorted({int(p) for p, _, _ in copy_spans})
+        for peer, b_ns, e_ns in copy_spans:
+            lane = -1.6 - 0.9 * lanes.index(int(peer))
+            x0, x1 = (int(b_ns) - base) / 1000.0, (int(e_ns) - base) / 1000.0
+            ax.add_patch(plt.Rectangle((x0, lane - 0.35), max(x1 - x0, min_w), 0.7,
+                                       facecolor=COLLAPSED_COPY, edgecolor="#155e75",
+                                       lw=0.5, zorder=4, clip_on=False))
+            ax.text(x0, lane, f" copy peer {int(peer)} ", fontsize=7, va="center",
+                    ha="left", color="#0e7490", zorder=5, clip_on=False)
+        ax.text(-0.008, -1.6 - 0.45 * (len(lanes) - 1), "COPY",
+                transform=ax.get_yaxis_transform(), ha="right", va="center",
+                fontweight="bold", fontsize=10, color="#0e7490")
+
     # Full-height rules at the marker instants, earliest observation per payload.
     for ev_name, mcolor, fmt in marker_events:
         mid = name_to_id.get(ev_name)
@@ -784,7 +806,10 @@ def plot(records, out_path, name_to_id, *, num_comp_sm, layout, title="",
               title="dark + cool = waiting      hot = working", title_fontsize=8)
 
     ax.set_xlim(0, xmax_us)
-    ax.set_ylim(y, -1)  # inverted: block 0 on top
+    top = -1.0
+    if copy_spans is not None and len(copy_spans):
+        top = -1.6 - 0.9 * len({int(p) for p, _, _ in copy_spans}) - 0.6
+    ax.set_ylim(y, top)  # inverted: block 0 on top
     ax.set_xlabel("time (us)")
     ax.set_ylabel("")
     ax.set_yticks([])
@@ -868,6 +893,7 @@ def main(argv=None):
         records, out, name_to_id, num_comp_sm=num_comp_sm, layout=layout,
         title=title, collapse=args.collapse, rows_per_role=args.rows_per_role,
         phases_by_role=phases, marker_events=MARKER_EVENTS.get(kernel, ()),
+        copy_spans=meta.get("copy_spans"),
     )
     print(f"wrote {written}" if written else "nothing to plot")
     return 0

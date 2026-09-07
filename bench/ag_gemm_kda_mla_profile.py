@@ -83,6 +83,8 @@ def run(args):
     import torch
     import torch.distributed as dist
 
+    import numpy as np
+
     import load_module
     import timings as tt
 
@@ -182,6 +184,46 @@ def run(args):
         print(f"  WARNING: {overflowed} CTAs hit the cap and dropped their tail. "
               f"Rebuild with EVENTS_PER_BLOCK={events_per_block * 2}.")
 
+    # Copy-engine spans. Widths come from CUDA events (exact, and independent of
+    # any clock base); their position comes from the kernel's own ACOPY_READY
+    # records. Anchoring uses the peer whose flag a CTA was actually caught
+    # spinning on -- that observation brackets the real completion tightly, where
+    # a peer nobody had to wait for only gives a loose upper bound.
+    copy_rows = []
+    try:
+        raw = mod.copy_times(local_rank)
+    except Exception as exc:                      # profile build without the export
+        print(f"  (copy_times unavailable: {exc})")
+        raw = []
+    if raw:
+        ev_ready = name_to_id["ACOPY_READY"]
+        ev_begin = name_to_id["ACOPY_WAIT_BEGIN"]
+        seq = records[:, 3] & ((1 << 28) - 1)
+        best_peer, best_slack, anchor = None, None, None
+        for peer, t_begin_ms, t_end_ms in raw:
+            m = (records[:, 2] == ev_ready) & (seq == peer)
+            b = (records[:, 2] == ev_begin) & (seq == peer)
+            if not m.any() or not b.any():
+                continue
+            ready_ns = int(records[m, 1].min())      # first CTA to observe it set
+            need_ns = int(records[b, 1].min())       # first CTA to want it
+            slack = ready_ns - need_ns               # small => tightly observed
+            if best_slack is None or slack < best_slack:
+                best_peer, best_slack = peer, slack
+                anchor = ready_ns - int(t_end_ms * 1e6)   # ref event, in globaltimer ns
+        if anchor is not None:
+            for peer, t_begin_ms, t_end_ms in raw:
+                copy_rows.append((int(peer),
+                                  anchor + int(t_begin_ms * 1e6),
+                                  anchor + int(t_end_ms * 1e6)))
+            t0 = int(records[:, 1].min())
+            print(f"\ncopy engine (anchored on peer {best_peer}, "
+                  f"observed to within {best_slack} ns):")
+            for peer, b_ns, e_ns in copy_rows:
+                print(f"  peer {peer}: {(b_ns-t0)/1000.0:8.1f} -> {(e_ns-t0)/1000.0:8.1f} us "
+                      f"({(e_ns-b_ns)/1000.0:7.1f} us, "
+                      f"{local_m*K*2/1e9/((e_ns-b_ns)/1e9):.0f} GB/s)")
+
     warp_layout = {str(k): int(v) for k, v in mod.WARP_LAYOUT.items()}
     name_to_id = {str(k): int(v) for k, v in mod.TIMING_EVENTS.items()}
     phases = tt.phases_for(KERNEL_NAME)
@@ -204,6 +246,8 @@ def run(args):
         rank=rank,
         world_size=world_size,
         kernel_ms=kernel_ms,
+        # (peer, begin_ns, end_ns) on the same clock as the records.
+        copy_spans=np.array(copy_rows, dtype=np.int64).reshape(-1, 3),
     )
     print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
 

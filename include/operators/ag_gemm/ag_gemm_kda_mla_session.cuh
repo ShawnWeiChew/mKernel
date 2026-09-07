@@ -45,6 +45,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("col_block_for_m", &ag_gemm_kda_mla::ag_gemm_kda_mla_col_block, pybind11::arg("M"));
 
 #ifdef PROFILE_TIMINGS
+    // (peer, start_ms, end_ms) per staged shard, relative to a reference event
+    // taken just before the first copy. Synchronize before calling.
+    m.def("copy_times", &ag_gemm_kda_mla::ag_gemm_kda_mla_copy_times, pybind11::arg("dev_idx"));
+
     // Only a profile build carries these. A runtime that must refuse the emit
     // overhead can probe hasattr(mod, "EVENTS_PER_BLOCK") and hard-fail.
     {

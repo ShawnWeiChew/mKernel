@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <tuple>
 #include <vector>
 
 #include "comm/comm.cuh"
@@ -230,6 +231,16 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globa
 #endif
     };
 }
+
+#ifdef PROFILE_TIMINGS
+// (peer, start_ms, end_ms) for each staged shard of the most recent launch,
+// measured on the copy stream and expressed relative to a reference event taken
+// just before the first copy. Widths are exact; the caller places them on the
+// %globaltimer axis by anchoring against the kernel's own ACOPY_READY records.
+//
+// Both events must have completed, so synchronize before calling.
+std::vector<std::tuple<int, float, float>> ag_gemm_kda_mla_copy_times(int dev_idx);
+#endif
 
 // COL_BLOCK is picked here, and the profiler needs it to size its expectations;
 // keep the threshold in one place so Python can ask rather than guess.

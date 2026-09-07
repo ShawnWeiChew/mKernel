@@ -59,6 +59,22 @@ struct ACopyPipelineState {
     uint32_t* ready = nullptr;
     uint32_t epoch = 0;
     bool initialized = false;
+#ifdef PROFILE_TIMINGS
+    // A cudaMemcpyAsync runs on a copy engine and executes no device code, so it
+    // cannot stamp %globaltimer the way the kernel does. CUDA events can: they
+    // are timestamped by the stream scheduler, not an SM, which matters because
+    // the persistent kernel owns every SM for its whole life -- a tiny "stamp
+    // kernel" on this stream would not be scheduled until the kernel retired.
+    //
+    // `ref` is recorded once, before the first copy, so the per-copy offsets are
+    // all relative to a single origin. Durations are exact; placing them on the
+    // %globaltimer axis is the host-side job of the profile driver, which
+    // anchors them with the kernel's own ACOPY_READY observation.
+    cudaEvent_t prof_ref = nullptr;
+    cudaEvent_t prof_begin[INTRA_NUM_DEVICES] = {};
+    cudaEvent_t prof_end[INTRA_NUM_DEVICES] = {};
+    bool prof_valid[INTRA_NUM_DEVICES] = {};
+#endif
 };
 
 ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
@@ -70,6 +86,15 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaMemset(state.ready, 0, INTRA_NUM_DEVICES * sizeof(uint32_t)));
+#ifdef PROFILE_TIMINGS
+        // cudaEventDefault keeps timing enabled; main_pre_event above disables it
+        // because it is only ever used for ordering.
+        MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.prof_ref, cudaEventDefault));
+        for (int i = 0; i < INTRA_NUM_DEVICES; ++i) {
+            MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.prof_begin[i], cudaEventDefault));
+            MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.prof_end[i], cudaEventDefault));
+        }
+#endif
         state.initialized = true;
     }
     return state;
@@ -533,6 +558,13 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
+#ifdef PROFILE_TIMINGS
+    // Origin for this launch's copy offsets, after the wait on the caller stream
+    // so it marks when the copy stream actually began working.
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_ref, copy_state.stream));
+    for (int i = 0; i < fg::NUM_DEVICES; ++i) copy_state.prof_valid[i] = false;
+#endif
+
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
 
@@ -543,8 +575,17 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
         auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr;
 
+#ifdef PROFILE_TIMINGS
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_begin[peer], copy_state.stream));
+#endif
+
         MKERNEL_CUDACHECK(
             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+
+#ifdef PROFILE_TIMINGS
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_end[peer], copy_state.stream));
+        copy_state.prof_valid[peer] = true;
+#endif
 
         // Keep the default pre-write barrier: it publishes the copied shard
         // before the completion epoch. The kernel-side load only needs GPU
@@ -567,6 +608,26 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     this_kernel<<<grid, num_threads, smem_size, stream>>>(launch_G);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
+#ifdef PROFILE_TIMINGS
+std::vector<std::tuple<int, float, float>> ag_gemm_kda_mla_copy_times(int dev_idx) {
+    std::vector<std::tuple<int, float, float>> out;
+    ACopyPipelineState& st = A_copy_states[dev_idx];
+    if (!st.initialized) return out;
+    // The events are stream-ordered behind the copies; the caller is expected to
+    // have synchronized, but make it safe rather than racy.
+    MKERNEL_CUDACHECK(cudaEventSynchronize(st.prof_ref));
+    for (int peer = 0; peer < INTRA_NUM_DEVICES; ++peer) {
+        if (!st.prof_valid[peer]) continue;
+        MKERNEL_CUDACHECK(cudaEventSynchronize(st.prof_end[peer]));
+        float t_begin = 0.f, t_end = 0.f;
+        MKERNEL_CUDACHECK(cudaEventElapsedTime(&t_begin, st.prof_ref, st.prof_begin[peer]));
+        MKERNEL_CUDACHECK(cudaEventElapsedTime(&t_end, st.prof_ref, st.prof_end[peer]));
+        out.emplace_back(peer, t_begin, t_end);
+    }
+    return out;
+}
+#endif
+
 };  // namespace ag_gemm_kda_mla
 
 #include "operators/ag_gemm/ag_gemm_kda_mla_session.cuh"
