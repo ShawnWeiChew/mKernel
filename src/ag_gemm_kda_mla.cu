@@ -185,7 +185,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         if (!is_local) {
             while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
                    G.A_copy_epoch) {
-                __nanosleep(64);
+                __nanosleep(16);
             }
         }
 
