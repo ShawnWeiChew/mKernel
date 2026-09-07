@@ -199,6 +199,8 @@ void entrypoint(dist::ParallelBuffer& A,
                 launch_ag_gemm_kda_mla<128, 256, 25>(globals);
                 break;
             }
+            default:
+                TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
         }
     } else {
         switch (M) {
@@ -237,6 +239,8 @@ void entrypoint(dist::ParallelBuffer& A,
                 launch_ag_gemm_kda_mla<128, 256, 10>(globals);
                 break;
             }
+            default:
+                TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
         }
     }
 }

@@ -3,6 +3,7 @@ import importlib.util
 import os
 import sys
 import sysconfig
+from itertools import product
 from pathlib import Path
 from typing import Callable
 
@@ -17,14 +18,23 @@ import load_module  # noqa: E402
 from common import check_close  # noqa: E402
 
 
-GLOBAL_M = [2048, 4096, 8192, 16384, 32768]
+GLOBAL_M = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
 K = 7168
 
-IS_KDA = False
+_WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+assert _WORLD_SIZE == 8, f"{_WORLD_SIZE=} is not 8"
 
-# Eight-way tensor parallel KDA projection width before kernel padding:
-#   (4 * 12288 + 96) / 8 + 128 = 6284.
-LOGICAL_N = 6284
+# Tensor parallel projection widths before kernel padding, swept together in
+# one launch because they land on different kernel configs: the entrypoint
+# dispatches on N, and 6284 and 3648 pad differently (6400 under either
+# column block, versus 3712 at 128 and 3840 at 256).
+PROJECTIONS = (
+    # KDA proj_qkvgfab, (4 * 12288 + 96) / TP + 128.
+    ("KDA", (4 * 12288 + 96) // _WORLD_SIZE + 128),
+    # MLA qkvg proj, 576 + 1536 + 12288 / TP.
+    ("MLA", 576 + 1536 + 12288 // _WORLD_SIZE),
+)
+PROJECTION_NAMES = tuple(name for name, _ in PROJECTIONS)
 
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
@@ -169,11 +179,22 @@ def matched_cutlass_tiler(m: int) -> tuple[int, int]:
 
 
 def cutlass_benchmark(
-    *, m: int, n: int, k: int, warmup: int, iterations: int
+    *,
+    m: int,
+    n: int,
+    k: int,
+    warmup: int,
+    iterations: int,
+    matched_tiler: tuple[int, int],
 ) -> tuple[float, tuple[int, int], list[tuple[tuple[int, int], float]]]:
-    """Autotune CUTLASS's MMA tile and benchmark the winning configuration."""
+    """Autotune CUTLASS's MMA tile and benchmark the winning configuration.
+
+    matched_tiler is the tile mKernel itself dispatches for this problem. It
+    is keyed on the padded M even though CUTLASS runs the unpadded shape, so
+    the non-autotuned run stays a like-for-like schedule comparison.
+    """
     autotune = _env_enabled(_CUTLASS_ENV_AUTOTUNE)
-    candidates = _CUTLASS_MMA_TILERS if autotune else (matched_cutlass_tiler(m),)
+    candidates = _CUTLASS_MMA_TILERS if autotune else (matched_tiler,)
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
 
@@ -384,6 +405,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ITERS,
         help="timed iterations per implementation (default: %(default)s)",
     )
+    parser.add_argument(
+        "--projections",
+        nargs="+",
+        choices=PROJECTION_NAMES,
+        default=list(PROJECTION_NAMES),
+        help="projection widths to sweep (default: all of them)",
+    )
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
@@ -401,15 +429,16 @@ def gemm_tflops(m: int, n: int, k: int, elapsed_ms: float) -> float:
     return 2.0 * m * n * k / (elapsed_ms * 1.0e9)
 
 
-def useful_tflops(m: int, k: int, elapsed_ms: float) -> float:
+def useful_tflops(m: int, logical_n: int, k: int, elapsed_ms: float) -> float:
     """Return throughput over the logical problem only.
 
-    Every candidate pads N to whatever its own tiler requires, and each pads
-    by a different amount. Charging each implementation for the columns it
-    happened to pad rewards the one that pads most, so score all of them on
-    the 2*M*LOGICAL_N*K the model actually needs.
+    Every candidate pads M and N to whatever its own tiler requires, and each
+    pads by a different amount. Charging each implementation for the rows and
+    columns it happened to pad rewards the one that pads most, so score all of
+    them on the 2*M*logical_n*K the model actually needs, where M is the
+    unpadded global sequence length.
     """
-    return gemm_tflops(m, LOGICAL_N, k, elapsed_ms)
+    return gemm_tflops(m, logical_n, k, elapsed_ms)
 
 
 def padded_n_for_m(m: int, logical_n: int) -> int:
@@ -420,6 +449,37 @@ def padded_n_for_m(m: int, logical_n: int) -> int:
 def padded_n_for_m_tk(m: int, logical_n: int) -> int:
     """We need a separate function because TK runs in 256 col blocks only"""
     return round_up(logical_n, 256)
+
+
+def padded_m_for_rank(local_m: int) -> int:
+    """Round one rank's A shard up to the kernel's row granularity.
+
+    The kernel walks each rank's shard in ROW_BLOCK=128 row tiles and hands
+    one tile to each CTA of its 2-CTA cluster, so a shard must be a multiple
+    of 256 rows. Padding per rank rather than globally keeps every shard at
+    the same offset in the all-gathered buffer. TK tiles rows in 256-row
+    blocks too, so it needs no separate variant the way N does.
+    """
+    return round_up(local_m, 256)
+
+
+def unpad_rows(
+    c: torch.Tensor,
+    local_m: int,
+    padded_local_m: int,
+    world_size: int,
+    logical_n: int,
+) -> torch.Tensor:
+    """Return the logical [M, logical_n] block of a row/column padded C.
+
+    Each rank contributes padded_local_m rows to the all-gathered output but
+    only the first local_m of them carry real data, so the padding rows sit
+    between rank shards rather than after the last one.
+    """
+    if padded_local_m == local_m:
+        return c[:, :logical_n]
+    rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
+    return rows.reshape(world_size * local_m, logical_n)
 
 
 def benchmark_cuda(
@@ -451,8 +511,6 @@ def benchmark_cuda(
 
 
 def main() -> int:
-    # The four-rank configuration selects a different projection width.
-    global LOGICAL_N
     args = parse_args()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -467,13 +525,6 @@ def main() -> int:
     world_size = dist.get_world_size()
     is_chief = rank == 0
 
-    assert world_size == 4 or world_size == 8, f"{world_size=} is not 4 or 8"
-
-    if IS_KDA:
-        LOGICAL_N = (4 * 12288 + 96) // world_size + 128
-    else:
-        LOGICAL_N = 576 + 1536 + 12288 // world_size
-
     if local_world_size != world_size:
         raise RuntimeError(
             "ag_gemm_kda_mla is an intra-node test and requires "
@@ -481,14 +532,25 @@ def main() -> int:
         )
 
     mod = load_module.load("ag_gemm_kda_mla")
+    projections = [
+        (name, logical_n)
+        for name, logical_n in PROJECTIONS
+        if name in args.projections
+    ]
     all_correct = True
 
-    for m in GLOBAL_M:
+    # Sweep every projection in one launch. product() puts M on the inner
+    # axis, so each projection's shapes stay grouped in the output.
+    for (projection, logical_n), m in product(projections, GLOBAL_M):
         if m % world_size != 0:
             raise ValueError(f"global M={m} is not divisible by {world_size=}")
 
         local_m = m // world_size
-        padded_n = padded_n_for_m(m, LOGICAL_N)
+        padded_local_m = padded_m_for_rank(local_m)
+        padded_m = padded_local_m * world_size
+        # The kernel dispatches its tile shape on the padded M it is handed,
+        # so the column padding has to be keyed on the same value.
+        padded_n = padded_n_for_m(padded_m, logical_n)
 
         # Reference tensors retain the original, unpadded problem shapes.
         torch.manual_seed(42 + rank)
@@ -498,46 +560,52 @@ def main() -> int:
         ) / (K**0.25)
         A_ref = torch.empty((m, K), device="cuda", dtype=torch.bfloat16)
         B_ref = torch.randn(
-            (K, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (K, logical_n), device="cuda", dtype=torch.bfloat16
         ) / (K**0.25)
         C_ref = torch.empty(
-            (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (m, logical_n), device="cuda", dtype=torch.bfloat16
         )
 
         dist.all_gather_into_tensor(A_ref, A_ref_local)
         torch.mm(A_ref, B_ref, out=C_ref)
 
-        # The modified implementation gets its own tensors. A already meets
-        # the kernel's K/row requirements, so only B and C need N padding.
+        # The modified implementation gets its own tensors: A's shard is
+        # padded up in rows, B and C in columns, and C in both. The padding
+        # rows are zero, so they contribute zero to C and cost only the tiles
+        # the kernel spends on them.
         A_kernel = mod.DistBuffer(
-            (local_m, K),
+            (padded_local_m, K),
             dtype=torch.bfloat16,
             local_rank=local_rank,
             local_world_size=local_world_size,
             multicast=True,
         )
-        A_kernel.data_.copy_(A_ref_local)
+        A_kernel.data_.zero_()
+        A_kernel.data_[:local_m].copy_(A_ref_local)
         A_local_buf = torch.empty(
-            (m, K), device="cuda", dtype=torch.bfloat16
+            (padded_m, K), device="cuda", dtype=torch.bfloat16
         )
 
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
         )
-        B_kernel[:, :LOGICAL_N].copy_(B_ref)
+        B_kernel[:, :logical_n].copy_(B_ref)
         C_kernel = torch.zeros(
-            (m, padded_n), device="cuda", dtype=torch.bfloat16
+            (padded_m, padded_n), device="cuda", dtype=torch.bfloat16
         )
 
         dist.barrier()
         mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
         torch.cuda.synchronize()
 
-        # Ignore the padded output columns and compare the original 6284-wide
-        # result against the unpadded PyTorch reference.
+        # Drop the padded rows and columns and compare the logical
+        # M x logical_n result against the unpadded PyTorch reference.
         is_correct = check_close(
-            f"ag-gemm-kda-mla M={m} N={LOGICAL_N} padded_n={padded_n}",
-            C_kernel[:, :LOGICAL_N],
+            f"ag-gemm-kda-mla {projection} M={m} N={logical_n} "
+            f"padded_m={padded_m} padded_n={padded_n}",
+            unpad_rows(
+                C_kernel, local_m, padded_local_m, world_size, logical_n
+            ),
             C_ref,
         )
         all_correct = all_correct and is_correct
@@ -545,8 +613,8 @@ def main() -> int:
         if is_chief:
             status = "passed :)" if is_correct else "FAILED :("
             print(
-                f"M={m} local_m={local_m} N={LOGICAL_N} "
-                f"padded_n={padded_n}: {status}",
+                f"{projection} M={m} local_m={local_m} N={logical_n} "
+                f"padded_m={padded_m} padded_n={padded_n}: {status}",
                 flush=True,
             )
 
@@ -591,22 +659,32 @@ def main() -> int:
 
     # Allocate fresh tensors for the benchmark pass so no performance result
     # is emitted until the complete correctness suite has passed.
-    for m in GLOBAL_M:
+    for (projection, logical_n), m in product(projections, GLOBAL_M):
+        if is_chief and m == GLOBAL_M[0]:
+            print(
+                f"\n===== {projection}: logical N={logical_n} =====",
+                flush=True,
+            )
         local_m = m // world_size
-        padded_n = padded_n_for_m(m, LOGICAL_N)
-        tk_padded_n = padded_n_for_m_tk(m, LOGICAL_N)
+        padded_local_m = padded_m_for_rank(local_m)
+        padded_m = padded_local_m * world_size
+        padded_n = padded_n_for_m(padded_m, logical_n)
+        tk_padded_n = padded_n_for_m_tk(padded_m, logical_n)
+        cutlass_tiler_match = matched_cutlass_tiler(padded_m)
 
         cutlass_ms = None
         cutlass_tiler = None
         cutlass_tune_log = []
         if cutlass_ok:
             try:
+                # hand the raw values to cutlass to let it handle on its own?
                 cutlass_ms, cutlass_tiler, cutlass_tune_log = cutlass_benchmark(
                     m=m,
                     n=padded_n,
                     k=K,
                     warmup=args.warmup,
                     iterations=args.iters,
+                    matched_tiler=cutlass_tiler_match,
                 )
             except Exception as exc:
                 cutlass_why = f"{type(exc).__name__}: {exc}"
@@ -619,7 +697,8 @@ def main() -> int:
                 cutlass_ms = None
                 if is_chief:
                     print(
-                        f"  [skip] CUTLASS M={m} N={padded_n}: "
+                        f"  [skip] CUTLASS {projection} M={m} "
+                        f"N={padded_n}: "
                         f"{cutlass_why or 'failed on a peer'}",
                         flush=True,
                     )
@@ -630,7 +709,8 @@ def main() -> int:
                     else "matched to mKernel"
                 )
                 print(
-                    f"  CUTLASS config M={m}: mma_tiler_mn={cutlass_tiler} "
+                    f"  CUTLASS config {projection} M={m}: "
+                    f"mma_tiler_mn={cutlass_tiler} "
                     f"cluster_shape_mn={_CUTLASS_CLUSTER_SHAPE} ({tune_note})",
                     flush=True,
                 )
@@ -639,12 +719,12 @@ def main() -> int:
                         cutlass_tune_log, key=lambda item: item[1]
                     ):
                         mark = " <- best" if tiler == cutlass_tiler else ""
-                        if tiler == matched_cutlass_tiler(m):
+                        if tiler == cutlass_tiler_match:
                             mark += " (matches mKernel tile)"
                         print(
                             f"    [autotune] mma_tiler_mn={tiler}: "
                             f"{tune_ms:8.3f} ms  "
-                            f"{useful_tflops(m, K, tune_ms):8.2f} "
+                            f"{useful_tflops(m, logical_n, K, tune_ms):8.2f} "
                             f"TFLOP/s{mark}",
                             flush=True,
                         )
@@ -656,30 +736,50 @@ def main() -> int:
         ) / (K**0.25)
         A_ref = torch.empty((m, K), device="cuda", dtype=torch.bfloat16)
         B_ref = torch.randn(
-            (K, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (K, logical_n), device="cuda", dtype=torch.bfloat16
         ) / (K**0.25)
         C_ref = torch.empty(
-            (m, LOGICAL_N), device="cuda", dtype=torch.bfloat16
+            (m, logical_n), device="cuda", dtype=torch.bfloat16
         )
 
+        # Both fused kernels consume a row-padded shard; the shard is shared
+        # because their 256-row granularity is the same.
+        if padded_local_m == local_m:
+            A_local_padded = A_ref_local
+        else:
+            A_local_padded = torch.zeros(
+                (padded_local_m, K), device="cuda", dtype=torch.bfloat16
+            )
+            A_local_padded[:local_m].copy_(A_ref_local)
+
         A_kernel = mod.DistBuffer(
-            (local_m, K),
+            (padded_local_m, K),
             dtype=torch.bfloat16,
             local_rank=local_rank,
             local_world_size=local_world_size,
             multicast=True,
         )
-        A_kernel.data_.copy_(A_ref_local)
+        A_kernel.data_.copy_(A_local_padded)
         A_local_buf = torch.empty(
-            (m, K), device="cuda", dtype=torch.bfloat16
+            (padded_m, K), device="cuda", dtype=torch.bfloat16
         )
         B_kernel = torch.zeros(
             (K, padded_n), device="cuda", dtype=torch.bfloat16
         )
-        B_kernel[:, :LOGICAL_N].copy_(B_ref)
+        B_kernel[:, :logical_n].copy_(B_ref)
         C_kernel = torch.zeros(
-            (m, padded_n), device="cuda", dtype=torch.bfloat16
+            (padded_m, padded_n), device="cuda", dtype=torch.bfloat16
         )
+
+        # cuBLAS is not bound by the kernel's row granularity, so its padded
+        # baseline keeps the logical M and needs its own output whenever the
+        # kernel's C carries per-rank row padding.
+        if padded_m == m:
+            C_padded = C_kernel
+        else:
+            C_padded = torch.zeros(
+                (m, padded_n), device="cuda", dtype=torch.bfloat16
+            )
 
         # ag_gemm_b200.cu only tiles N in 256-column blocks, so a B padded to
         # mKernel's 128-column block crashes it. Give TK its own operand
@@ -690,7 +790,7 @@ def main() -> int:
             B_tk = torch.zeros(
                 (K, tk_padded_n), device="cuda", dtype=torch.bfloat16
             )
-            B_tk[:, :LOGICAL_N].copy_(B_ref)
+            B_tk[:, :logical_n].copy_(B_ref)
 
         def run_all_gather() -> None:
             dist.all_gather_into_tensor(A_ref, A_ref_local)
@@ -699,7 +799,7 @@ def main() -> int:
             torch.mm(A_ref, B_ref, out=C_ref)
 
         def run_cublas_padded() -> None:
-            torch.mm(A_ref, B_kernel, out=C_kernel)
+            torch.mm(A_ref, B_kernel, out=C_padded)
 
         def run_baseline_logical() -> None:
             run_all_gather()
@@ -718,12 +818,12 @@ def main() -> int:
         if tk_ok:
             try:
                 tk_state = make_tk_state(
-                    m=m,
+                    m=padded_m,
                     k=K,
                     n=tk_padded_n,
                     local_rank=local_rank,
                     world_size=world_size,
-                    a_local=A_ref_local,
+                    a_local=A_local_padded,
                     b=B_tk,
                 )
             except Exception as exc:
@@ -737,7 +837,8 @@ def main() -> int:
                 tk_state = None
                 if is_chief:
                     print(
-                        f"  [skip] ThunderKittens M={m} N={tk_padded_n}: "
+                        f"  [skip] ThunderKittens {projection} M={padded_m} "
+                        f"N={tk_padded_n}: "
                         f"{tk_why or 'failed on a peer'}",
                         flush=True,
                     )
@@ -751,12 +852,19 @@ def main() -> int:
                 launch_tk(tk_state, check_comm_sms)
                 torch.cuda.synchronize()
                 if not check_close(
-                    f"ThunderKittens AG-GEMM M={m}",
-                    tk_state["c"][:, :LOGICAL_N],
+                    f"ThunderKittens AG-GEMM {projection} M={m}",
+                    unpad_rows(
+                        tk_state["c"],
+                        local_m,
+                        padded_local_m,
+                        world_size,
+                        logical_n,
+                    ),
                     C_ref,
                 ):
                     raise RuntimeError(
-                        f"ThunderKittens correctness failed at M={m} "
+                        f"ThunderKittens correctness failed at "
+                        f"{projection} M={m} padded_m={padded_m} "
                         f"N={tk_padded_n}"
                     )
 
@@ -772,7 +880,7 @@ def main() -> int:
                         else f"set by {_TK_ENV_COMM_SMS}"
                     )
                     print(
-                        f"  ThunderKittens config M={m}: "
+                        f"  ThunderKittens config {projection} M={m}: "
                         f"num_comm_sms={tk_comm_sms} ({tune_note})",
                         flush=True,
                     )
@@ -781,11 +889,13 @@ def main() -> int:
                             tk_tune_log, key=lambda item: item[1]
                         ):
                             mark = " <- best" if comm_sms == tk_comm_sms else ""
+                            tune_tflops = useful_tflops(
+                                m, logical_n, K, tune_ms
+                            )
                             print(
                                 f"    [autotune] num_comm_sms={comm_sms}: "
                                 f"{tune_ms:8.3f} ms  "
-                                f"{useful_tflops(m, K, tune_ms):8.2f} "
-                                f"TFLOP/s{mark}",
+                                f"{tune_tflops:8.2f} TFLOP/s{mark}",
                                 flush=True,
                             )
 
@@ -817,43 +927,46 @@ def main() -> int:
 
         if is_chief:
             print(
-                f"M={m} local_m={local_m} N={LOGICAL_N} "
-                f"padded_n={padded_n} tk_padded_n={tk_padded_n}  "
-                f"(TFLOP/s scored on the logical N={LOGICAL_N})\n"
+                f"{projection} M={m} local_m={local_m} N={logical_n} "
+                f"padded_m={padded_m} padded_n={padded_n} "
+                f"tk_padded_n={tk_padded_n}  "
+                f"(TFLOP/s scored on the logical M={m} N={logical_n})\n"
                 f"  {'NCCL all-gather':<26} {all_gather_ms:8.3f} ms\n"
-                f"  {f'cuBLAS N={LOGICAL_N}':<26} {cublas_logical_ms:8.3f} ms  "
-                f"{useful_tflops(m, K, cublas_logical_ms):8.2f} "
+                f"  {f'cuBLAS N={logical_n}':<26} {cublas_logical_ms:8.3f} ms  "
+                f"{useful_tflops(m, logical_n, K, cublas_logical_ms):8.2f} "
                 f"TFLOP/s\n"
                 f"  {f'cuBLAS N={padded_n}':<26} {cublas_padded_ms:8.3f} ms  "
-                f"{useful_tflops(m, K, cublas_padded_ms):8.2f} "
+                f"{useful_tflops(m, logical_n, K, cublas_padded_ms):8.2f} "
                 f"TFLOP/s\n"
-                f"  {f'cuBLAS + NCCL N={LOGICAL_N}':<26} "
+                f"  {f'cuBLAS + NCCL N={logical_n}':<26} "
                 f"{baseline_logical_ms:8.3f} ms  "
-                f"{useful_tflops(m, K, baseline_logical_ms):8.2f} "
+                f"{useful_tflops(m, logical_n, K, baseline_logical_ms):8.2f} "
                 f"TFLOP/s\n"
                 f"  {f'cuBLAS + NCCL N={padded_n}':<26} "
                 f"{baseline_padded_ms:8.3f} ms  "
-                f"{useful_tflops(m, K, baseline_padded_ms):8.2f} "
+                f"{useful_tflops(m, logical_n, K, baseline_padded_ms):8.2f} "
                 f"TFLOP/s  (matched baseline)",
                 flush=True,
             )
             if cutlass_ms is not None:
                 print(
                     f"  {'CUTLASS AG-GEMM':<26} {cutlass_ms:8.3f} ms  "
-                    f"{useful_tflops(m, K, cutlass_ms):8.2f} TFLOP/s  "
+                    f"{useful_tflops(m, logical_n, K, cutlass_ms):8.2f} "
+                    f"TFLOP/s  "
                     f"({baseline_padded_ms / cutlass_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             if tk_ms is not None:
                 print(
                     f"  {'ThunderKittens AG-GEMM':<26} {tk_ms:8.3f} ms  "
-                    f"{useful_tflops(m, K, tk_ms):8.2f} TFLOP/s  "
+                    f"{useful_tflops(m, logical_n, K, tk_ms):8.2f} "
+                    f"TFLOP/s  "
                     f"({baseline_padded_ms / tk_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             kernel_line = (
                 f"  {'ag_gemm_kda_mla':<26} {kernel_ms:8.3f} ms  "
-                f"{useful_tflops(m, K, kernel_ms):8.2f} TFLOP/s  "
+                f"{useful_tflops(m, logical_n, K, kernel_ms):8.2f} TFLOP/s  "
                 f"({relative_performance:6.3f}x vs matched, "
                 f"{logical_relative_performance:6.3f}x vs logical)"
             )
@@ -871,8 +984,8 @@ def main() -> int:
                 )
             print(kernel_line, flush=True)
 
-        del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_local_buf, B_kernel, C_kernel, B_tk
+        del A_ref_local, A_ref, B_ref, C_ref, A_local_padded
+        del A_kernel, A_local_buf, B_kernel, C_kernel, C_padded, B_tk
         tk_state = None
         dist.barrier()
 
