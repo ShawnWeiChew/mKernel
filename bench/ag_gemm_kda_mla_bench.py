@@ -401,9 +401,25 @@ def gemm_tflops(m: int, n: int, k: int, elapsed_ms: float) -> float:
     return 2.0 * m * n * k / (elapsed_ms * 1.0e9)
 
 
+def useful_tflops(m: int, k: int, elapsed_ms: float) -> float:
+    """Return throughput over the logical problem only.
+
+    Every candidate pads N to whatever its own tiler requires, and each pads
+    by a different amount. Charging each implementation for the columns it
+    happened to pad rewards the one that pads most, so score all of them on
+    the 2*M*LOGICAL_N*K the model actually needs.
+    """
+    return gemm_tflops(m, LOGICAL_N, k, elapsed_ms)
+
+
 def padded_n_for_m(m: int, logical_n: int) -> int:
     col_block = 128 if m < 4096 else 256
     return round_up(logical_n, col_block)
+
+
+def padded_n_for_m_tk(m: int, logical_n: int) -> int:
+    """We need a separate function because TK runs in 256 col blocks only"""
+    return round_up(logical_n, 256)
 
 
 def benchmark_cuda(
@@ -578,6 +594,7 @@ def main() -> int:
     for m in GLOBAL_M:
         local_m = m // world_size
         padded_n = padded_n_for_m(m, LOGICAL_N)
+        tk_padded_n = padded_n_for_m_tk(m, LOGICAL_N)
 
         cutlass_ms = None
         cutlass_tiler = None
@@ -627,7 +644,7 @@ def main() -> int:
                         print(
                             f"    [autotune] mma_tiler_mn={tiler}: "
                             f"{tune_ms:8.3f} ms  "
-                            f"{gemm_tflops(m, padded_n, K, tune_ms):8.2f} "
+                            f"{useful_tflops(m, K, tune_ms):8.2f} "
                             f"TFLOP/s{mark}",
                             flush=True,
                         )
@@ -664,6 +681,17 @@ def main() -> int:
             (m, padded_n), device="cuda", dtype=torch.bfloat16
         )
 
+        # ag_gemm_b200.cu only tiles N in 256-column blocks, so a B padded to
+        # mKernel's 128-column block crashes it. Give TK its own operand
+        # whenever the two paddings disagree.
+        if tk_padded_n == padded_n:
+            B_tk = B_kernel
+        else:
+            B_tk = torch.zeros(
+                (K, tk_padded_n), device="cuda", dtype=torch.bfloat16
+            )
+            B_tk[:, :LOGICAL_N].copy_(B_ref)
+
         def run_all_gather() -> None:
             dist.all_gather_into_tensor(A_ref, A_ref_local)
 
@@ -692,11 +720,11 @@ def main() -> int:
                 tk_state = make_tk_state(
                     m=m,
                     k=K,
-                    n=padded_n,
+                    n=tk_padded_n,
                     local_rank=local_rank,
                     world_size=world_size,
                     a_local=A_ref_local,
-                    b=B_kernel,
+                    b=B_tk,
                 )
             except Exception as exc:
                 tk_why = f"{type(exc).__name__}: {exc}"
@@ -709,7 +737,7 @@ def main() -> int:
                 tk_state = None
                 if is_chief:
                     print(
-                        f"  [skip] ThunderKittens M={m} N={padded_n}: "
+                        f"  [skip] ThunderKittens M={m} N={tk_padded_n}: "
                         f"{tk_why or 'failed on a peer'}",
                         flush=True,
                     )
@@ -728,7 +756,8 @@ def main() -> int:
                     C_ref,
                 ):
                     raise RuntimeError(
-                        f"ThunderKittens correctness failed at M={m} N={padded_n}"
+                        f"ThunderKittens correctness failed at M={m} "
+                        f"N={tk_padded_n}"
                     )
 
                 tk_comm_sms, tk_tune_log = tune_tk_comm_sms(
@@ -755,7 +784,7 @@ def main() -> int:
                             print(
                                 f"    [autotune] num_comm_sms={comm_sms}: "
                                 f"{tune_ms:8.3f} ms  "
-                                f"{gemm_tflops(m, padded_n, K, tune_ms):8.2f} "
+                                f"{useful_tflops(m, K, tune_ms):8.2f} "
                                 f"TFLOP/s{mark}",
                                 flush=True,
                             )
@@ -789,41 +818,42 @@ def main() -> int:
         if is_chief:
             print(
                 f"M={m} local_m={local_m} N={LOGICAL_N} "
-                f"padded_n={padded_n}\n"
+                f"padded_n={padded_n} tk_padded_n={tk_padded_n}  "
+                f"(TFLOP/s scored on the logical N={LOGICAL_N})\n"
                 f"  {'NCCL all-gather':<26} {all_gather_ms:8.3f} ms\n"
                 f"  {f'cuBLAS N={LOGICAL_N}':<26} {cublas_logical_ms:8.3f} ms  "
-                f"{gemm_tflops(m, LOGICAL_N, K, cublas_logical_ms):8.2f} "
+                f"{useful_tflops(m, K, cublas_logical_ms):8.2f} "
                 f"TFLOP/s\n"
                 f"  {f'cuBLAS N={padded_n}':<26} {cublas_padded_ms:8.3f} ms  "
-                f"{gemm_tflops(m, padded_n, K, cublas_padded_ms):8.2f} "
+                f"{useful_tflops(m, K, cublas_padded_ms):8.2f} "
                 f"TFLOP/s\n"
                 f"  {f'cuBLAS + NCCL N={LOGICAL_N}':<26} "
                 f"{baseline_logical_ms:8.3f} ms  "
-                f"{gemm_tflops(m, LOGICAL_N, K, baseline_logical_ms):8.2f} "
+                f"{useful_tflops(m, K, baseline_logical_ms):8.2f} "
                 f"TFLOP/s\n"
                 f"  {f'cuBLAS + NCCL N={padded_n}':<26} "
                 f"{baseline_padded_ms:8.3f} ms  "
-                f"{gemm_tflops(m, padded_n, K, baseline_padded_ms):8.2f} "
+                f"{useful_tflops(m, K, baseline_padded_ms):8.2f} "
                 f"TFLOP/s  (matched baseline)",
                 flush=True,
             )
             if cutlass_ms is not None:
                 print(
                     f"  {'CUTLASS AG-GEMM':<26} {cutlass_ms:8.3f} ms  "
-                    f"{gemm_tflops(m, padded_n, K, cutlass_ms):8.2f} TFLOP/s  "
+                    f"{useful_tflops(m, K, cutlass_ms):8.2f} TFLOP/s  "
                     f"({baseline_padded_ms / cutlass_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             if tk_ms is not None:
                 print(
                     f"  {'ThunderKittens AG-GEMM':<26} {tk_ms:8.3f} ms  "
-                    f"{gemm_tflops(m, padded_n, K, tk_ms):8.2f} TFLOP/s  "
+                    f"{useful_tflops(m, K, tk_ms):8.2f} TFLOP/s  "
                     f"({baseline_padded_ms / tk_ms:6.3f}x vs matched)",
                     flush=True,
                 )
             kernel_line = (
                 f"  {'ag_gemm_kda_mla':<26} {kernel_ms:8.3f} ms  "
-                f"{gemm_tflops(m, padded_n, K, kernel_ms):8.2f} TFLOP/s  "
+                f"{useful_tflops(m, K, kernel_ms):8.2f} TFLOP/s  "
                 f"({relative_performance:6.3f}x vs matched, "
                 f"{logical_relative_performance:6.3f}x vs logical)"
             )
@@ -842,7 +872,7 @@ def main() -> int:
             print(kernel_line, flush=True)
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_local_buf, B_kernel, C_kernel
+        del A_kernel, A_local_buf, B_kernel, C_kernel, B_tk
         tk_state = None
         dist.barrier()
 
