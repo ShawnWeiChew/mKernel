@@ -449,24 +449,6 @@ def benchmark_cuda(
     return float(rank_ms.item())
 
 
-def williams_orders(items):
-    """Balanced Latin square (Williams design) over `items`.
-
-    Same construction as bench/gemm_ar_blackwell_bench.py. Returns len(items)
-    orderings in which every condition occupies every position exactly once, so
-    no implementation is systematically measured first (cold clock) or last (hot
-    part). Every row is the first row shifted, which keeps the order identical
-    on every rank -- it has to be, because each condition is collective.
-    """
-    n = len(items)
-    first, lo, hi = [], 0, n - 1
-    while lo <= hi:
-        first.append(lo)
-        if lo != hi:
-            first.append(hi)
-        lo, hi = lo + 1, hi - 1
-    return [tuple(items[(v + r) % n] for v in first) for r in range(n)]
-
 
 def counterbalanced_sweeps(candidates):
     """Candidate orders that give every candidate the same average position.
@@ -497,15 +479,26 @@ def tuning_result(samples):
     return [(cand, min(times)) for cand, times in samples.items()]
 
 
-def sync_ranks() -> None:
-    """Drain the local stream, then line every rank up on the host.
+def tune_supergroup_width(mod, run_with_width, *, warmup: int, iterations: int):
+    """Pick the kernel's supergroup width, the way the other two are tuned.
 
-    Each timed iteration then starts from an idle stream on every rank. Without
-    it a back-to-back loop hides launch overhead behind the queue and lets ranks
-    self-synchronize, which flatters whichever condition is measured that way.
+    The widths the .so was built with are the only launchable ones -- the
+    swizzle divides by the width on every tile, so each is a separate
+    instantiation -- and mod.SUPERGROUP_WIDTHS is that list.
     """
-    torch.cuda.synchronize()
-    dist.barrier()
+    candidates = tuple(getattr(mod, "SUPERGROUP_WIDTHS", ()) or ())
+    if not candidates:
+        return 0, []                       # .so predates the dispatch
+    samples = {w: [] for w in candidates}
+    for sweep in counterbalanced_sweeps(candidates):
+        for width in sweep:
+            samples[width].append(
+                benchmark_cuda(lambda w=width: run_with_width(w), warmup, iterations)
+            )
+    timings = tuning_result(samples)
+    best_width, _ = min(timings, key=lambda item: item[1])
+    return best_width, timings
+
 
 
 def cooldown(seconds: float) -> None:
@@ -516,23 +509,6 @@ def cooldown(seconds: float) -> None:
         time.sleep(seconds)
 
 
-def elapsed_ms(samples):
-    """Drain (start, end) cuda event pairs into per-iter wall times (ms)."""
-    return [s.elapsed_time(e) for s, e in samples]
-
-
-def median_then_max(samples) -> float:
-    """Median over iterations per rank, then the slowest rank.
-
-    Median rather than mean because a single descheduled iteration should not
-    move the number; max across ranks because end-to-end latency is gated by
-    the slowest rank.
-    """
-    ordered = sorted(float(x) for x in samples)
-    median = ordered[len(ordered) // 2]
-    t = torch.tensor([median], dtype=torch.float64, device="cuda")
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return float(t.item())
 
 
 def bench_shape_order(shapes, seed: int):
@@ -707,10 +683,10 @@ def main() -> int:
         cutlass_tiler = None
         cutlass_tune_log = []
         if cutlass_ok:
-            # CUTLASS owns its loop: upstream run() captures a graph and replays
-            # it back to back, so it cannot join the rotation below. Bracket it
-            # with the same cooldowns at least, and see kernel_b2b_ms for the
-            # like-for-like number.
+            # CUTLASS owns its loop -- upstream run() captures a graph and
+            # replays it back to back inside its own event pair -- which is the
+            # discipline every condition below is now measured with, so its
+            # number is directly comparable. Same cooldown around it.
             cooldown(args.cooldown)
             try:
                 cutlass_ms, cutlass_tiler, cutlass_tune_log = cutlass_benchmark(
@@ -810,8 +786,16 @@ def main() -> int:
             run_all_gather()
             run_cublas_padded()
 
+        # 0 until tuned, which means the width the .so was built with. The
+        # closure reads it at call time, so tuning below retargets both this and
+        # the timed loop.
+        kernel_width = 0
+
+        def run_kernel_with(width: int) -> None:
+            mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel, 0, width)
+
         def run_kernel() -> None:
-            mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
+            run_kernel_with(kernel_width)
 
         tk_state = None
         tk_comm_sms = None
@@ -889,11 +873,28 @@ def main() -> int:
                                 flush=True,
                             )
 
-        # Interleaved measurement, as in bench/gemm_ar_blackwell_bench.py.
-        # Measuring each condition to completion in turn confounds the
-        # implementation with the thermal and clock state it happened to run in:
-        # the first one measured gets a cold part, the last one a soaked one. A
-        # balanced rotation gives every condition every position instead.
+        # Tune the kernel's own knob, as CUTLASS and TK tune theirs above, then
+        # measure everything at its best config.
+        cooldown(args.cooldown)
+        tune_w = min(2, args.warmup)
+        tune_i = min(5, args.iters)
+        kernel_width, width_tune_log = tune_supergroup_width(
+            mod, run_kernel_with, warmup=tune_w, iterations=tune_i
+        )
+        if is_chief and width_tune_log:
+            print(f"  ag_gemm_kda_mla config M={m}: supergroup_width={kernel_width} "
+                  f"(autotuned)", flush=True)
+            for width, tune_ms in sorted(width_tune_log, key=lambda item: item[1]):
+                mark = " <- best" if width == kernel_width else ""
+                print(f"    [autotune] supergroup_width={width}: {tune_ms:8.3f} ms  "
+                      f"{gemm_tflops(m, padded_n, K, tune_ms):8.2f} TFLOP/s{mark}",
+                      flush=True)
+
+        # Every condition is measured the same way: warm up, then time N
+        # launches back to back inside one event pair. That is exactly how
+        # upstream CUTLASS times itself (warmup replays, then one event pair
+        # around `iterations` graph replays), so every row of the table below is
+        # directly comparable to every other.
         launchers = {
             "all_gather": run_all_gather,
             "cublas_logical": run_cublas_logical,
@@ -904,38 +905,12 @@ def main() -> int:
         }
         if tk_state is not None:
             launchers["tk"] = lambda: launch_tk(tk_state, tk_comm_sms)
-        conditions = tuple(launchers)
-
-        ORDERS = williams_orders(conditions)
-        # A whole number of rotations, so the balancing is exact rather than
-        # approximate -- the last partial rotation would favour whatever sits
-        # early in it.
-        iterations = max(1, round(args.iters / len(ORDERS))) * len(ORDERS)
-
-        cooldown(args.cooldown)
-        # Warm on the rotation the timed loop uses, so no condition pays another
-        # condition's cold start once measurement begins.
-        for it in range(args.warmup):
-            for cond in ORDERS[it % len(ORDERS)]:
-                sync_ranks()
-                launchers[cond]()
-        cooldown(args.cooldown)
-
-        samples = {c: [] for c in conditions}
-        for it in range(iterations):
-            for cond in ORDERS[it % len(ORDERS)]:
-                sync_ranks()
-                s_ev = torch.cuda.Event(enable_timing=True)
-                e_ev = torch.cuda.Event(enable_timing=True)
-                s_ev.record()
-                launchers[cond]()
-                e_ev.record()
-                samples[cond].append((s_ev, e_ev))
-
-        # Events only read back once the stream has drained.
-        torch.cuda.synchronize()
-        dist.barrier()
-        timings = {c: median_then_max(elapsed_ms(samples[c])) for c in conditions}
+        # A cooldown before each one, so no implementation inherits the heat the
+        # previous one left behind.
+        timings = {}
+        for cond, launch in launchers.items():
+            cooldown(args.cooldown)
+            timings[cond] = benchmark_cuda(launch, args.warmup, args.iters)
 
         all_gather_ms = timings["all_gather"]
         cublas_logical_ms = timings["cublas_logical"]
@@ -945,14 +920,6 @@ def main() -> int:
         kernel_ms = timings["kernel"]
         tk_ms = timings.get("tk")
 
-        # Same kernel, measured the way CUTLASS measures itself: warm up, then
-        # time N launches back to back with no per-iteration sync. That hides
-        # launch overhead behind the queue, so the difference from kernel_ms is
-        # how much of this kernel's cost is exposed per launch rather than
-        # absorbed by a pipelined loop -- and it is the number to compare
-        # against CUTLASS's graph-replay timing.
-        cooldown(args.cooldown)
-        kernel_b2b_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
         relative_performance = baseline_padded_ms / kernel_ms
         logical_relative_performance = baseline_logical_ms / kernel_ms
 
@@ -1010,18 +977,6 @@ def main() -> int:
                     f"({verdict})"
                 )
             print(kernel_line, flush=True)
-            b2b_line = (
-                f"  {'ag_gemm_kda_mla (b2b)':<26} {kernel_b2b_ms:8.3f} ms  "
-                f"{gemm_tflops(m, padded_n, K, kernel_b2b_ms):8.2f} TFLOP/s  "
-                f"(back-to-back, no per-iter sync"
-            )
-            if cutlass_ms is not None:
-                verdict = "BEATS" if kernel_b2b_ms < cutlass_ms else "behind"
-                b2b_line += (
-                    f"; {cutlass_ms / kernel_b2b_ms:6.3f}x vs CUTLASS "
-                    f"({verdict}), like-for-like"
-                )
-            print(b2b_line + ")", flush=True)
 
         del A_ref_local, A_ref, B_ref, C_ref
         del A_kernel, A_local_buf, B_kernel, C_kernel
