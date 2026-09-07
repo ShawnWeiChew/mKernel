@@ -26,6 +26,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // otherwise deadlocks in the multicast path rather than erroring.
         m.attr("NUM_DEVICES") = (int)fg::NUM_DEVICES;
         m.attr("K") = (int)fg::K;
+        // Copy streams the staging all-gather is spread over. Exported so a
+        // bench can report which setting produced a number.
+        m.attr("A_COPY_STREAMS") = (int)ag_gemm_kda_mla::A_COPY_STREAMS;
 
         // Which warp plays which role. The renderer turns records into rows with
         // this, so exporting it keeps the plot honest if the warp specialisation

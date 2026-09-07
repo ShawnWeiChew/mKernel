@@ -676,6 +676,11 @@ def resolve_defaults(args):
         # upstream names them kernel_cutlass_*; leave the kernel's own run
         # unfiltered, its profiled region holds nothing else.
         args.ncu_kernel = "regex:cutlass" if cutlass else ""
+    if args.ncu_replay in ("range", "app-range"):
+        # Range modes profile the whole region as one result, so there is no
+        # per-launch identity left for a kernel filter to select. Everything
+        # launched inside the region lands in the aggregate instead.
+        args.ncu_kernel = ""
     if args.impl == "cutlass" and not (args.ncu or args.cutlass_tune_only):
         raise SystemExit(
             "--impl cutlass only profiles under ncu: add --ncu, or "

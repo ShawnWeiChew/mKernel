@@ -51,10 +51,29 @@ namespace ag_gemm_kda_mla {
 
 namespace {
 
+// The staging all-gather runs on the copy engines, not the SMs. A stream feeds
+// one engine, so issuing every shard on a single stream caps the gather at one
+// engine's bandwidth -- and the tile schedule starts consuming remote rows well
+// before the last shard would land at that rate, so the wait lands on the
+// critical path. Spreading the shards over several streams lets several engines
+// run concurrently.
+//
+// Override with -DMKERNEL_A_COPY_STREAMS=N; 1 restores the single-stream path.
+// More streams than peers buys nothing, so the count is clamped.
+#ifndef MKERNEL_A_COPY_STREAMS
+#define MKERNEL_A_COPY_STREAMS 4
+#endif
+constexpr int A_COPY_STREAMS_MAX = INTRA_NUM_DEVICES > 1 ? INTRA_NUM_DEVICES - 1 : 1;
+constexpr int A_COPY_STREAMS =
+    MKERNEL_A_COPY_STREAMS < 1
+        ? 1
+        : (MKERNEL_A_COPY_STREAMS > A_COPY_STREAMS_MAX ? A_COPY_STREAMS_MAX
+                                                       : MKERNEL_A_COPY_STREAMS);
+
 // Process-lifetime resources, one set per local CUDA device. This extension
 // uses one host process per GPU, and launches are serialized by that process.
 struct ACopyPipelineState {
-    cudaStream_t stream = nullptr;
+    cudaStream_t streams[A_COPY_STREAMS] = {};
     cudaEvent_t main_pre_event = nullptr;
     uint32_t* ready = nullptr;
     uint32_t epoch = 0;
@@ -82,7 +101,10 @@ ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
 inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     ACopyPipelineState& state = A_copy_states[dev_idx];
     if (!state.initialized) {
-        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
+        for (int i = 0; i < A_COPY_STREAMS; ++i) {
+            MKERNEL_CUDACHECK(
+                cudaStreamCreateWithFlags(&state.streams[i], cudaStreamNonBlocking));
+        }
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaMemset(state.ready, 0, INTRA_NUM_DEVICES * sizeof(uint32_t)));
@@ -556,12 +578,17 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     // prevents the copy stream from overwriting A_local_buf until the previous
     // persistent kernel on the caller stream has finished consuming it.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
-    MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
+    for (int i = 0; i < A_COPY_STREAMS; ++i) {
+        MKERNEL_CUDACHECK(
+            cudaStreamWaitEvent(copy_state.streams[i], copy_state.main_pre_event, 0));
+    }
 
 #ifdef PROFILE_TIMINGS
     // Origin for this launch's copy offsets, after the wait on the caller stream
     // so it marks when the copy stream actually began working.
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_ref, copy_state.stream));
+    // Every copy stream waits on the same pre-event, so one origin recorded on
+    // the first of them still dates the whole gather.
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_ref, copy_state.streams[0]));
     for (int i = 0; i < fg::NUM_DEVICES; ++i) copy_state.prof_valid[i] = false;
 #endif
 
@@ -574,23 +601,28 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr;
+        // Round-robin by ring distance, so consecutive peers -- which the tile
+        // schedule also reaches in ring order -- land on different engines
+        // rather than queueing behind each other.
+        cudaStream_t copy_stream = copy_state.streams[(distance - 1) % A_COPY_STREAMS];
 
 #ifdef PROFILE_TIMINGS
-        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_begin[peer], copy_state.stream));
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_begin[peer], copy_stream));
 #endif
 
         MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_stream));
 
 #ifdef PROFILE_TIMINGS
-        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_end[peer], copy_state.stream));
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_end[peer], copy_stream));
         copy_state.prof_valid[peer] = true;
 #endif
 
         // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+        // before the completion epoch. Each shard's flag is written on the same
+        // stream that carried it, so a peer is announced when *its* copy is
+        // done rather than when every earlier one is.
+        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_stream),
                                              reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
                                              copy_state.epoch,
                                              CU_STREAM_WRITE_VALUE_DEFAULT));

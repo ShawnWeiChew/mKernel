@@ -1,8 +1,10 @@
 import argparse
 import importlib.util
 import os
+import random
 import sys
 import sysconfig
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +30,9 @@ LOGICAL_N = 6284
 
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
+# Idle time between phases and between shapes. A sleep only resets temperature
+# once the part is actually idle, so every cooldown drains the stream first.
+DEFAULT_COOLDOWN_S = 5.0
 
 
 ########## CUTLASS compatibility layer ##########
@@ -384,6 +389,19 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ITERS,
         help="timed iterations per implementation (default: %(default)s)",
     )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=DEFAULT_COOLDOWN_S,
+        help="idle seconds between phases and shapes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--shape-seed",
+        type=int,
+        default=0,
+        help="seed for the benchmark shape order; -1 keeps the declared "
+             "ascending order (default: %(default)s)",
+    )
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
@@ -432,6 +450,77 @@ def benchmark_cuda(
     dist.all_reduce(rank_ms, op=dist.ReduceOp.MAX)
     dist.barrier()
     return float(rank_ms.item())
+
+
+def williams_orders(items):
+    """Balanced Latin square (Williams design) over `items`.
+
+    Same construction as bench/gemm_ar_blackwell_bench.py. Returns len(items)
+    orderings in which every condition occupies every position exactly once, so
+    no implementation is systematically measured first (cold clock) or last (hot
+    part). Every row is the first row shifted, which keeps the order identical
+    on every rank -- it has to be, because each condition is collective.
+    """
+    n = len(items)
+    first, lo, hi = [], 0, n - 1
+    while lo <= hi:
+        first.append(lo)
+        if lo != hi:
+            first.append(hi)
+        lo, hi = lo + 1, hi - 1
+    return [tuple(items[(v + r) % n] for v in first) for r in range(n)]
+
+
+def sync_ranks() -> None:
+    """Drain the local stream, then line every rank up on the host.
+
+    Each timed iteration then starts from an idle stream on every rank. Without
+    it a back-to-back loop hides launch overhead behind the queue and lets ranks
+    self-synchronize, which flatters whichever condition is measured that way.
+    """
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def cooldown(seconds: float) -> None:
+    """Drain, line the ranks up, then idle so the next phase starts cool."""
+    torch.cuda.synchronize()
+    dist.barrier()
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def elapsed_ms(samples):
+    """Drain (start, end) cuda event pairs into per-iter wall times (ms)."""
+    return [s.elapsed_time(e) for s, e in samples]
+
+
+def median_then_max(samples) -> float:
+    """Median over iterations per rank, then the slowest rank.
+
+    Median rather than mean because a single descheduled iteration should not
+    move the number; max across ranks because end-to-end latency is gated by
+    the slowest rank.
+    """
+    ordered = sorted(float(x) for x in samples)
+    median = ordered[len(ordered) // 2]
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
+def bench_shape_order(shapes, seed: int):
+    """Shapes in a fixed but non-monotonic order, identical on every rank.
+
+    Running 2048 -> 32768 in ascending order confounds size with thermal state:
+    the largest shape is always measured on the hottest part. A seeded shuffle
+    breaks that correlation while staying reproducible across runs and ranks.
+    """
+    if seed < 0:
+        return list(shapes)
+    ordered = list(shapes)
+    random.Random(seed).shuffle(ordered)
+    return ordered
 
 
 def main() -> int:
@@ -575,7 +664,15 @@ def main() -> int:
 
     # Allocate fresh tensors for the benchmark pass so no performance result
     # is emitted until the complete correctness suite has passed.
-    for m in GLOBAL_M:
+    bench_shapes = bench_shape_order(GLOBAL_M, args.shape_seed)
+    if is_chief:
+        order = " ".join(str(x) for x in bench_shapes)
+        streams = getattr(mod, "A_COPY_STREAMS", None)
+        print(f"\nbenchmark shape order (seed {args.shape_seed}): {order}\n"
+              f"cooldown {args.cooldown:g}s between phases and shapes"
+              + (f" | A copy streams: {streams}" if streams else ""),
+              flush=True)
+    for m in bench_shapes:
         local_m = m // world_size
         padded_n = padded_n_for_m(m, LOGICAL_N)
 
@@ -583,6 +680,11 @@ def main() -> int:
         cutlass_tiler = None
         cutlass_tune_log = []
         if cutlass_ok:
+            # CUTLASS owns its loop: upstream run() captures a graph and replays
+            # it back to back, so it cannot join the rotation below. Bracket it
+            # with the same cooldowns at least, and see kernel_b2b_ms for the
+            # like-for-like number.
+            cooldown(args.cooldown)
             try:
                 cutlass_ms, cutlass_tiler, cutlass_tune_log = cutlass_benchmark(
                     m=m,
@@ -760,29 +862,70 @@ def main() -> int:
                                 flush=True,
                             )
 
-        all_gather_ms = benchmark_cuda(run_all_gather, args.warmup, args.iters)
-        cublas_logical_ms = benchmark_cuda(
-            run_cublas_logical, args.warmup, args.iters
-        )
-        cublas_padded_ms = benchmark_cuda(
-            run_cublas_padded, args.warmup, args.iters
-        )
-        baseline_logical_ms = benchmark_cuda(
-            run_baseline_logical, args.warmup, args.iters
-        )
-        baseline_padded_ms = benchmark_cuda(
-            run_baseline_padded, args.warmup, args.iters
-        )
-        kernel_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
-        tk_ms = (
-            benchmark_cuda(
-                lambda: launch_tk(tk_state, tk_comm_sms),
-                args.warmup,
-                args.iters,
-            )
-            if tk_state is not None
-            else None
-        )
+        # Interleaved measurement, as in bench/gemm_ar_blackwell_bench.py.
+        # Measuring each condition to completion in turn confounds the
+        # implementation with the thermal and clock state it happened to run in:
+        # the first one measured gets a cold part, the last one a soaked one. A
+        # balanced rotation gives every condition every position instead.
+        launchers = {
+            "all_gather": run_all_gather,
+            "cublas_logical": run_cublas_logical,
+            "cublas_padded": run_cublas_padded,
+            "baseline_logical": run_baseline_logical,
+            "baseline_padded": run_baseline_padded,
+            "kernel": run_kernel,
+        }
+        if tk_state is not None:
+            launchers["tk"] = lambda: launch_tk(tk_state, tk_comm_sms)
+        conditions = tuple(launchers)
+
+        ORDERS = williams_orders(conditions)
+        # A whole number of rotations, so the balancing is exact rather than
+        # approximate -- the last partial rotation would favour whatever sits
+        # early in it.
+        iterations = max(1, round(args.iters / len(ORDERS))) * len(ORDERS)
+
+        cooldown(args.cooldown)
+        # Warm on the rotation the timed loop uses, so no condition pays another
+        # condition's cold start once measurement begins.
+        for it in range(args.warmup):
+            for cond in ORDERS[it % len(ORDERS)]:
+                sync_ranks()
+                launchers[cond]()
+        cooldown(args.cooldown)
+
+        samples = {c: [] for c in conditions}
+        for it in range(iterations):
+            for cond in ORDERS[it % len(ORDERS)]:
+                sync_ranks()
+                s_ev = torch.cuda.Event(enable_timing=True)
+                e_ev = torch.cuda.Event(enable_timing=True)
+                s_ev.record()
+                launchers[cond]()
+                e_ev.record()
+                samples[cond].append((s_ev, e_ev))
+
+        # Events only read back once the stream has drained.
+        torch.cuda.synchronize()
+        dist.barrier()
+        timings = {c: median_then_max(elapsed_ms(samples[c])) for c in conditions}
+
+        all_gather_ms = timings["all_gather"]
+        cublas_logical_ms = timings["cublas_logical"]
+        cublas_padded_ms = timings["cublas_padded"]
+        baseline_logical_ms = timings["baseline_logical"]
+        baseline_padded_ms = timings["baseline_padded"]
+        kernel_ms = timings["kernel"]
+        tk_ms = timings.get("tk")
+
+        # Same kernel, measured the way CUTLASS measures itself: warm up, then
+        # time N launches back to back with no per-iteration sync. That hides
+        # launch overhead behind the queue, so the difference from kernel_ms is
+        # how much of this kernel's cost is exposed per launch rather than
+        # absorbed by a pipelined loop -- and it is the number to compare
+        # against CUTLASS's graph-replay timing.
+        cooldown(args.cooldown)
+        kernel_b2b_ms = benchmark_cuda(run_kernel, args.warmup, args.iters)
         relative_performance = baseline_padded_ms / kernel_ms
         logical_relative_performance = baseline_logical_ms / kernel_ms
 
@@ -840,11 +983,25 @@ def main() -> int:
                     f"({verdict})"
                 )
             print(kernel_line, flush=True)
+            b2b_line = (
+                f"  {'ag_gemm_kda_mla (b2b)':<26} {kernel_b2b_ms:8.3f} ms  "
+                f"{gemm_tflops(m, padded_n, K, kernel_b2b_ms):8.2f} TFLOP/s  "
+                f"(back-to-back, no per-iter sync"
+            )
+            if cutlass_ms is not None:
+                verdict = "BEATS" if kernel_b2b_ms < cutlass_ms else "behind"
+                b2b_line += (
+                    f"; {cutlass_ms / kernel_b2b_ms:6.3f}x vs CUTLASS "
+                    f"({verdict}), like-for-like"
+                )
+            print(b2b_line + ")", flush=True)
 
         del A_ref_local, A_ref, B_ref, C_ref
         del A_kernel, A_local_buf, B_kernel, C_kernel
         tk_state = None
-        dist.barrier()
+        # Between shapes, not just between phases: the next shape should not
+        # start on the heat this one left behind.
+        cooldown(args.cooldown)
 
     dist.destroy_process_group()
     return 0
