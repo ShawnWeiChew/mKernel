@@ -100,7 +100,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
 __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
 
@@ -321,7 +321,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                      tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
                      tile_id += num_comp_clusters) {
                     // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-                    auto [local_row_id, tile_col_idx] = calculate_tile_idx(
+                    auto [local_row_id, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
                         cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
                     int target_device = tile_id / cluster_tiles_per_device;
@@ -362,7 +362,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         for (int tile_id = cluster_idx; tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
              tile_id += num_comp_clusters) {
             // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-            auto [local_tile_row, tile_col_idx] = calculate_tile_idx(
+            auto [local_tile_row, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
                 cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
             const int target_device =
@@ -394,14 +394,14 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     }
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
 __global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_THREADS, 1) void fused_kernel_stub(
         const __grid_constant__ fused_globals<_ROW_BLOCK, _COL_BLOCK> G) {
-    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK>(G);
+    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, SUPERGROUP_WIDTH>(G);
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
 inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -451,7 +451,7 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK>;
+    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, SUPERGROUP_WIDTH>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

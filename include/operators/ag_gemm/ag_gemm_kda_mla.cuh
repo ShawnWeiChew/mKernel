@@ -29,7 +29,11 @@ namespace ag_gemm_kda_mla {
 template <int _ROW_BLOCK, int _COL_BLOCK>
 struct fused_globals;
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+// Number of tile columns visited before the snake pattern steps to the next
+// supergroup; wider supergroups trade B-tile reuse for A-tile reuse in L2.
+static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
+
+template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH>
 void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G);
 
 static constexpr int DEFAULT_ROW_BLOCK = 128;
@@ -185,11 +189,11 @@ void entrypoint(dist::ParallelBuffer& A,
     if (M <= 512) {
         using fg = fused_globals<128, 128>;
         fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<128, 128>(globals);
+        launch_ag_gemm_kda_mla<128, 128, DEFAULT_SUPERGROUP_WIDTH>(globals);
     } else {
         using fg = fused_globals<128, 256>;
         fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<128, 256>(globals);
+        launch_ag_gemm_kda_mla<128, 256, DEFAULT_SUPERGROUP_WIDTH>(globals);
     }
 }
 };  // namespace ag_gemm_kda_mla
