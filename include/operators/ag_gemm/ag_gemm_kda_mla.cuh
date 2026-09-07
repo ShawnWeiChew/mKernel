@@ -56,13 +56,13 @@ struct fused_globals {
     static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
     // this is pipelining along the reduction dimension
-    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 8 : 6;
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 7 : 5;
     // this is pipelining among different MMAs
     static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
     static constexpr int EPILOGUE_PIPELINE_STAGES = 3;
     // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 4 : 8;
+    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 2 : 4;
 
     // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
     // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
