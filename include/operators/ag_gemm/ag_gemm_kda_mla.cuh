@@ -169,31 +169,75 @@ void entrypoint(dist::ParallelBuffer& A,
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
-    TORCH_CHECK(A.data_.dim() == 2, "A must be a 2D tensor");
-    TORCH_CHECK(A.data_.scalar_type() == at::kBFloat16, "A must be bfloat16");
-    TORCH_CHECK(A.data_.size(1) == K, "A's K dimension must be ", K);
-    TORCH_CHECK(A_local_buf.is_cuda() && A_local_buf.is_contiguous(),
-                "A_local_buf must be a contiguous CUDA tensor");
-    TORCH_CHECK(A_local_buf.device().index() == dev_idx, "A_local_buf must be on A's local device");
-    TORCH_CHECK(A_local_buf.scalar_type() == at::kBFloat16, "A_local_buf must be bfloat16");
-    TORCH_CHECK(A_local_buf.dim() == 2 && A_local_buf.size(0) == M &&
-                    A_local_buf.size(1) == A.data_.size(1),
-                "A_local_buf must have shape [global_M, K] = [",
-                M,
-                ", ",
-                A.data_.size(1),
-                "]");
-    TORCH_CHECK(M == A.data_.size(0) * A.local_world_size_,
-                "C's M dimension must equal A.local_M * world_size");
 
-    if (M <= 512) {
-        using fg = fused_globals<128, 128>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<128, 128, DEFAULT_SUPERGROUP_WIDTH>(globals);
+    // TODO: this only works for TP == 8
+    constexpr int KDA_N = 6400;
+
+    // use size of N to check which projection is being done
+    if (N == KDA_N) {
+        switch (M) {
+            case 2048: {
+                using fg = fused_globals<128, 128>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 128, 10>(globals);
+                break;
+            }
+            case 4096:
+            case 16384:
+            case 32768: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 15>(globals);
+                break;
+            }
+            case 8192: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 25>(globals);
+                break;
+            }
+        }
     } else {
-        using fg = fused_globals<128, 256>;
-        fg globals = ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-        launch_ag_gemm_kda_mla<128, 256, DEFAULT_SUPERGROUP_WIDTH>(globals);
+        switch (M) {
+            case 2048: {
+                using fg = fused_globals<128, 128>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 128, 10>(globals);
+                break;
+            }
+            case 4096: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 10>(globals);
+                break;
+            }
+            case 8192: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 15>(globals);
+                break;
+            }
+            case 16384: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 25>(globals);
+                break;
+            }
+            case 32768: {
+                using fg = fused_globals<128, 256>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 10>(globals);
+                break;
+            }
+        }
     }
 }
 };  // namespace ag_gemm_kda_mla
