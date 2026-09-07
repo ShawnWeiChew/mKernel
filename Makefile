@@ -157,6 +157,19 @@ $(BUILD)/lib%.so: $(SRC)/%.cu Makefile | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_$* $(DEFS_$*) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
+# Single-GPU microbenchmark for the already-ready acquire-load path in
+# ag_gemm_kda_mla. It deliberately does not link either internode backend.
+acquire-load-pass-bench: $(BUILD)/libacquire_load_pass_bench.so
+
+$(BUILD)/libacquire_load_pass_bench.so: $(SRC)/acquire_load_pass_bench.cu \
+		include/comm/atomic_u32.cuh Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(ARCH_DEFINES) \
+	    -DTORCH_EXTENSION_NAME=mkernel_release_acquire_load_pass_bench \
+	    $(INC_RELEASE) $(TORCH_INC) $(PY_INC) --compiler-options '-fPIC' \
+	    -shared -lcuda -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+	    -ltorch_python -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib \
+	    $< -o $@
+
 $(BUILD):
 	mkdir -p $(BUILD)
 
@@ -281,17 +294,48 @@ run-ag-gemm-kda-mla-profile : ag-gemm-kda-mla-profile
 NCU              ?= ncu
 NCU_SET          ?= detailed
 NCU_REPLAY       ?= application
-NCU_OUT          ?= traces/ag_gemm_kda_mla_ncu
 NCU_RANK         ?= 0
 NCU_ITERS        ?= 1
 NCU_EXTRA        ?=
+# Shared by both ncu rules on purpose: a report is only comparable against
+# another at the same shape. NCU_OUT empty lets the driver pick a per-impl
+# default, so the two reports never land on the same path.
+NCU_SHAPE        ?= 32768
+NCU_OUT          ?=
+
+NCU_FLAGS = --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-replay $(NCU_REPLAY) \
+	    --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) --shape $(NCU_SHAPE) \
+	    $(if $(NCU_OUT),--ncu-out $(NCU_OUT))
 
 run-ag-gemm-kda-mla-ncu : ag-gemm-kda-mla
-	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu \
-	    --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-replay $(NCU_REPLAY) \
-	    --ncu-out $(NCU_OUT) --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) \
+	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu $(NCU_FLAGS) \
 	    $(NCU_EXTRA) $(PROFILE_ARGS)
 
-.PHONY: gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
+# === CUTLASS baseline, same shape, second report ===
+#
+# CUTLASS is JIT-compiled per config and application replay restarts the job
+# once per pass, so tuning is a separate step: it caches the bench script's
+# autotuned winner to traces/.cutlass_tiler_rank<N>.json and the profiled run
+# reads it. Re-tune with CUTLASS_RETUNE=1, or pin one with CUTLASS_TILER=256x256.
+#
+# Needs CUTLASS_PATH (or CUTLASS_AG_GEMM) set, exactly as the bench does.
+#
+#   make run-cutlass-ag-gemm-ncu NCU=/opt/nvidia/nsight-compute/2026.2.0/ncu
+CUTLASS_TILER    ?= auto
+CUTLASS_RETUNE   ?=
+
+tune-cutlass-ag-gemm :
+	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --impl cutlass --cutlass-tune-only \
+	    --shape $(NCU_SHAPE) --cutlass-tiler $(CUTLASS_TILER) \
+	    $(if $(CUTLASS_RETUNE),--cutlass-retune)
+
+# Depends on the tune step so one command is always correct: with the winner
+# already cached that step is just a job start, not another autotune.
+run-cutlass-ag-gemm-ncu : tune-cutlass-ag-gemm
+	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu --impl cutlass $(NCU_FLAGS) \
+	    --cutlass-tiler $(CUTLASS_TILER) $(NCU_EXTRA) $(PROFILE_ARGS)
+
+.PHONY: acquire-load-pass-bench \
+	gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
 	ag-gemm-kda-mla-profile run-ag-gemm-kda-mla-profile \
-	run-ag-gemm-kda-mla-ncu
+	run-ag-gemm-kda-mla-ncu tune-cutlass-ag-gemm run-cutlass-ag-gemm-ncu

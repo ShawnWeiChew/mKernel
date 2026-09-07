@@ -56,6 +56,7 @@ or a targeted --ncu-arg=--metrics=... beats `full` by minutes.
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -101,8 +102,9 @@ def build_argparser():
                      help="profile one rank under Nsight Compute instead of tracing")
     ncu.add_argument("--ncu-rank", type=int, default=0,
                      help="the only rank that runs under ncu; the rest run natively")
-    ncu.add_argument("--ncu-out", default="traces/ag_gemm_kda_mla_ncu",
-                     help="report path, without the .ncu-rep suffix ncu appends")
+    ncu.add_argument("--ncu-out", default=None,
+                     help="report path, without the .ncu-rep suffix ncu appends. "
+                          "Defaults per --impl, so the two never clobber")
     ncu.add_argument("--ncu-replay", default="application",
                      choices=("application", "kernel"),
                      help="application (default): relaunch the job per pass, ncu "
@@ -123,6 +125,29 @@ def build_argparser():
                           "use --ncu-arg=--flag for dashed values")
     ncu.add_argument("--ncu-timeout-min", type=int, default=60,
                      help="collective timeout while the peers wait out the replay")
+
+    cut = ap.add_argument_group(
+        "cutlass baseline",
+        "Profile CUTLASS's distributed all-gather GEMM at the same shape, for a "
+        "report you can baseline the kernel's against.",
+    )
+    cut.add_argument("--impl", default="mkernel", choices=("mkernel", "cutlass"),
+                     help="what to profile. cutlass needs --ncu or "
+                          "--cutlass-tune-only; the in-kernel trace is mkernel-only")
+    cut.add_argument("--cutlass-tiler", default="auto",
+                     help="mma_tiler_mn as MxN (e.g. 256x256), or auto to take the "
+                          "winner from the bench script's autotune")
+    cut.add_argument("--cutlass-tune-only", action="store_true",
+                     help="autotune, cache the winner and exit; run this once "
+                          "before profiling so no replay pass pays for tuning")
+    cut.add_argument("--cutlass-retune", action="store_true",
+                     help="ignore the cached winner")
+    cut.add_argument("--cutlass-cache", default="traces/.cutlass_tiler",
+                     help="cache prefix; one JSON per rank")
+    cut.add_argument("--cutlass-warmup", type=int, default=0,
+                     help="warmup launches inside the profiled call. 0 keeps the "
+                          "region to the timed launches; the JIT and caches are "
+                          "already warm from the call before it")
     return ap
 
 
@@ -226,6 +251,103 @@ def round_up(value, multiple):
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def parse_tiler(text):
+    parts = text.replace(",", "x").split("x")
+    if len(parts) != 2:
+        raise SystemExit(f"--cutlass-tiler wants MxN (e.g. 256x256), got {text!r}")
+    return tuple(int(p) for p in parts)
+
+
+def cutlass_tiler_cache(args, rank):
+    # Per rank: every rank tunes (run() is collective) and they would otherwise
+    # race on one file. They all see the same max-rank timings, so the winner
+    # agrees across ranks anyway.
+    return Path(f"{args.cutlass_cache}_rank{rank}.json")
+
+
+def resolve_cutlass_tiler(args, bench, rank, M, N, K):
+    """The bench script's autotuned winner, cached across processes.
+
+    Application replay restarts the whole job once per metric pass, and CUTLASS
+    is JIT-compiled per config -- tuning inside the profiled run would pay that
+    on every pass. The cache turns it into a one-off, which is also what keeps
+    the launch sequence identical across passes.
+    """
+    if args.cutlass_tiler != "auto":
+        return parse_tiler(args.cutlass_tiler)
+
+    key = f"{M}x{N}x{K}"
+    path = cutlass_tiler_cache(args, rank)
+    cache = {}
+    if path.exists():
+        try:
+            cache = json.loads(path.read_text())
+        except ValueError:                        # truncated by an interrupted run
+            cache = {}
+    if not args.cutlass_retune and key in cache:
+        return tuple(cache[key])
+
+    # cutlass_benchmark is the bench script's own autotune, honouring
+    # CUTLASS_AUTOTUNE: with it off, this is just the mKernel-matched tile.
+    ms, tiler, log = bench.cutlass_benchmark(m=M, n=N, k=K, warmup=2, iterations=5)
+    if rank == 0:
+        for cand, cand_ms in sorted(log, key=lambda kv: kv[1]):
+            mark = " <- best" if tuple(cand) == tuple(tiler) else ""
+            print(f"  [autotune] mma_tiler_mn={tuple(cand)}: {cand_ms:8.3f} ms{mark}",
+                  flush=True)
+    cache[key] = list(tiler)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=2))
+    return tuple(tiler)
+
+
+def run_cutlass(args, rank, M, padded_n, K):
+    """Profile the CUTLASS baseline at the same shape as the kernel.
+
+    Nothing here touches an mKernel .so: this path exists to produce a second
+    report at the same M/N/K, so the two can be compared as baselines.
+    """
+    import torch
+    import torch.distributed as dist
+
+    import ag_gemm_kda_mla_bench as bench
+
+    tiler = resolve_cutlass_tiler(args, bench, rank, M, padded_n, K)
+    if rank == 0:
+        print(f"CUTLASS mma_tiler_mn={tiler} "
+              f"cluster_shape_mn={bench._CUTLASS_CLUSTER_SHAPE}", flush=True)
+    if args.cutlass_tune_only:
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
+
+    # Warm the JIT, the allocator and the caches outside the profiled region.
+    # Upstream run() builds its own CUDA graph, so the profiled call below is a
+    # graph launch -- ncu's default --graph-profiling node profiles the kernels
+    # inside it individually, which is what makes the report comparable.
+    bench._run_cutlass_once(m=M, n=padded_n, k=K, mma_tiler_mn=tiler,
+                            warmup=WARMUP, iterations=1)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    profiled = rank == args.ncu_rank
+    if profiled:
+        torch.cuda.profiler.start()
+    ms = bench._run_cutlass_once(m=M, n=padded_n, k=K, mma_tiler_mn=tiler,
+                                 warmup=args.cutlass_warmup,
+                                 iterations=args.ncu_iters)
+    if profiled:
+        torch.cuda.profiler.stop()
+
+    if profiled:
+        print(f"\nCUTLASS profiled: {ms:.3f} ms/iter under the profiler "
+              f"(not a benchmark -- read the report)", flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+    return 0
+
+
 def run(args):
     import torch
     import torch.distributed as dist
@@ -245,6 +367,22 @@ def run(args):
         "nccl", device_id=torch.device(f"cuda:{local_rank}"),
         timeout=datetime.timedelta(minutes=args.ncu_timeout_min) if args.ncu else None,
     )
+
+    if args.impl == "cutlass":
+        # No mKernel .so is involved. N still has to match the kernel run
+        # exactly for the reports to be comparable, and padded_n_for_m applies
+        # the same 128/256 column-block rule col_block_for_m does.
+        import ag_gemm_kda_mla_bench as bench
+
+        M = args.shape
+        if M % world_size != 0:
+            raise SystemExit(
+                f"global M={M} is not divisible by world_size={world_size}")
+        padded_n = bench.padded_n_for_m(M, LOGICAL_N)
+        if rank == 0:
+            print(f"CUTLASS all-gather GEMM | M={M} (local {M // world_size}) "
+                  f"N={padded_n} K={bench.K} world={world_size}", flush=True)
+        return run_cutlass(args, rank, M, padded_n, bench.K)
 
     # ncu measures the shipping cubin, never the instrumented one: the emits,
     # the registers they cost and the ring's stores are work the real kernel
@@ -496,8 +634,26 @@ def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
     return 0
 
 
+def resolve_defaults(args):
+    """Fill in what depends on --impl, before any wrapping decision is made."""
+    if args.ncu_out is None:
+        args.ncu_out = ("traces/cutlass_ag_gemm_ncu" if args.impl == "cutlass"
+                        else "traces/ag_gemm_kda_mla_ncu")
+    if args.impl == "cutlass" and not (args.ncu or args.cutlass_tune_only):
+        raise SystemExit(
+            "--impl cutlass only profiles under ncu: add --ncu, or "
+            "--cutlass-tune-only to just pick and cache the config."
+        )
+    if args.cutlass_tune_only:
+        if args.impl != "cutlass":
+            raise SystemExit("--cutlass-tune-only needs --impl cutlass")
+        # Tuning is the step that exists so ncu never has to pay for it.
+        args.ncu = False
+
+
 def main():
     args = build_argparser().parse_args()
+    resolve_defaults(args)
     # torchrun sets RANK in the children; its absence means we are the launcher.
     if "RANK" not in os.environ:
         return bootstrap(args)
