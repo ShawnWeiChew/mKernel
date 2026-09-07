@@ -303,9 +303,17 @@ NCU_EXTRA        ?=
 NCU_SHAPE        ?= 32768
 NCU_OUT          ?=
 
+# NCU_RANKS/NCU_KERNEL empty = per-impl defaults: one rank and no filter for
+# the kernel, all ranks and a cutlass-only filter for CUTLASS, whose GEMM
+# rendezvouses device-side and hangs if its peers are left unprofiled.
+NCU_RANKS        ?=
+NCU_KERNEL       ?=
+
 NCU_FLAGS = --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-replay $(NCU_REPLAY) \
 	    --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) --shape $(NCU_SHAPE) \
-	    $(if $(NCU_OUT),--ncu-out $(NCU_OUT))
+	    $(if $(NCU_OUT),--ncu-out $(NCU_OUT)) \
+	    $(if $(NCU_RANKS),--ncu-ranks $(NCU_RANKS)) \
+	    $(if $(NCU_KERNEL),--ncu-kernel $(NCU_KERNEL))
 
 run-ag-gemm-kda-mla-ncu : ag-gemm-kda-mla
 	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu $(NCU_FLAGS) \

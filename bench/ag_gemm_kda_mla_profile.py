@@ -106,10 +106,20 @@ def build_argparser():
                      help="report path, without the .ncu-rep suffix ncu appends. "
                           "Defaults per --impl, so the two never clobber")
     ncu.add_argument("--ncu-replay", default="application",
-                     choices=("application", "kernel"),
+                     choices=("application", "kernel", "app-range", "range"),
                      help="application (default): relaunch the job per pass, ncu "
                           "wraps torchrun. kernel: ncu wraps one rank, but this "
-                          "kernel's multicast buffers make ncu's context save fail")
+                          "kernel's multicast buffers make ncu's context save "
+                          "fail. app-range: profile the whole profiled region as "
+                          "one unit, no per-kernel serialization -- the escape "
+                          "hatch when a device-side collective deadlocks")
+    ncu.add_argument("--ncu-ranks", default="auto", choices=("auto", "one", "all"),
+                     help="which ranks call cudaProfilerStart. auto: one for the "
+                          "kernel, all for CUTLASS, whose GEMM rendezvouses "
+                          "device-side and hangs if its peers are not profiled too")
+    ncu.add_argument("--ncu-kernel", default=None,
+                     help="ncu --kernel-name filter. Defaults per --impl; keeps "
+                          "NCCL and tensor-init kernels out of the report")
     # Every extra pass is another full job restart under application replay,
     # so `detailed` rather than `full` is the default.
     ncu.add_argument("--ncu-set", default="detailed",
@@ -205,6 +215,11 @@ def ncu_prefix(args, target_processes, out):
         "--set", args.ncu_set,
         "--force-overwrite",
         "--export", str(out),
+        # Without this the profiler region also collects the NCCL barrier and
+        # the elementwise kernels upstream's run() launches while it allocates.
+        # Profiling a collective barrier is both wasted passes and a deadlock
+        # risk, since ncu serializes the launch it is profiling.
+        *(("--kernel-name", args.ncu_kernel) if args.ncu_kernel else ()),
         *args.ncu_arg,
     ]
 
@@ -330,7 +345,7 @@ def run_cutlass(args, rank, M, padded_n, K):
     torch.cuda.synchronize()
     dist.barrier()
 
-    profiled = rank == args.ncu_rank
+    profiled = ncu_records_here(args, rank)
     if profiled:
         torch.cuda.profiler.start()
     ms = bench._run_cutlass_once(m=M, n=padded_n, k=K, mma_tiler_mn=tiler,
@@ -339,7 +354,7 @@ def run_cutlass(args, rank, M, padded_n, K):
     if profiled:
         torch.cuda.profiler.stop()
 
-    if profiled:
+    if rank == args.ncu_rank:
         print(f"\nCUTLASS profiled: {ms:.3f} ms/iter under the profiler "
               f"(not a benchmark -- read the report)", flush=True)
 
@@ -597,6 +612,18 @@ def run(args):
     return 0
 
 
+def ncu_records_here(args, rank):
+    """Whether this rank calls cudaProfilerStart.
+
+    One rank is right for a kernel whose peers only supply memory: it keeps the
+    report small and lets the peers run at full speed. It is wrong for a kernel
+    that rendezvouses device-side -- ncu serializes the launch it profiles while
+    the unprofiled peers run ahead and exit their kernel, so the rendezvous
+    never completes and the launch hangs.
+    """
+    return args.ncu_ranks == "all" or rank == args.ncu_rank
+
+
 def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
     """Profiled launches only: null ring, no records, no plot.
 
@@ -611,7 +638,7 @@ def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
     torch.cuda.synchronize()
     dist.barrier()
 
-    profiled = rank == args.ncu_rank
+    profiled = ncu_records_here(args, rank)
     if profiled:
         torch.cuda.profiler.start()
     start.record()
@@ -623,7 +650,7 @@ def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
         torch.cuda.profiler.stop()
     per_launch_ms = start.elapsed_time(end) / max(args.ncu_iters, 1)
 
-    if profiled:
+    if rank == args.ncu_rank:
         # Serialized and replayed, so this is wall time, not the kernel's time.
         # The honest number is in the report; this only shows it ran.
         print(f"\n{args.ncu_iters} launch(es) profiled, {per_launch_ms:.3f} ms each "
@@ -636,9 +663,19 @@ def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
 
 def resolve_defaults(args):
     """Fill in what depends on --impl, before any wrapping decision is made."""
+    cutlass = args.impl == "cutlass"
     if args.ncu_out is None:
-        args.ncu_out = ("traces/cutlass_ag_gemm_ncu" if args.impl == "cutlass"
+        args.ncu_out = ("traces/cutlass_ag_gemm_ncu" if cutlass
                         else "traces/ag_gemm_kda_mla_ncu")
+    if args.ncu_ranks == "auto":
+        # CUTLASS's GEMM signals between ranks from inside the kernel, so every
+        # rank has to be in the same profiled phase. The kernel's peers only
+        # serve memory, so one rank there keeps the report small.
+        args.ncu_ranks = "all" if cutlass else "one"
+    if args.ncu_kernel is None:
+        # upstream names them kernel_cutlass_*; leave the kernel's own run
+        # unfiltered, its profiled region holds nothing else.
+        args.ncu_kernel = "regex:cutlass" if cutlass else ""
     if args.impl == "cutlass" and not (args.ncu or args.cutlass_tune_only):
         raise SystemExit(
             "--impl cutlass only profiles under ncu: add --ncu, or "
