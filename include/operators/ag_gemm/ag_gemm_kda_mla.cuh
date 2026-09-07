@@ -52,13 +52,13 @@ struct fused_globals {
     static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
     // this is pipelining along the reduction dimension
-    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 7 : 5;
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 8 : 6;
     // this is pipelining among different MMAs
     static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
     static constexpr int EPILOGUE_PIPELINE_STAGES = 3;
     // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 2 : 4;
+    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 4 : 8;
 
     // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
     // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
@@ -170,10 +170,8 @@ void entrypoint(dist::ParallelBuffer& A,
     TORCH_CHECK(A.data_.size(1) == K, "A's K dimension must be ", K);
     TORCH_CHECK(A_local_buf.is_cuda() && A_local_buf.is_contiguous(),
                 "A_local_buf must be a contiguous CUDA tensor");
-    TORCH_CHECK(A_local_buf.device().index() == dev_idx,
-                "A_local_buf must be on A's local device");
-    TORCH_CHECK(A_local_buf.scalar_type() == at::kBFloat16,
-                "A_local_buf must be bfloat16");
+    TORCH_CHECK(A_local_buf.device().index() == dev_idx, "A_local_buf must be on A's local device");
+    TORCH_CHECK(A_local_buf.scalar_type() == at::kBFloat16, "A_local_buf must be bfloat16");
     TORCH_CHECK(A_local_buf.dim() == 2 && A_local_buf.size(0) == M &&
                     A_local_buf.size(1) == A.data_.size(1),
                 "A_local_buf must have shape [global_M, K] = [",
