@@ -50,11 +50,21 @@ _CUTLASS_RELATIVE_EXAMPLE = (
 )
 
 # The upstream example does not expose the swizzle/raster controls used by the
-# CUTLASS GEMM+AR benchmark. Its useful schedule knob is the MMA N tile. Keep M
-# and the cluster shape matched to this kernel's 2-CTA geometry, and tune the two
-# N tiles this kernel itself dispatches between.
-_CUTLASS_MMA_TILERS = ((256, 128), (256, 256))
-_CUTLASS_CLUSTER_SHAPE = (2, 1)
+# CUTLASS GEMM+AR benchmark. Its useful schedule knobs are the MMA tile and the
+# CTA geometry, as (mma_tiler_mn, cluster_shape_mn, use_2cta_instrs).
+#
+# The first two match this kernel's 2-CTA geometry and the two N tiles it
+# dispatches between. The 1-CTA pair exists because a 256-row tile cannot
+# divide an odd shard: at M=3072 the 384-row shard rounds to 512 and CUTLASS
+# silently does M=4096 of work. A 128-row tile divides 384 exactly, so these
+# candidates measure whether the 2-CTA schedule is worth the padding it forces
+# -- the same question this kernel faces, answered without writing the path.
+_CUTLASS_CONFIGS = (
+    ((256, 128), (2, 1), True),
+    ((256, 256), (2, 1), True),
+    ((128, 128), (1, 1), False),
+    ((128, 256), (1, 1), False),
+)
 _CUTLASS_MODULE = None
 
 
@@ -110,12 +120,23 @@ def cutlass_availability() -> tuple[bool, str]:
     return True, ""
 
 
+CutlassConfig = tuple[tuple[int, int], tuple[int, int], bool]
+
+
+def cutlass_config_label(config: CutlassConfig) -> str:
+    (tile_m, tile_n), cluster, two_cta = config
+    return (
+        f"mma={tile_m}x{tile_n} cluster={cluster[0]}x{cluster[1]} "
+        f"{'2-CTA' if two_cta else '1-CTA'}"
+    )
+
+
 def _run_cutlass_once(
     *,
     m: int,
     n: int,
     k: int,
-    mma_tiler_mn: tuple[int, int],
+    config: CutlassConfig,
     warmup: int,
     iterations: int,
 ) -> float:
@@ -137,6 +158,7 @@ def _run_cutlass_once(
     # streams and walking the ring, but __main__ is not executed by our loader.
     # Supply the same value explicitly for the embedded path.
     example.local_rank = int(os.environ["LOCAL_RANK"])
+    mma_tiler_mn, cluster_shape_mn, use_2cta_instrs = config
 
     destroy_process_group = dist.destroy_process_group
     can_implement = example.PersistentDenseGemmKernel.can_implement
@@ -159,8 +181,8 @@ def _run_cutlass_once(
             b_major="n",
             c_major="n",
             mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=_CUTLASS_CLUSTER_SHAPE,
-            use_2cta_instrs=True,
+            cluster_shape_mn=cluster_shape_mn,
+            use_2cta_instrs=use_2cta_instrs,
             use_tma_store=True,
             warmup_iterations=warmup,
             iterations=iterations,
@@ -174,8 +196,9 @@ def _run_cutlass_once(
     return float(time_us) / 1000.0
 
 
-def matched_cutlass_tiler(m: int) -> tuple[int, int]:
-    return (256, 128 if m < 4096 else 256)
+def matched_cutlass_config(m: int) -> CutlassConfig:
+    """The candidate whose geometry mirrors what mKernel dispatches."""
+    return ((256, 128 if m < 4096 else 256), (2, 1), True)
 
 
 def cutlass_benchmark(
@@ -185,36 +208,47 @@ def cutlass_benchmark(
     k: int,
     warmup: int,
     iterations: int,
-    matched_tiler: tuple[int, int],
-) -> tuple[float, tuple[int, int], list[tuple[tuple[int, int], float]]]:
-    """Autotune CUTLASS's MMA tile and benchmark the winning configuration.
+    matched_config: CutlassConfig,
+) -> tuple[float, CutlassConfig, list[tuple[CutlassConfig, float]]]:
+    """Autotune CUTLASS's schedule and benchmark the winning configuration.
 
-    matched_tiler is the tile mKernel itself dispatches for this problem. It
-    is keyed on the padded M even though CUTLASS runs the unpadded shape, so
-    the non-autotuned run stays a like-for-like schedule comparison.
+    matched_config is the geometry mKernel itself dispatches for this problem.
+    It is keyed on the padded M even though CUTLASS runs the unpadded shape,
+    so the non-autotuned run stays a like-for-like schedule comparison.
     """
     autotune = _env_enabled(_CUTLASS_ENV_AUTOTUNE)
-    candidates = _CUTLASS_MMA_TILERS if autotune else (matched_tiler,)
+    candidates = _CUTLASS_CONFIGS if autotune else (matched_config,)
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
 
     timings = []
-    best_tiler = None
+    best_config = None
     best_ms = float("inf")
-    for tiler in candidates:
-        ms = _run_cutlass_once(
-            m=m,
-            n=n,
-            k=k,
-            mma_tiler_mn=tiler,
-            warmup=tune_warmup if autotune else warmup,
-            iterations=tune_iterations if autotune else iterations,
-        )
-        timings.append((tiler, ms))
+    for config in candidates:
+        try:
+            ms = _run_cutlass_once(
+                m=m,
+                n=n,
+                k=k,
+                config=config,
+                warmup=tune_warmup if autotune else warmup,
+                iterations=tune_iterations if autotune else iterations,
+            )
+        except Exception:
+            # can_implement rejects some tile/shape pairs. Drop the candidate
+            # rather than the whole shape, but only in lockstep: a rank that
+            # kept a config its peers dropped would hang in the next launch.
+            ms = None
+        vote = torch.tensor([1 if ms is not None else 0], device="cuda")
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+        if not vote.item():
+            continue
+        timings.append((config, ms))
         if ms < best_ms:
-            best_tiler, best_ms = tiler, ms
+            best_config, best_ms = config, ms
 
-    assert best_tiler is not None
+    if best_config is None:
+        raise RuntimeError(f"no CUTLASS config ran at M={m} N={n}")
     if autotune:
         # The upstream run() builds a private CUDA graph, so it cannot hand its
         # tuned launcher back to us. Rebuild the winner for the full benchmark
@@ -223,11 +257,11 @@ def cutlass_benchmark(
             m=m,
             n=n,
             k=k,
-            mma_tiler_mn=best_tiler,
+            config=best_config,
             warmup=warmup,
             iterations=iterations,
         )
-    return best_ms, best_tiler, timings
+    return best_ms, best_config, timings
 
 
 ########## ThunderKittens compatibility layer ##########
@@ -670,21 +704,21 @@ def main() -> int:
         padded_m = padded_local_m * world_size
         padded_n = padded_n_for_m(padded_m, logical_n)
         tk_padded_n = padded_n_for_m_tk(padded_m, logical_n)
-        cutlass_tiler_match = matched_cutlass_tiler(padded_m)
+        cutlass_config_match = matched_cutlass_config(padded_m)
 
         cutlass_ms = None
-        cutlass_tiler = None
+        cutlass_config = None
         cutlass_tune_log = []
         if cutlass_ok:
             try:
                 # hand the raw values to cutlass to let it handle on its own?
-                cutlass_ms, cutlass_tiler, cutlass_tune_log = cutlass_benchmark(
+                cutlass_ms, cutlass_config, cutlass_tune_log = cutlass_benchmark(
                     m=m,
                     n=padded_n,
                     k=K,
                     warmup=args.warmup,
                     iterations=args.iters,
-                    matched_tiler=cutlass_tiler_match,
+                    matched_config=cutlass_config_match,
                 )
             except Exception as exc:
                 cutlass_why = f"{type(exc).__name__}: {exc}"
@@ -710,22 +744,22 @@ def main() -> int:
                 )
                 print(
                     f"  CUTLASS config {projection} M={m}: "
-                    f"mma_tiler_mn={cutlass_tiler} "
-                    f"cluster_shape_mn={_CUTLASS_CLUSTER_SHAPE} ({tune_note})",
+                    f"{cutlass_config_label(cutlass_config)} ({tune_note})",
                     flush=True,
                 )
                 if _env_enabled(_CUTLASS_ENV_AUTOTUNE):
-                    for tiler, tune_ms in sorted(
+                    for config, tune_ms in sorted(
                         cutlass_tune_log, key=lambda item: item[1]
                     ):
-                        mark = " <- best" if tiler == cutlass_tiler else ""
-                        if tiler == cutlass_tiler_match:
+                        mark = " <- best" if config == cutlass_config else ""
+                        if config == cutlass_config_match:
                             mark += " (matches mKernel tile)"
+                        tune_tflops = useful_tflops(m, logical_n, K, tune_ms)
                         print(
-                            f"    [autotune] mma_tiler_mn={tiler}: "
+                            f"    [autotune] "
+                            f"{cutlass_config_label(config)}: "
                             f"{tune_ms:8.3f} ms  "
-                            f"{useful_tflops(m, logical_n, K, tune_ms):8.2f} "
-                            f"TFLOP/s{mark}",
+                            f"{tune_tflops:8.2f} TFLOP/s{mark}",
                             flush=True,
                         )
 
