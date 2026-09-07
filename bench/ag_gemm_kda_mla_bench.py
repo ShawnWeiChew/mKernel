@@ -182,23 +182,21 @@ def cutlass_benchmark(
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
 
-    timings = []
-    best_tiler = None
-    best_ms = float("inf")
-    for tiler in candidates:
-        ms = _run_cutlass_once(
-            m=m,
-            n=n,
-            k=k,
-            mma_tiler_mn=tiler,
-            warmup=tune_warmup if autotune else warmup,
-            iterations=tune_iterations if autotune else iterations,
-        )
-        timings.append((tiler, ms))
-        if ms < best_ms:
-            best_tiler, best_ms = tiler, ms
-
-    assert best_tiler is not None
+    samples = {tiler: [] for tiler in candidates}
+    for sweep in counterbalanced_sweeps(candidates):
+        for tiler in sweep:
+            samples[tiler].append(
+                _run_cutlass_once(
+                    m=m,
+                    n=n,
+                    k=k,
+                    mma_tiler_mn=tiler,
+                    warmup=tune_warmup if autotune else warmup,
+                    iterations=tune_iterations if autotune else iterations,
+                )
+            )
+    timings = tuning_result(samples)
+    best_tiler, best_ms = min(timings, key=lambda item: item[1])
     if autotune:
         # The upstream run() builds a private CUDA graph, so it cannot hand its
         # tuned launcher back to us. Rebuild the winner for the full benchmark
@@ -357,19 +355,18 @@ def tune_tk_comm_sms(
     candidates = _TK_COMM_SMS if autotune else (configured_tk_comm_sms(),)
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
-    timings = []
-    best_comm_sms = None
-    best_ms = float("inf")
-    for num_comm_sms in candidates:
-        ms = benchmark_cuda(
-            lambda num_comm_sms=num_comm_sms: launch_tk(state, num_comm_sms),
-            tune_warmup if autotune else warmup,
-            tune_iterations if autotune else iterations,
-        )
-        timings.append((num_comm_sms, ms))
-        if ms < best_ms:
-            best_comm_sms, best_ms = num_comm_sms, ms
-    assert best_comm_sms is not None
+    samples = {num_comm_sms: [] for num_comm_sms in candidates}
+    for sweep in counterbalanced_sweeps(candidates):
+        for num_comm_sms in sweep:
+            samples[num_comm_sms].append(
+                benchmark_cuda(
+                    lambda n=num_comm_sms: launch_tk(state, n),
+                    tune_warmup if autotune else warmup,
+                    tune_iterations if autotune else iterations,
+                )
+            )
+    timings = tuning_result(samples)
+    best_comm_sms, _ = min(timings, key=lambda item: item[1])
     return best_comm_sms, timings
 
 
@@ -469,6 +466,35 @@ def williams_orders(items):
             first.append(hi)
         lo, hi = lo + 1, hi - 1
     return [tuple(items[(v + r) % n] for v in first) for r in range(n)]
+
+
+def counterbalanced_sweeps(candidates):
+    """Candidate orders that give every candidate the same average position.
+
+    A tuner that measures its candidates in a fixed order confounds the
+    candidate with the thermal and clock state it happened to be measured in:
+    the first is always timed on the coldest part, the last on the most soaked.
+    Sweeping forward and then backward puts every candidate at position i once
+    and at position n-1-i once, so the mean position is (n-1)/2 for all of them.
+
+    Cheaper than the Williams rotation used for the reported measurements --
+    2 passes rather than n -- which matters because each tuning sample here is
+    a full warmup plus timed loop, and CUTLASS JIT-compiles per config.
+    """
+    ordered = list(candidates)
+    if len(ordered) < 2:
+        return [ordered]
+    return [ordered, list(reversed(ordered))]
+
+
+def tuning_result(samples):
+    """Best time per candidate, in the candidates' declared order.
+
+    min rather than median: with two samples per candidate the noise is
+    one-sided (something interfered, or nothing did), so the smaller sample is
+    the better estimate of what the config can do.
+    """
+    return [(cand, min(times)) for cand, times in samples.items()]
 
 
 def sync_ranks() -> None:
@@ -667,10 +693,11 @@ def main() -> int:
     bench_shapes = bench_shape_order(GLOBAL_M, args.shape_seed)
     if is_chief:
         order = " ".join(str(x) for x in bench_shapes)
-        streams = getattr(mod, "A_COPY_STREAMS", None)
+        # Report the build knob, so a log says which .so produced it.
+        width = getattr(mod, "SUPERGROUP_WIDTH", None)
         print(f"\nbenchmark shape order (seed {args.shape_seed}): {order}\n"
               f"cooldown {args.cooldown:g}s between phases and shapes"
-              + (f" | A copy streams: {streams}" if streams else ""),
+              + (f" | SUPERGROUP_WIDTH={width}" if width else ""),
               flush=True)
     for m in bench_shapes:
         local_m = m // world_size

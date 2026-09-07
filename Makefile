@@ -103,14 +103,15 @@ TK_MOE_NUM_NODES ?= 2
 DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 DEFS_dispatch_gemm_blackwell := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_dispatch_gemm_warp_specialization := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
-# Copy streams the ag_gemm_kda_mla staging all-gather is spread over. One stream
-# feeds one copy engine, so this is the knob for how much of the link the gather
-# can use; 1 is the old single-stream behaviour.
+# Column tiles per supergroup in the ag_gemm_kda_mla tile schedule. Trades A's
+# DRAM passes (ceil(num_col_tiles / W)) against the B panel L2 must hold
+# (W * COL_BLOCK * K * 2 bytes).
 #
-# One build per value: `make A_COPY_STREAMS=n ag-gemm-kda-mla` compiles that one
-# setting, so a sweep is a shell loop over builds, not a single make call.
-A_COPY_STREAMS ?= 4
-DEFS_ag_gemm_kda_mla := -DMKERNEL_A_COPY_STREAMS=$(A_COPY_STREAMS)
+# One build per value: `make SUPERGROUP_WIDTH=n ag-gemm-kda-mla` compiles that
+# one setting, so a sweep is a shell loop over builds, not a single make call.
+SUPERGROUP_WIDTH ?= 5
+
+DEFS_ag_gemm_kda_mla := -DMKERNEL_SUPERGROUP_WIDTH=$(SUPERGROUP_WIDTH)
 
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
@@ -123,11 +124,12 @@ SRC   := src
 # make cannot see that a variable given on the command line changed, so record
 # the value in a stamp and depend on that. The recipe runs every time but only
 # rewrites the stamp when the value actually differs, which is exactly when the
-# .so has to be recompiled -- without this, switching A_COPY_STREAMS silently
+# .so has to be recompiled -- without this, switching SUPERGROUP_WIDTH silently
 # reuses the previously built .so and the sweep measures one setting N times.
-ACOPY_STAMP := $(BUILD)/.a_copy_streams.stamp
-$(ACOPY_STAMP) : FORCE | $(BUILD)
-	@printf '%s\n' '$(A_COPY_STREAMS)' | cmp -s - $@ || printf '%s\n' '$(A_COPY_STREAMS)' > $@
+AG_KDA_STAMP := $(BUILD)/.ag_gemm_kda_mla_config.stamp
+AG_KDA_CONFIG = $(SUPERGROUP_WIDTH)
+$(AG_KDA_STAMP) : FORCE | $(BUILD)
+	@printf '%s\n' '$(AG_KDA_CONFIG)' | cmp -s - $@ || printf '%s\n' '$(AG_KDA_CONFIG)' > $@
 
 FORCE :
 
@@ -226,12 +228,14 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
+# Extra flags for the bench itself, e.g. BENCH_ARGS='--cooldown 2 --iters 12'.
+BENCH_ARGS ?=
 run-ag-gemm-kda-mla : ag-gemm-kda-mla
-	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_kda_mla_bench.py
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_kda_mla_bench.py $(BENCH_ARGS)
 
 ag-gemm-kda-mla : $(BUILD)/libag_gemm_kda_mla.so
 
-$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu Makefile $(ACOPY_STAMP) | $(BUILD)
+$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu Makefile $(AG_KDA_STAMP) | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(DEFS_ag_gemm_kda_mla) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 # === In-kernel timing profile ===
@@ -280,7 +284,7 @@ $(BUILD)/libag_gemm_kda_mla.so : $(AG_GEMM_KDA_MLA_HEADERS)
 ag-gemm-kda-mla-profile : $(BUILD)/libag_gemm_kda_mla_profile.so
 
 $(BUILD)/libag_gemm_kda_mla_profile.so : $(SRC)/ag_gemm_kda_mla.cu \
-		$(AG_GEMM_KDA_MLA_HEADERS) Makefile $(ACOPY_STAMP) | $(BUILD)
+		$(AG_GEMM_KDA_MLA_HEADERS) Makefile $(AG_KDA_STAMP) | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) \
 	    -DPROFILE_TIMINGS -DMKERNEL_EVENTS_PER_BLOCK=$(EVENTS_PER_BLOCK) \
 	    -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla_profile \

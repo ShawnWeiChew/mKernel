@@ -31,11 +31,25 @@ namespace ag_gemm_kda_mla {
 template <int _ROW_BLOCK, int _COL_BLOCK>
 struct fused_globals;
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _SUPERGROUP_WIDTH>
 void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G);
 
 static constexpr int DEFAULT_ROW_BLOCK = 128;
 static constexpr int DEFAULT_COL_BLOCK = 128;
+
+// Column tiles per supergroup in the tile schedule. It has to be a compile-time
+// constant -- the swizzle divides and mods by it on every tile -- so the widths
+// worth trying are instantiated up front and picked at launch. Every entry
+// doubles nothing on its own, but the set multiplies with the COL_BLOCK
+// dispatch: this is 2 x 4 = 8 kernels in the cubin.
+//
+// Passing 0 to entrypoint means "the build default", MKERNEL_SUPERGROUP_WIDTH.
+#ifndef MKERNEL_SUPERGROUP_WIDTH
+#define MKERNEL_SUPERGROUP_WIDTH 5
+#endif
+static constexpr int SUPERGROUP_WIDTHS[] = {5, 10, 15, 25};
+static constexpr int NUM_SUPERGROUP_WIDTHS =
+    sizeof(SUPERGROUP_WIDTHS) / sizeof(SUPERGROUP_WIDTHS[0]);
 
 #ifdef PROFILE_TIMINGS
 // Append-only: these values are the ABI of every saved .npz. Renumbering makes
@@ -246,6 +260,24 @@ std::vector<std::tuple<int, float, float>> ag_gemm_kda_mla_copy_times(int dev_id
 // keep the threshold in one place so Python can ask rather than guess.
 __host__ inline int ag_gemm_kda_mla_col_block(int M) { return M <= 512 ? 128 : 256; }
 
+// Runtime width -> compile-time instantiation. Kept in one place so the set of
+// launchable widths cannot drift from SUPERGROUP_WIDTHS.
+template <int _ROW_BLOCK, int _COL_BLOCK>
+inline void ag_gemm_kda_mla_dispatch_width(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G,
+                                           int width) {
+    switch (width) {
+        case 5:  launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, 5>(G);  return;
+        case 10: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, 10>(G); return;
+        case 15: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, 15>(G); return;
+        case 25: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, 25>(G); return;
+        default:
+            TORCH_CHECK(false,
+                        "supergroup_width ",
+                        width,
+                        " is not instantiated; pick one of SUPERGROUP_WIDTHS");
+    }
+}
+
 void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
@@ -253,7 +285,10 @@ void entrypoint(dist::ParallelBuffer& A,
                 // Device pointer to a ring of TimingRecords, or 0. Ignored
                 // unless built with -DPROFILE_TIMINGS, so the signature is the
                 // same either way.
-                const uint64_t timings_ptr = 0) {
+                const uint64_t timings_ptr = 0,
+                // Column tiles per supergroup, or 0 for the build default. Must
+                // be one of SUPERGROUP_WIDTHS -- only those are instantiated.
+                const int supergroup_width = 0) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -281,16 +316,18 @@ void entrypoint(dist::ParallelBuffer& A,
     TORCH_CHECK(M == A.data_.size(0) * A.local_world_size_,
                 "C's M dimension must equal A.local_M * world_size");
 
+    const int width = supergroup_width == 0 ? MKERNEL_SUPERGROUP_WIDTH : supergroup_width;
+
     if (ag_gemm_kda_mla_col_block(M) == 128) {
         using fg = fused_globals<128, 128>;
         fg globals = ag_gemm_kda_mla_make_globals<128, 128>(
             A, A_local_buf, B, C, dev_idx, M, N, timings_ptr);
-        launch_ag_gemm_kda_mla<128, 128>(globals);
+        ag_gemm_kda_mla_dispatch_width<128, 128>(globals, width);
     } else {
         using fg = fused_globals<128, 256>;
         fg globals = ag_gemm_kda_mla_make_globals<128, 256>(
             A, A_local_buf, B, C, dev_idx, M, N, timings_ptr);
-        launch_ag_gemm_kda_mla<128, 256>(globals);
+        ag_gemm_kda_mla_dispatch_width<128, 256>(globals, width);
     }
 }
 };  // namespace ag_gemm_kda_mla

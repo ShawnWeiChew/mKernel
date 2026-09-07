@@ -51,29 +51,17 @@ namespace ag_gemm_kda_mla {
 
 namespace {
 
-// The staging all-gather runs on the copy engines, not the SMs. A stream feeds
-// one engine, so issuing every shard on a single stream caps the gather at one
-// engine's bandwidth -- and the tile schedule starts consuming remote rows well
-// before the last shard would land at that rate, so the wait lands on the
-// critical path. Spreading the shards over several streams lets several engines
-// run concurrently.
-//
-// Override with -DMKERNEL_A_COPY_STREAMS=N; 1 restores the single-stream path.
-// More streams than peers buys nothing, so the count is clamped.
-#ifndef MKERNEL_A_COPY_STREAMS
-#define MKERNEL_A_COPY_STREAMS 4
-#endif
-constexpr int A_COPY_STREAMS_MAX = INTRA_NUM_DEVICES > 1 ? INTRA_NUM_DEVICES - 1 : 1;
-constexpr int A_COPY_STREAMS =
-    MKERNEL_A_COPY_STREAMS < 1
-        ? 1
-        : (MKERNEL_A_COPY_STREAMS > A_COPY_STREAMS_MAX ? A_COPY_STREAMS_MAX
-                                                       : MKERNEL_A_COPY_STREAMS);
-
 // Process-lifetime resources, one set per local CUDA device. This extension
 // uses one host process per GPU, and launches are serialized by that process.
 struct ACopyPipelineState {
-    cudaStream_t streams[A_COPY_STREAMS] = {};
+    // One stream for the whole staging gather. Spreading the shards over 2, 4
+    // and 7 streams was measured on 8x B300 at the KDA shape and is neutral at
+    // best: M=32768 went 1.885 ms (1 stream) / 1.880 (2) / 1.937 (4) / 2.214
+    // (7). The link, not the engine count, is the limit -- NCCL's all-gather of
+    // the same 411 MB takes 0.72-0.77 ms (530-570 GB/s), which one stream
+    // already reaches -- so extra streams only add per-copy scheduling and one
+    // cudaStreamWaitEvent plus flag write each.
+    cudaStream_t stream = nullptr;
     cudaEvent_t main_pre_event = nullptr;
     uint32_t* ready = nullptr;
     uint32_t epoch = 0;
@@ -101,10 +89,7 @@ ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
 inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     ACopyPipelineState& state = A_copy_states[dev_idx];
     if (!state.initialized) {
-        for (int i = 0; i < A_COPY_STREAMS; ++i) {
-            MKERNEL_CUDACHECK(
-                cudaStreamCreateWithFlags(&state.streams[i], cudaStreamNonBlocking));
-        }
+        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaMemset(state.ready, 0, INTRA_NUM_DEVICES * sizeof(uint32_t)));
@@ -134,7 +119,17 @@ static constexpr int PROFILE_CONSUMER_WARP = 5;
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
 // https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
-template <int SUPERGROUP_WIDTH = 5>
+//
+// The width trades A traffic against B's L2 footprint, within one device's
+// shard. A shard is re-read from DRAM once per supergroup, so passes =
+// ceil(num_col_tiles / W): at W=5 and 25 column tiles that is 5 passes, which
+// ncu attributes 2.35 GB of the kernel's 3.70 GB of DRAM traffic to. Raising W
+// cuts those passes, but the B panel L2 has to hold grows with it --
+// W * COL_BLOCK * K * 2 bytes, so 18 MB at W=5 and 92 MB at W=25. Past what L2
+// holds, B starts re-streaming per row tile instead, which is far worse than
+// what was saved. The candidates are instantiated in the header and chosen per
+// launch, so the bench can autotune it; the crossover is an L2 property.
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
                                                                    int num_cols,
                                                                    int tile_idx) {
@@ -156,7 +151,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _SUPERGROUP_WIDTH>
 __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
 
@@ -475,7 +470,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
                      tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
                      tile_id += num_comp_clusters) {
                     // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-                    auto [local_row_id, tile_col_idx] = calculate_tile_idx(
+                    auto [local_row_id, tile_col_idx] = calculate_tile_idx<_SUPERGROUP_WIDTH>(
                         cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
                     int target_device = tile_id / cluster_tiles_per_device;
@@ -517,7 +512,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         for (int tile_id = cluster_idx; tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
              tile_id += num_comp_clusters) {
             // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-            auto [local_tile_row, tile_col_idx] = calculate_tile_idx(
+            auto [local_tile_row, tile_col_idx] = calculate_tile_idx<_SUPERGROUP_WIDTH>(
                 cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
             const int target_device =
@@ -549,14 +544,14 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     }
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _SUPERGROUP_WIDTH>
 __global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_THREADS, 1) void fused_kernel_stub(
         const __grid_constant__ fused_globals<_ROW_BLOCK, _COL_BLOCK> G) {
-    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK>(G);
+    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _SUPERGROUP_WIDTH>(G);
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _SUPERGROUP_WIDTH>
 inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -578,17 +573,12 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     // prevents the copy stream from overwriting A_local_buf until the previous
     // persistent kernel on the caller stream has finished consuming it.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
-    for (int i = 0; i < A_COPY_STREAMS; ++i) {
-        MKERNEL_CUDACHECK(
-            cudaStreamWaitEvent(copy_state.streams[i], copy_state.main_pre_event, 0));
-    }
+    MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
 #ifdef PROFILE_TIMINGS
     // Origin for this launch's copy offsets, after the wait on the caller stream
     // so it marks when the copy stream actually began working.
-    // Every copy stream waits on the same pre-event, so one origin recorded on
-    // the first of them still dates the whole gather.
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_ref, copy_state.streams[0]));
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_ref, copy_state.stream));
     for (int i = 0; i < fg::NUM_DEVICES; ++i) copy_state.prof_valid[i] = false;
 #endif
 
@@ -601,28 +591,23 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr;
-        // Round-robin by ring distance, so consecutive peers -- which the tile
-        // schedule also reaches in ring order -- land on different engines
-        // rather than queueing behind each other.
-        cudaStream_t copy_stream = copy_state.streams[(distance - 1) % A_COPY_STREAMS];
 
 #ifdef PROFILE_TIMINGS
-        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_begin[peer], copy_stream));
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_begin[peer], copy_state.stream));
 #endif
 
         MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_stream));
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
 
 #ifdef PROFILE_TIMINGS
-        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_end[peer], copy_stream));
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.prof_end[peer], copy_state.stream));
         copy_state.prof_valid[peer] = true;
 #endif
 
         // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. Each shard's flag is written on the same
-        // stream that carried it, so a peer is announced when *its* copy is
-        // done rather than when every earlier one is.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_stream),
+        // before the completion epoch. The kernel-side load only needs GPU
+        // scope because it reads a flag and payload resident on this device.
+        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
                                              reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
                                              copy_state.epoch,
                                              CU_STREAM_WRITE_VALUE_DEFAULT));
@@ -632,7 +617,7 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK>;
+    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _SUPERGROUP_WIDTH>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

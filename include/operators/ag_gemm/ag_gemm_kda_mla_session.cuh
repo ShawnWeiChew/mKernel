@@ -12,7 +12,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::arg("A_local_buf"),
     pybind11::arg("B"),
     pybind11::arg("C"),
-    pybind11::arg("timings_ptr") = 0);
+    pybind11::arg("timings_ptr") = 0,
+    pybind11::arg("supergroup_width") = 0);
 
     // The launch geometry the profiler needs. Both template instantiations share
     // NUM_BLOCKS, the warp split and NUM_DEVICES -- only the pipeline depths and
@@ -26,9 +27,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // otherwise deadlocks in the multicast path rather than erroring.
         m.attr("NUM_DEVICES") = (int)fg::NUM_DEVICES;
         m.attr("K") = (int)fg::K;
-        // Copy streams the staging all-gather is spread over. Exported so a
-        // bench can report which setting produced a number.
-        m.attr("A_COPY_STREAMS") = (int)ag_gemm_kda_mla::A_COPY_STREAMS;
+        // Column tiles per supergroup. The widths instantiated in this .so are
+        // the only ones entrypoint accepts, so a bench autotunes over exactly
+        // this list; SUPERGROUP_WIDTH is what a launch gets if it passes 0.
+        m.attr("SUPERGROUP_WIDTH") = (int)MKERNEL_SUPERGROUP_WIDTH;
+        pybind11::list widths;
+        for (int i = 0; i < ag_gemm_kda_mla::NUM_SUPERGROUP_WIDTHS; ++i) {
+            widths.append(ag_gemm_kda_mla::SUPERGROUP_WIDTHS[i]);
+        }
+        m.attr("SUPERGROUP_WIDTHS") = widths;
 
         // Which warp plays which role. The renderer turns records into rows with
         // this, so exporting it keeps the plot honest if the warp specialisation
