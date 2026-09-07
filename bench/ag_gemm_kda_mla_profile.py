@@ -22,19 +22,43 @@ the compute, which is why the consumer's input wait is split into
 Re-render any time without a GPU:
 
     python python/timings.py traces/ag_gemm_kda_mla.npz --collapse
+
+Nsight Compute (--ncu) is a separate mode and deliberately shares nothing with
+the trace path:
+
+    make -j 10 GPU=blackwell run-ag-gemm-kda-mla-ncu
+
+It loads the *shipping* .so, not the profile one, and passes a null ring, so the
+cubin ncu measures carries no emit instructions, no extra registers and no ring
+traffic -- the counters describe the kernel that actually ships. Only one rank
+runs under ncu: the rank re-execs itself under `ncu`, the peers run natively and
+sit in a barrier keeping their buffers alive, and cudaProfilerStart/Stop brackets
+just the profiled launches so nothing else (NCCL, warmup) lands in the report.
+
+Kernel replay is the only workable mode here: application replay would re-run the
+torchrun child from scratch. Replay is safe because the kernel only *reads* the
+copy-engine ready flags (a monotone counter the host stream writes), so a second
+pass sees them already set instead of hanging.
 """
 
 import argparse
+import datetime
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+SELF = Path(__file__).resolve()
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 
 WARMUP = 5
+
+# Set on the rank that re-execs itself under ncu, so the new process runs the
+# kernel instead of wrapping itself again.
+NCU_ACTIVE_ENV = "MKERNEL_NCU_ACTIVE"
 
 # Matches bench/ag_gemm_kda_mla_bench.py: the 8-way tensor-parallel KDA
 # projection width before the kernel's column padding.
@@ -55,6 +79,30 @@ def build_argparser():
                     help="rows per band in the PDF; 0 for every CTA")
     ap.add_argument("--collapse", action="store_true",
                     help="render the two-colour wait/work view")
+
+    ncu = ap.add_argument_group(
+        "nsight compute",
+        "--ncu switches modes entirely: shipping .so, null ring, no trace, no PDF.",
+    )
+    ncu.add_argument("--ncu", action="store_true",
+                     help="profile one rank under Nsight Compute instead of tracing")
+    ncu.add_argument("--ncu-rank", type=int, default=0,
+                     help="the only rank that runs under ncu; the rest run natively")
+    ncu.add_argument("--ncu-out", default="traces/ag_gemm_kda_mla_ncu",
+                     help="report path, without the .ncu-rep suffix ncu appends")
+    ncu.add_argument("--ncu-set", default="full",
+                     help="ncu --set (full, detailed, basic, roofline, ...)")
+    ncu.add_argument("--ncu-iters", type=int, default=1,
+                     help="launches inside the profiled region")
+    ncu.add_argument("--ncu-bin", default=os.environ.get("NCU", "ncu"),
+                     help="ncu executable")
+    # Values that start with a dash need the = form, or argparse eats them as
+    # options of ours: --ncu-arg=--replay-mode --ncu-arg=application.
+    ncu.add_argument("--ncu-arg", action="append", default=[], metavar="ARG",
+                     help="extra flag passed through to ncu; repeatable, "
+                          "use --ncu-arg=--flag for dashed values")
+    ncu.add_argument("--ncu-timeout-min", type=int, default=60,
+                     help="collective timeout while the peers wait out the replay")
     return ap
 
 
@@ -75,6 +123,49 @@ def bootstrap(args):
     return subprocess.call(cmd)
 
 
+def exec_under_ncu(args, rank):
+    """Re-run this rank's process under ncu, leaving the peers untouched.
+
+    torchrun has no per-rank wrapper hook, so the child does it to itself: the
+    inherited RANK/MASTER_ADDR environment survives the exec, which is what
+    keeps the re-launched process the same rank of the same job.
+    """
+    ncu_bin = shutil.which(args.ncu_bin) or args.ncu_bin
+    out = Path(args.ncu_out)
+    if out.suffix == ".ncu-rep":
+        out = out.with_suffix("")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ncu_bin,
+        # Only this process; the peer ranks must run at full speed, both to
+        # feed the copy engine and to keep the report free of their kernels.
+        "--target-processes", "application-only",
+        # cudaProfilerStart/Stop in run() brackets the launches, so NCCL setup,
+        # the barriers and the warmup never reach the profiler.
+        "--profile-from-start", "off",
+        "--set", args.ncu_set,
+        "--force-overwrite",
+        "--export", str(out),
+        *args.ncu_arg,
+        sys.executable, str(SELF), *sys.argv[1:],
+    ]
+    env = dict(os.environ, **{NCU_ACTIVE_ENV: "1"})
+    print(f"rank {rank} under ncu: {' '.join(cmd)}\n", flush=True)
+    code = subprocess.call(cmd, env=env)
+    if code == 0:
+        print(f"wrote {out}.ncu-rep  (open with: ncu-ui {out}.ncu-rep)", flush=True)
+    else:
+        print(
+            f"ncu exited {code}. ERR_NVGPUCTRPERM means counters are locked to "
+            f"root: run as root, or `sudo sh -c 'echo options nvidia "
+            f"NVreg_RestrictProfilingToAdminUsers=0 > "
+            f"/etc/modprobe.d/nvidia-profile.conf'` and reboot.",
+            file=sys.stderr, flush=True,
+        )
+    return code
+
+
 def round_up(value, multiple):
     return ((value + multiple - 1) // multiple) * multiple
 
@@ -92,13 +183,29 @@ def run(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    # Under ncu the peers sit in the closing barrier for as long as the replay
+    # takes, which is minutes, not the 10 the default timeout allows.
+    dist.init_process_group(
+        "nccl", device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=datetime.timedelta(minutes=args.ncu_timeout_min) if args.ncu else None,
+    )
 
-    mod = load_module.load("ag_gemm_kda_mla_profile")
-    if not hasattr(mod, "EVENTS_PER_BLOCK"):
+    # ncu measures the shipping cubin, never the instrumented one: the emits,
+    # the registers they cost and the ring's stores are work the real kernel
+    # does not do, and every counter in the report would carry them.
+    mod_name = KERNEL_NAME if args.ncu else f"{KERNEL_NAME}_profile"
+    make_target = mod_name.replace("_", "-")
+    mod = load_module.load(mod_name)
+    if args.ncu and hasattr(mod, "EVENTS_PER_BLOCK"):
         raise RuntimeError(
-            "loaded .so is not a profile build (no EVENTS_PER_BLOCK). "
-            "Run `make -j 10 ag-gemm-kda-mla-profile`."
+            f"lib{mod_name}.so was built with -DPROFILE_TIMINGS. ncu must see a "
+            f"cubin with no timing instrumentation in it -- rebuild with "
+            f"`make -j 10 {make_target}`."
+        )
+    if not args.ncu and not hasattr(mod, "EVENTS_PER_BLOCK"):
+        raise RuntimeError(
+            f"lib{mod_name}.so is not a profile build (no EVENTS_PER_BLOCK). "
+            f"Run `make -j 10 {make_target}`."
         )
     if world_size != mod.NUM_DEVICES:
         raise SystemExit(
@@ -117,13 +224,17 @@ def run(args):
     padded_n = round_up(LOGICAL_N, col_block)
 
     num_blocks = mod.NUM_BLOCKS
-    events_per_block = mod.EVENTS_PER_BLOCK
+    events_per_block = 0 if args.ncu else mod.EVENTS_PER_BLOCK
     if rank == 0:
-        ring_mb = num_blocks * events_per_block * mod.TIMING_RECORD_SIZE / 1e6
+        if args.ncu:
+            tail = f"ncu on rank {args.ncu_rank}, no ring (uninstrumented build)"
+        else:
+            ring_mb = num_blocks * events_per_block * mod.TIMING_RECORD_SIZE / 1e6
+            tail = (f"ring {num_blocks}x{events_per_block} = "
+                    f"{ring_mb:.0f} MB/rank")
         print(
             f"M={M} (local {local_m}) N={padded_n} K={K} world={world_size} | "
-            f"COL_BLOCK={col_block} | {num_blocks} CTAs (all compute) | "
-            f"ring {num_blocks}x{events_per_block} = {ring_mb:.0f} MB/rank",
+            f"COL_BLOCK={col_block} | {num_blocks} CTAs (all compute) | {tail}",
             flush=True,
         )
 
@@ -152,6 +263,9 @@ def run(args):
         mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B, C, 0)
     torch.cuda.synchronize()
     dist.barrier()
+
+    if args.ncu:
+        return run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C)
 
     # Two int64s per 16-byte record. Zero init is what makes timestamp==0 the
     # "unwritten" sentinel the host unpacker uses to find each block's head.
@@ -203,26 +317,32 @@ def run(args):
         ev_ready = name_to_id["ACOPY_READY"]
         ev_begin = name_to_id["ACOPY_WAIT_BEGIN"]
         seq = records[:, 3] & ((1 << 28) - 1)
-        best_peer, best_slack, anchor = None, None, None
+        # copy_end[p] <= earliest ACOPY_READY[p] holds for EVERY peer, because a
+        # CTA cannot observe a flag before the copy that sets it finished. Each
+        # peer therefore caps the anchor; only the tightest cap satisfies all of
+        # them, so take the minimum rather than trusting any single peer.
+        #
+        # Picking the peer with the *smallest* observed spin is exactly wrong: a
+        # short spin means the flag was already set, i.e. the copy finished at
+        # some unknown earlier time -- the loosest bound available. The binding
+        # constraint comes from whichever peer actually blocked someone.
+        best_peer, anchor = None, None
         for peer, t_begin_ms, t_end_ms in raw:
             m = (records[:, 2] == ev_ready) & (seq == peer)
-            b = (records[:, 2] == ev_begin) & (seq == peer)
-            if not m.any() or not b.any():
+            if not m.any():
                 continue
-            ready_ns = int(records[m, 1].min())      # first CTA to observe it set
-            need_ns = int(records[b, 1].min())       # first CTA to want it
-            slack = ready_ns - need_ns               # small => tightly observed
-            if best_slack is None or slack < best_slack:
-                best_peer, best_slack = peer, slack
-                anchor = ready_ns - int(t_end_ms * 1e6)   # ref event, in globaltimer ns
+            cand = int(records[m, 1].min()) - int(t_end_ms * 1e6)
+            if anchor is None or cand < anchor:
+                best_peer, anchor = peer, cand
+        best_slack = 0
         if anchor is not None:
             for peer, t_begin_ms, t_end_ms in raw:
                 copy_rows.append((int(peer),
                                   anchor + int(t_begin_ms * 1e6),
                                   anchor + int(t_end_ms * 1e6)))
             t0 = int(records[:, 1].min())
-            print(f"\ncopy engine (anchored on peer {best_peer}, "
-                  f"observed to within {best_slack} ns):")
+            print(f"\ncopy engine (anchor bound by peer {best_peer} -- the one that "
+                  f"actually gated a CTA):")
             for peer, b_ns, e_ns in copy_rows:
                 print(f"  peer {peer}: {(b_ns-t0)/1000.0:8.1f} -> {(e_ns-t0)/1000.0:8.1f} us "
                       f"({(e_ns-b_ns)/1000.0:7.1f} us, "
@@ -283,11 +403,52 @@ def run(args):
     return 0
 
 
+def run_ncu(args, mod, rank, A_kernel, A_local_buf, B, C):
+    """Profiled launches only: null ring, no records, no plot.
+
+    Every rank runs this; only args.ncu_rank has an ncu attached, and the others
+    are here to serve its remote A reads and then wait in the closing barrier.
+    Leaving early would free the buffers a replay pass is still reading.
+    """
+    import torch
+    import torch.distributed as dist
+
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    profiled = rank == args.ncu_rank
+    if profiled:
+        torch.cuda.profiler.start()
+    start.record()
+    for _ in range(args.ncu_iters):
+        mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B, C, 0)
+    end.record()
+    torch.cuda.synchronize()
+    if profiled:
+        torch.cuda.profiler.stop()
+    per_launch_ms = start.elapsed_time(end) / max(args.ncu_iters, 1)
+
+    if profiled:
+        # Serialized and replayed, so this is wall time, not the kernel's time.
+        # The honest number is in the report; this only shows it ran.
+        print(f"\n{args.ncu_iters} launch(es) profiled, {per_launch_ms:.3f} ms each "
+              f"under the profiler (not a benchmark -- read the report)", flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+    return 0
+
+
 def main():
     args = build_argparser().parse_args()
     # torchrun sets RANK in the children; its absence means we are the launcher.
     if "RANK" not in os.environ:
         return bootstrap(args)
+    rank = int(os.environ["RANK"])
+    if args.ncu and rank == args.ncu_rank and not os.environ.get(NCU_ACTIVE_ENV):
+        # Before torch touches the GPU: ncu has to own the context from birth.
+        return exec_under_ncu(args, rank)
     return run(args)
 
 

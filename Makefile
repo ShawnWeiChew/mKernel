@@ -257,5 +257,35 @@ $(BUILD)/libag_gemm_kda_mla_profile.so : $(SRC)/ag_gemm_kda_mla.cu \
 run-ag-gemm-kda-mla-profile : ag-gemm-kda-mla-profile
 	$(PYTHON) bench/ag_gemm_kda_mla_profile.py $(PROFILE_ARGS)
 
+# === Nsight Compute ===
+#
+# Deliberately built on the *shipping* .so, not the profile one: -DPROFILE_TIMINGS
+# adds emits, registers and ring stores that every ncu counter would then include.
+# The driver enforces this -- it refuses to run ncu against an instrumented build.
+#
+# One rank runs under ncu (the driver re-execs that child under it); the peers run
+# natively and wait in a barrier so their A buffers stay mapped for the replay.
+# cudaProfilerStart/Stop brackets just the profiled launches, so NCCL setup and
+# the warmup never reach the report.
+#
+#   make -j 10 GPU=blackwell run-ag-gemm-kda-mla-ncu
+#   make run-ag-gemm-kda-mla-ncu NCU_SET=speed-of-light NCU_OUT=traces/sol
+#   make run-ag-gemm-kda-mla-ncu NCU_EXTRA='--ncu-arg=--kernel-name --ncu-arg=regex:fused'
+#
+# NCU_EXTRA values that start with a dash need the = form shown above.
+NCU              ?= ncu
+NCU_SET          ?= full
+NCU_OUT          ?= traces/ag_gemm_kda_mla_ncu
+NCU_RANK         ?= 0
+NCU_ITERS        ?= 1
+NCU_EXTRA        ?=
+
+run-ag-gemm-kda-mla-ncu : ag-gemm-kda-mla
+	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu \
+	    --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-out $(NCU_OUT) \
+	    --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) \
+	    $(NCU_EXTRA) $(PROFILE_ARGS)
+
 .PHONY: gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
-	ag-gemm-kda-mla-profile run-ag-gemm-kda-mla-profile
+	ag-gemm-kda-mla-profile run-ag-gemm-kda-mla-profile \
+	run-ag-gemm-kda-mla-ncu
