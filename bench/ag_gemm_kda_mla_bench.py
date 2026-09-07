@@ -20,6 +20,8 @@ from common import check_close  # noqa: E402
 GLOBAL_M = [2048, 4096, 8192, 16384, 32768]
 K = 7168
 
+IS_KDA = False
+
 # Eight-way tensor parallel KDA projection width before kernel padding:
 #   (4 * 12288 + 96) / 8 + 128 = 6284.
 LOGICAL_N = 6284
@@ -449,13 +451,12 @@ def main() -> int:
     world_size = dist.get_world_size()
     is_chief = rank == 0
 
-    if world_size == 4:
-        LOGICAL_N = (4 * 12288 + 96) // 4 + 128
-    elif world_size != 8:
-        raise RuntimeError(
-            f"This correctness test fixes the logical projection width at "
-            f"{LOGICAL_N}, which assumes 8 ranks; got {world_size}."
-        )
+    assert world_size == 4 or world_size == 8, f"{world_size=} is not 4 or 8"
+
+    if IS_KDA:
+        LOGICAL_N = (4 * 12288 + 96) // world_size + 128
+    else:
+        LOGICAL_N = 576 + 1536 + 12288 // world_size
 
     if local_world_size != world_size:
         raise RuntimeError(
