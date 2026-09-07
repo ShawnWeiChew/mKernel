@@ -35,10 +35,23 @@ runs under ncu: the rank re-execs itself under `ncu`, the peers run natively and
 sit in a barrier keeping their buffers alive, and cudaProfilerStart/Stop brackets
 just the profiled launches so nothing else (NCCL, warmup) lands in the report.
 
-Kernel replay is the only workable mode here: application replay would re-run the
-torchrun child from scratch. Replay is safe because the kernel only *reads* the
-copy-engine ready flags (a monotone counter the host stream writes), so a second
-pass sees them already set instead of hanging.
+Replay mode is the whole story here. Kernel replay -- ncu's default -- snapshots
+every allocation reachable from the context before each pass, and a DistBuffer's
+multicast/peer-imported mappings are not copyable, so it dies before the first
+pass with:
+
+    cuda_context_state>> Failed to copy memory
+    executeInternal returned an error: ContextSaveFailed
+
+There is no ncu flag to exclude an allocation from that snapshot, so the default
+here is application replay, which re-runs instead of saving. That relaunches the
+whole job once per metric pass, which means ncu has to wrap *torchrun*: relaunch
+one rank alone and its peers are gone. So this mode profiles from the launcher,
+attaches to every rank (--target-processes all), and lets cudaProfilerStart pick
+which one actually records -- the peers are attached but collect nothing.
+
+Each pass is a full job restart, so keep the pass count down: --ncu-set detailed,
+or a targeted --ncu-arg=--metrics=... beats `full` by minutes.
 """
 
 import argparse
@@ -90,8 +103,15 @@ def build_argparser():
                      help="the only rank that runs under ncu; the rest run natively")
     ncu.add_argument("--ncu-out", default="traces/ag_gemm_kda_mla_ncu",
                      help="report path, without the .ncu-rep suffix ncu appends")
-    ncu.add_argument("--ncu-set", default="full",
-                     help="ncu --set (full, detailed, basic, roofline, ...)")
+    ncu.add_argument("--ncu-replay", default="application",
+                     choices=("application", "kernel"),
+                     help="application (default): relaunch the job per pass, ncu "
+                          "wraps torchrun. kernel: ncu wraps one rank, but this "
+                          "kernel's multicast buffers make ncu's context save fail")
+    # Every extra pass is another full job restart under application replay,
+    # so `detailed` rather than `full` is the default.
+    ncu.add_argument("--ncu-set", default="detailed",
+                     help="ncu --set (detailed, basic, roofline, full, ...)")
     ncu.add_argument("--ncu-iters", type=int, default=1,
                      help="launches inside the profiled region")
     ncu.add_argument("--ncu-bin", default=os.environ.get("NCU", "ncu"),
@@ -117,53 +137,89 @@ def bootstrap(args):
     cmd = [
         sys.executable, "-m", "torch.distributed.run",
         "--standalone", f"--nproc-per-node={nproc}",
-        str(Path(__file__).resolve()), *sys.argv[1:],
+        str(SELF), *sys.argv[1:],
     ]
+    env = dict(os.environ)
+    out = None
+    if args.ncu and args.ncu_replay == "application":
+        # Application replay relaunches the profiled application once per metric
+        # pass. That application has to be the whole job: relaunch a single rank
+        # and it comes back to peers that have long since exited.
+        out = ncu_report_path(args)
+        cmd = ncu_prefix(args, "all", out) + cmd
+        # The children are already inside ncu; stop the profiled rank from
+        # wrapping itself a second time.
+        env[NCU_ACTIVE_ENV] = "1"
+        print(f"application replay: the whole {nproc}-rank job reruns once per "
+              f"metric pass, so prefer --ncu-set detailed over full\n", flush=True)
+
     print(f"spawning {nproc} ranks: {' '.join(cmd)}\n", flush=True)
-    return subprocess.call(cmd)
+    code = subprocess.call(cmd, env=env)
+    return report_ncu_exit(code, out) if out is not None else code
 
 
-def exec_under_ncu(args, rank):
-    """Re-run this rank's process under ncu, leaving the peers untouched.
-
-    torchrun has no per-rank wrapper hook, so the child does it to itself: the
-    inherited RANK/MASTER_ADDR environment survives the exec, which is what
-    keeps the re-launched process the same rank of the same job.
-    """
-    ncu_bin = shutil.which(args.ncu_bin) or args.ncu_bin
+def ncu_report_path(args):
     out = Path(args.ncu_out)
-    if out.suffix == ".ncu-rep":
+    if out.suffix == ".ncu-rep":     # ncu appends it; don't end up with two
         out = out.with_suffix("")
     out.parent.mkdir(parents=True, exist_ok=True)
+    return out
 
-    cmd = [
-        ncu_bin,
-        # Only this process; the peer ranks must run at full speed, both to
-        # feed the copy engine and to keep the report free of their kernels.
-        "--target-processes", "application-only",
-        # cudaProfilerStart/Stop in run() brackets the launches, so NCCL setup,
-        # the barriers and the warmup never reach the profiler.
+
+def ncu_prefix(args, target_processes, out):
+    """The ncu invocation both wrapping strategies share."""
+    return [
+        shutil.which(args.ncu_bin) or args.ncu_bin,
+        "--target-processes", target_processes,
+        # cudaProfilerStart/Stop in run_ncu() brackets the launches, so NCCL
+        # setup, the barriers and the warmup never reach the profiler -- and
+        # under --target-processes all it is also what keeps the peer ranks,
+        # which never call it, out of the report.
         "--profile-from-start", "off",
+        "--replay-mode", args.ncu_replay,
         "--set", args.ncu_set,
         "--force-overwrite",
         "--export", str(out),
         *args.ncu_arg,
+    ]
+
+
+def report_ncu_exit(code, out):
+    if code == 0:
+        print(f"\nwrote {out}.ncu-rep  (open with: ncu-ui {out}.ncu-rep)", flush=True)
+        return code
+    print(
+        f"\nncu exited {code}.\n"
+        f"  ContextSaveFailed / 'Failed to copy memory': kernel replay cannot "
+        f"snapshot the multicast DistBuffer mappings. Use the default "
+        f"--ncu-replay application.\n"
+        f"  ERR_NVGPUCTRPERM: counters are locked to root -- run as root, or "
+        f"`sudo sh -c 'echo options nvidia "
+        f"NVreg_RestrictProfilingToAdminUsers=0 > "
+        f"/etc/modprobe.d/nvidia-profile.conf'` and reboot.",
+        file=sys.stderr, flush=True,
+    )
+    return code
+
+
+def exec_under_ncu(args, rank):
+    """Kernel replay: wrap this one rank, leave the peers untouched.
+
+    torchrun has no per-rank wrapper hook, so the child does it to itself: the
+    inherited RANK/MASTER_ADDR environment survives the exec, which is what
+    keeps the re-launched process the same rank of the same job. Only valid for
+    kernel replay -- application replay would relaunch this rank alone.
+    """
+    out = ncu_report_path(args)
+    cmd = [
+        # application-only: the peers must run at full speed, both to serve the
+        # remote A reads and to stay out of the report.
+        *ncu_prefix(args, "application-only", out),
         sys.executable, str(SELF), *sys.argv[1:],
     ]
     env = dict(os.environ, **{NCU_ACTIVE_ENV: "1"})
     print(f"rank {rank} under ncu: {' '.join(cmd)}\n", flush=True)
-    code = subprocess.call(cmd, env=env)
-    if code == 0:
-        print(f"wrote {out}.ncu-rep  (open with: ncu-ui {out}.ncu-rep)", flush=True)
-    else:
-        print(
-            f"ncu exited {code}. ERR_NVGPUCTRPERM means counters are locked to "
-            f"root: run as root, or `sudo sh -c 'echo options nvidia "
-            f"NVreg_RestrictProfilingToAdminUsers=0 > "
-            f"/etc/modprobe.d/nvidia-profile.conf'` and reboot.",
-            file=sys.stderr, flush=True,
-        )
-    return code
+    return report_ncu_exit(subprocess.call(cmd, env=env), out)
 
 
 def round_up(value, multiple):
@@ -446,9 +502,18 @@ def main():
     if "RANK" not in os.environ:
         return bootstrap(args)
     rank = int(os.environ["RANK"])
-    if args.ncu and rank == args.ncu_rank and not os.environ.get(NCU_ACTIVE_ENV):
-        # Before torch touches the GPU: ncu has to own the context from birth.
-        return exec_under_ncu(args, rank)
+    if args.ncu and not os.environ.get(NCU_ACTIVE_ENV):
+        if args.ncu_replay == "application":
+            # Someone ran this under their own torchrun, so the launcher ncu has
+            # to wrap is out of reach.
+            raise SystemExit(
+                "--ncu-replay application needs to wrap the launcher: run "
+                "`python bench/ag_gemm_kda_mla_profile.py --ncu ...` without "
+                "torchrun and let it spawn the ranks itself."
+            )
+        if rank == args.ncu_rank:
+            # Before torch touches the GPU: ncu has to own the context from birth.
+            return exec_under_ncu(args, rank)
     return run(args)
 
 

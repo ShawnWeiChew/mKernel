@@ -263,18 +263,24 @@ run-ag-gemm-kda-mla-profile : ag-gemm-kda-mla-profile
 # adds emits, registers and ring stores that every ncu counter would then include.
 # The driver enforces this -- it refuses to run ncu against an instrumented build.
 #
-# One rank runs under ncu (the driver re-execs that child under it); the peers run
-# natively and wait in a barrier so their A buffers stay mapped for the replay.
-# cudaProfilerStart/Stop brackets just the profiled launches, so NCCL setup and
-# the warmup never reach the report.
+# NCU_REPLAY=application (the default) is not a preference: kernel replay
+# snapshots every allocation reachable from the context before each pass, and the
+# multicast/peer-imported DistBuffer mappings cannot be copied, so ncu dies with
+# ContextSaveFailed before the first pass. Application replay re-runs instead of
+# saving -- which relaunches the whole job once per metric pass, so ncu wraps
+# torchrun and attaches to every rank, and cudaProfilerStart on NCU_RANK alone
+# decides who actually records.
+#
+# Passes cost a full job restart each, hence NCU_SET=detailed rather than full.
 #
 #   make -j 10 GPU=blackwell run-ag-gemm-kda-mla-ncu
-#   make run-ag-gemm-kda-mla-ncu NCU_SET=speed-of-light NCU_OUT=traces/sol
-#   make run-ag-gemm-kda-mla-ncu NCU_EXTRA='--ncu-arg=--kernel-name --ncu-arg=regex:fused'
+#   make run-ag-gemm-kda-mla-ncu NCU=/usr/local/cuda-13.1/bin/ncu NCU_SET=basic
+#   make run-ag-gemm-kda-mla-ncu NCU_EXTRA='--ncu-arg=--metrics=sm__cycles_active.avg'
 #
 # NCU_EXTRA values that start with a dash need the = form shown above.
 NCU              ?= ncu
-NCU_SET          ?= full
+NCU_SET          ?= detailed
+NCU_REPLAY       ?= application
 NCU_OUT          ?= traces/ag_gemm_kda_mla_ncu
 NCU_RANK         ?= 0
 NCU_ITERS        ?= 1
@@ -282,8 +288,8 @@ NCU_EXTRA        ?=
 
 run-ag-gemm-kda-mla-ncu : ag-gemm-kda-mla
 	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu \
-	    --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-out $(NCU_OUT) \
-	    --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) \
+	    --ncu-bin $(NCU) --ncu-set $(NCU_SET) --ncu-replay $(NCU_REPLAY) \
+	    --ncu-out $(NCU_OUT) --ncu-rank $(NCU_RANK) --ncu-iters $(NCU_ITERS) \
 	    $(NCU_EXTRA) $(PROFILE_ARGS)
 
 .PHONY: gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
