@@ -184,6 +184,10 @@ def run(args):
         print(f"  WARNING: {overflowed} CTAs hit the cap and dropped their tail. "
               f"Rebuild with EVENTS_PER_BLOCK={events_per_block * 2}.")
 
+    warp_layout = {str(k): int(v) for k, v in mod.WARP_LAYOUT.items()}
+    name_to_id = {str(k): int(v) for k, v in mod.TIMING_EVENTS.items()}
+    phases = tt.phases_for(KERNEL_NAME)
+
     # Copy-engine spans. Widths come from CUDA events (exact, and independent of
     # any clock base); their position comes from the kernel's own ACOPY_READY
     # records. Anchoring uses the peer whose flag a CTA was actually caught
@@ -223,10 +227,6 @@ def run(args):
                 print(f"  peer {peer}: {(b_ns-t0)/1000.0:8.1f} -> {(e_ns-t0)/1000.0:8.1f} us "
                       f"({(e_ns-b_ns)/1000.0:7.1f} us, "
                       f"{local_m*K*2/1e9/((e_ns-b_ns)/1e9):.0f} GB/s)")
-
-    warp_layout = {str(k): int(v) for k, v in mod.WARP_LAYOUT.items()}
-    name_to_id = {str(k): int(v) for k, v in mod.TIMING_EVENTS.items()}
-    phases = tt.phases_for(KERNEL_NAME)
 
     out = tt.save(
         args.out,
