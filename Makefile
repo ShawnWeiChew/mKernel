@@ -105,10 +105,13 @@ DEFS_dispatch_gemm_blackwell := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8
 DEFS_dispatch_gemm_warp_specialization := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 # Copy streams the ag_gemm_kda_mla staging all-gather is spread over. One stream
 # feeds one copy engine, so this is the knob for how much of the link the gather
-# can use; 1 is the old single-stream behaviour. Sweep it with
-# `make A_COPY_STREAMS=n ...` -- the .so rebuilds when it changes.
+# can use; 1 is the old single-stream behaviour.
+#
+# One build per value: `make A_COPY_STREAMS=n ag-gemm-kda-mla` compiles that one
+# setting, so a sweep is a shell loop over builds, not a single make call.
 A_COPY_STREAMS ?= 4
 DEFS_ag_gemm_kda_mla := -DMKERNEL_A_COPY_STREAMS=$(A_COPY_STREAMS)
+
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
 DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
@@ -116,6 +119,17 @@ DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K
 # === Build targets ===
 BUILD := build
 SRC   := src
+
+# make cannot see that a variable given on the command line changed, so record
+# the value in a stamp and depend on that. The recipe runs every time but only
+# rewrites the stamp when the value actually differs, which is exactly when the
+# .so has to be recompiled -- without this, switching A_COPY_STREAMS silently
+# reuses the previously built .so and the sweep measures one setting N times.
+ACOPY_STAMP := $(BUILD)/.a_copy_streams.stamp
+$(ACOPY_STAMP) : FORCE | $(BUILD)
+	@printf '%s\n' '$(A_COPY_STREAMS)' | cmp -s - $@ || printf '%s\n' '$(A_COPY_STREAMS)' > $@
+
+FORCE :
 
 KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention dispatch_gemm_glu_combine
 
@@ -217,7 +231,7 @@ run-ag-gemm-kda-mla : ag-gemm-kda-mla
 
 ag-gemm-kda-mla : $(BUILD)/libag_gemm_kda_mla.so
 
-$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu Makefile | $(BUILD)
+$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu Makefile $(ACOPY_STAMP) | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(DEFS_ag_gemm_kda_mla) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 # === In-kernel timing profile ===
@@ -266,7 +280,7 @@ $(BUILD)/libag_gemm_kda_mla.so : $(AG_GEMM_KDA_MLA_HEADERS)
 ag-gemm-kda-mla-profile : $(BUILD)/libag_gemm_kda_mla_profile.so
 
 $(BUILD)/libag_gemm_kda_mla_profile.so : $(SRC)/ag_gemm_kda_mla.cu \
-		$(AG_GEMM_KDA_MLA_HEADERS) Makefile | $(BUILD)
+		$(AG_GEMM_KDA_MLA_HEADERS) Makefile $(ACOPY_STAMP) | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) \
 	    -DPROFILE_TIMINGS -DMKERNEL_EVENTS_PER_BLOCK=$(EVENTS_PER_BLOCK) \
 	    -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla_profile \
@@ -349,7 +363,7 @@ run-cutlass-ag-gemm-ncu : tune-cutlass-ag-gemm
 	$(PYTHON) bench/ag_gemm_kda_mla_profile.py --ncu --impl cutlass $(NCU_FLAGS) \
 	    --cutlass-tiler $(CUTLASS_TILER) $(NCU_EXTRA) $(PROFILE_ARGS)
 
-.PHONY: acquire-load-pass-bench \
+.PHONY: FORCE acquire-load-pass-bench \
 	gemm-ar-blackwell-profile run-gemm-ar-blackwell-profile \
 	ag-gemm-kda-mla-profile run-ag-gemm-kda-mla-profile \
 	run-ag-gemm-kda-mla-ncu tune-cutlass-ag-gemm run-cutlass-ag-gemm-ncu
