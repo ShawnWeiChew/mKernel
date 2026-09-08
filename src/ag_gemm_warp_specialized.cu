@@ -34,7 +34,7 @@
 #include "memory/tk_ops_thread_util_sync.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
 #include "memory/tk_ops_thread_util_util.cuh"
-#include "operators/ag_gemm/ag_gemm_kda_mla.cuh"
+#include "operators/ag_gemm/ag_gemm_warp_specialized.cuh"
 
 // clang-format off
 // this has to go under tk_ops_group_group
@@ -244,8 +244,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(
                                 {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
                                 tma_load[input_stage_id]);
 
-                tma::load_async(
-                    A_smem, A_gmem, {A_tile_row_idx, iter_k}, tma_load[input_stage_id]);
+                tma::load_async(A_smem, A_gmem, {A_tile_row_idx, iter_k}, tma_load[input_stage_id]);
             }
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -509,4 +508,4 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _
 }
 };  // namespace ag_gemm_kda_mla
 
-#include "operators/ag_gemm/ag_gemm_kda_mla_session.cuh"
+#include "operators/ag_gemm/ag_gemm_warp_specialized_session.cuh"
