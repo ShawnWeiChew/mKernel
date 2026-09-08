@@ -434,31 +434,28 @@ def tune_tk_comm_sms(
 ########## mKernel schedule autotuning ##########
 
 
-def mkernel_candidates(mod, local_m: int) -> list[MKernelConfig]:
-    """The configs worth measuring for a shard of `local_m` rows.
+def should_tune_mkernel(local_m: int) -> bool:
+    """Whether this shape's schedule is still an open question.
 
     A 2-CTA cluster takes one 128-row tile per CTA, so it can only run a shard
     that is a multiple of 256 rows and pads up to get one. When the shard
-    already divides, that padding is free and 2-CTA is strictly the better
-    schedule, so there is nothing to learn from the 1-CTA variants -- sweep
-    2-CTA only.
+    already divides, that padding is free, the entrypoint's hand-picked table
+    is already the answer, and re-deriving it costs bench time and reports a
+    number that is not comparable to the ones already collected -- so leave
+    those shapes on the shipping dispatch.
 
-    The shapes where it does not divide are the ones worth the full sweep.
-    Note the two are not alike. M=3072's shard is 384 rows = 3 row tiles, so
-    1-CTA runs it unpadded where 2-CTA pads to 512 -- 1.7% padded work against
-    26.3%, which is the case where dropping to a 1-CTA MMA can actually pay.
-    M=3584's shard is 448 rows = 3.5 tiles, so it pads to 512 under *either*
-    schedule and 1-CTA buys no rows back; it is swept because 2-CTA still pays
-    padding there, and the two schedules are then a straight comparison at
-    equal padding.
+    The shards that do not divide are the open question, and they are not
+    alike. M=3072's shard is 384 rows = 3 row tiles, so 1-CTA runs it unpadded
+    where 2-CTA pads to 512 -- 1.7% padded work against 26.3%, the case where
+    dropping to a 1-CTA MMA can actually pay. M=3584's shard is 448 rows = 3.5
+    tiles, so it pads to 512 under either schedule and 1-CTA buys no rows
+    back; it is swept because 2-CTA still pays padding there, making the two a
+    straight comparison at equal padding.
 
-    Derived from the shard rather than a list of M, so it keeps holding if
+    Keyed on the shard rather than a list of M, so it keeps holding if
     GLOBAL_M changes.
     """
-    configs = [tuple(config) for config in mod.ag_gemm_kda_mla_tuning_configs()]
-    if local_m % 256 == 0:
-        configs = [config for config in configs if config[1] == 2]
-    return configs
+    return local_m % 256 != 0
 
 
 def mkernel_config_label(config: MKernelConfig) -> str:
@@ -554,7 +551,8 @@ def tune_mkernel(
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
 
-    for config in mkernel_candidates(mod, local_m):
+    for config in mod.ag_gemm_kda_mla_tuning_configs():
+        config = tuple(config)
         col_block, num_cta, supergroup_width = config
         row_granularity, col_granularity = mod.ag_gemm_kda_mla_granularity(
             num_cta, col_block
@@ -1053,7 +1051,7 @@ def main() -> int:
         mkernel_config = None
         mkernel_tune_log = []
         best_operand = None
-        if _env_enabled(_MKERNEL_ENV_AUTOTUNE):
+        if _env_enabled(_MKERNEL_ENV_AUTOTUNE) and should_tune_mkernel(local_m):
             # The reference is otherwise only materialised inside the TK block,
             # which does not run when TK is unavailable. Tuning needs it to
             # reject a candidate that is fast because it is wrong.
