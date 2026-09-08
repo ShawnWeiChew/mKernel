@@ -434,6 +434,33 @@ def tune_tk_comm_sms(
 ########## mKernel schedule autotuning ##########
 
 
+def mkernel_candidates(mod, local_m: int) -> list[MKernelConfig]:
+    """The configs worth measuring for a shard of `local_m` rows.
+
+    A 2-CTA cluster takes one 128-row tile per CTA, so it can only run a shard
+    that is a multiple of 256 rows and pads up to get one. When the shard
+    already divides, that padding is free and 2-CTA is strictly the better
+    schedule, so there is nothing to learn from the 1-CTA variants -- sweep
+    2-CTA only.
+
+    The shapes where it does not divide are the ones worth the full sweep.
+    Note the two are not alike. M=3072's shard is 384 rows = 3 row tiles, so
+    1-CTA runs it unpadded where 2-CTA pads to 512 -- 1.7% padded work against
+    26.3%, which is the case where dropping to a 1-CTA MMA can actually pay.
+    M=3584's shard is 448 rows = 3.5 tiles, so it pads to 512 under *either*
+    schedule and 1-CTA buys no rows back; it is swept because 2-CTA still pays
+    padding there, and the two schedules are then a straight comparison at
+    equal padding.
+
+    Derived from the shard rather than a list of M, so it keeps holding if
+    GLOBAL_M changes.
+    """
+    configs = [tuple(config) for config in mod.ag_gemm_kda_mla_tuning_configs()]
+    if local_m % 256 == 0:
+        configs = [config for config in configs if config[1] == 2]
+    return configs
+
+
 def mkernel_config_label(config: MKernelConfig) -> str:
     col_block, num_cta, supergroup_width = config
     return (
@@ -472,7 +499,7 @@ def make_mkernel_operands(
     a.data_[:local_m].copy_(a_local)
     b = torch.zeros((K, padded_n), device="cuda", dtype=torch.bfloat16)
     b[:, :logical_n].copy_(b_ref)
-    return {
+    operands = {
         "a": a,
         "a_local_buf": torch.empty(
             (padded_m, K), device="cuda", dtype=torch.bfloat16
@@ -484,6 +511,15 @@ def make_mkernel_operands(
         "padded_local_m": padded_local_m,
         "padded_n": padded_n,
     }
+    # The kernel's first act is to pull every peer's shard out of their
+    # DistBuffer, so no rank may launch until all of them have finished
+    # filling theirs. Without this a rank that arrives early copies a
+    # neighbour's still-zeroed buffer and silently produces zero C tiles for
+    # that peer's rows. The correctness pass guards its own first launch the
+    # same way.
+    torch.cuda.synchronize()
+    dist.barrier()
+    return operands
 
 
 def tune_mkernel(
@@ -518,8 +554,7 @@ def tune_mkernel(
     tune_warmup = min(2, warmup)
     tune_iterations = min(5, iterations)
 
-    for config in mod.ag_gemm_kda_mla_tuning_configs():
-        config = tuple(config)
+    for config in mkernel_candidates(mod, local_m):
         col_block, num_cta, supergroup_width = config
         row_granularity, col_granularity = mod.ag_gemm_kda_mla_granularity(
             num_cta, col_block
