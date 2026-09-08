@@ -83,17 +83,6 @@ struct fused_globals {
     // this is the number of partitions for the epilogue tile in SMEM
     static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 2 : 4;
 
-    // NOTE: based on PK paper, To sustain over 80% bandwidth utilization, the transfer granularity
-    // must be at least 256 MB when using the copy engine, whereas device-side methods (TMA) achieve
-    // comparable utilization with only 2 KB. The vllm / cutlass one uses copy engine, but even the
-    // largest tile size with TP = 8 is only 4096 * 64 * 2 = 500 KB
-
-    // TODO: load, in a ring like fashion, the data necessary from the target GMEM into SMEM
-    // for correctness first, we can just load from the same peer every time
-
-    // NOTE: potential problem with this is that the load is never cached in local L2, which may be
-    // why it is not used if that is teh case, then fine grained cudaMemcpyAsync, which will be
-    // dispatched to run on a separate stream will be better
     static constexpr int ROW_BLOCK = _ROW_BLOCK;
     static constexpr int COL_BLOCK = _COL_BLOCK;
     static constexpr int RED_BLOCK = 64;
