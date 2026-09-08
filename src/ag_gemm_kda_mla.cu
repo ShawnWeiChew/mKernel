@@ -74,6 +74,18 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     return state;
 }
 
+// tcgen05 MMA with the CTA group taken from the config. mm2_AB / mma2_AB are
+// hardwired to a 2-CTA group, so spell out the ncta template argument instead.
+template <int NUM_CTA, typename D, typename A, typename B>
+__device__ __forceinline__ void mm_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
+    kittens::mma<transpose::N, transpose::N, D, A, B, 0, NUM_CTA>(d, a, b, sem);
+}
+
+template <int NUM_CTA, typename D, typename A, typename B>
+__device__ __forceinline__ void mma_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
+    kittens::mma<transpose::N, transpose::N, D, A, B, 1, NUM_CTA>(d, a, b, sem);
+}
+
 }  // namespace
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
@@ -100,9 +112,10 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
-__device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
+__device__ __forceinline__ void ag_gemm_kda_mla(
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -150,7 +163,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
 #pragma unroll
         for (int i = 0; i < fg::PRODUCER_CONSUMER_PIPELINE_STAGES; i++) {
             // tma finish has to be broadcasted to mma warp
-            init_semaphore(tma_load[i], 0, 2);
+            init_semaphore(tma_load[i], 0, fg::NUM_CLUSTERS);
             // mma warp will broadcast finish
             init_semaphore(mma_finish[i], 0, 1);
         }
@@ -162,7 +175,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             init_semaphore(epilogue_tmem_finished[i], WARPGROUP_WARPS * fg::NUM_CLUSTERS);
         }
 
-        init_semaphore(tmem_finished, 1);
+        // every CTA in the cluster arrives here, itself included
+        init_semaphore(tmem_finished, fg::NUM_CTA);
     } else if (warp_id == 1) {
         tm_alloc.provision(tmem_addr);
     }
@@ -199,22 +213,40 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
             wait(mma_finish[input_stage_id], (phasebits >> 0 & 0b1));
-            tma::cluster::expect_bytes(
-                tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
 
-            tma::cluster::load_async(B_smem,
-                                     G.B,
-                                     {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
-                                     tma_load[input_stage_id],
-                                     (uint16_t)(1 << cta_rank),
-                                     0);
+            if constexpr (_NUM_CTA == 2) {
+                tma::cluster::expect_bytes(
+                    tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
 
-            tma::cluster::load_async(A_smem,
-                                     A_gmem,
-                                     {A_tile_row_idx, iter_k},
-                                     tma_load[input_stage_id],
-                                     (uint16_t)(1 << cta_rank),
-                                     0);
+                tma::cluster::load_async(B_smem,
+                                         G.B,
+                                         {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
+                                         tma_load[input_stage_id],
+                                         (uint16_t)(1 << cta_rank),
+                                         0);
+
+                tma::cluster::load_async(A_smem,
+                                         A_gmem,
+                                         {A_tile_row_idx, iter_k},
+                                         tma_load[input_stage_id],
+                                         (uint16_t)(1 << cta_rank),
+                                         0);
+            } else {
+                // A 1-CTA cluster has nothing to multicast to and nothing to
+                // map: the barrier is this CTA's own. The cluster overloads
+                // would still emit cta_group::2.multicast::cluster loads, so
+                // take the plain CTA-scope TMA path instead.
+                tma::expect_bytes(tma_load[input_stage_id],
+                                  sizeof(fg::A_tile) + sizeof(fg::B_tile));
+
+                tma::load_async(B_smem,
+                                G.B,
+                                {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
+                                tma_load[input_stage_id]);
+
+                tma::load_async(
+                    A_smem, A_gmem, {A_tile_row_idx, iter_k}, tma_load[input_stage_id]);
+            }
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -230,7 +262,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
-            mm2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mm_AB_ncta<fg::NUM_CTA>(
+                tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -243,7 +276,8 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
-            mma2_AB(tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mma_AB_ncta<fg::NUM_CTA>(
+                tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -282,7 +316,11 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
         tensor_load_wait();
 
         if (elect_warp_leader()) {
-            tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
+            if constexpr (_NUM_CTA == 2) {
+                tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
+            } else {
+                arrive(epilogue_tmem_finished[epilogue_stage_id]);
+            }
         }
 
 #pragma unroll
@@ -385,7 +423,14 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
 
         if (group<fg::EPILOGUE_WARPS>::warpid() == 0) {
             if (elect_warp_leader()) {
-                tma::cluster::arrive(tmem_finished, 1 - cta_rank);
+                if constexpr (_NUM_CTA == 1) {
+                    arrive(tmem_finished);
+                } else {
+#pragma unroll
+                    for (int peer = 0; peer < fg::NUM_CTA; peer++) {
+                        tma::cluster::arrive(tmem_finished, peer);
+                    }
+                }
             }
             // Only reach here if we finish with our tmem. Other party as well
             wait(tmem_finished, 0);
@@ -394,18 +439,21 @@ __device__ __forceinline__ void ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, 
     }
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
-__global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_CLUSTERS, 1, 1)
-    __launch_bounds__(fused_globals<_ROW_BLOCK, _COL_BLOCK>::NUM_THREADS, 1) void fused_kernel_stub(
-        const __grid_constant__ fused_globals<_ROW_BLOCK, _COL_BLOCK> G) {
-    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, SUPERGROUP_WIDTH>(G);
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
+__global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM_CLUSTERS, 1, 1)
+    __launch_bounds__(
+        fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM_THREADS,
+        1) void fused_kernel_stub(const __grid_constant__
+                                      fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> G) {
+    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>(G);
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH>
-inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G) {
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
+inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
+    static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
     copy_state.epoch++;
@@ -451,7 +499,7 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& 
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, SUPERGROUP_WIDTH>;
+    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

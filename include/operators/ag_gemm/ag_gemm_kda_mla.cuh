@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <tuple>
 #include <vector>
 
 #include "comm/comm.cuh"
@@ -26,21 +27,28 @@
 
 namespace ag_gemm_kda_mla {
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
+// CTAs per cluster, i.e. the tcgen05 MMA CTA group. 2 splits COL_BLOCK across
+// the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
+static constexpr int DEFAULT_NUM_CTA = 2;
+
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
 struct fused_globals;
 
 // Number of tile columns visited before the snake pattern steps to the next
 // supergroup; wider supergroups trade B-tile reuse for A-tile reuse in L2.
 static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH>
-void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK>& G);
+template <int _ROW_BLOCK,
+          int _COL_BLOCK,
+          int _NUM_CTA = DEFAULT_NUM_CTA,
+          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH>
+void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G);
 
 static constexpr int DEFAULT_ROW_BLOCK = 128;
 static constexpr int DEFAULT_COL_BLOCK = 128;
 
 // for M < 512, this should be 128
-template <int _ROW_BLOCK, int _COL_BLOCK>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA>
 struct fused_globals {
     // config items
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
@@ -51,12 +59,23 @@ struct fused_globals {
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = 1;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
-    static constexpr int NUM_CLUSTERS =
-        2;  // will try to use 2-CTA as much as possible for instructions that cleanly divide it
+    // CTAs per cluster. 2-CTA MMA is preferred for shapes that divide cleanly;
+    // NUM_CLUSTERS is the cluster dimension the kernel launches with.
+    static constexpr int NUM_CTA = _NUM_CTA;
+    static constexpr int NUM_CLUSTERS = NUM_CTA;
+    static_assert(NUM_CTA == 1 || NUM_CTA == 2, "tcgen05 only has 1- and 2-CTA MMA groups");
+    static_assert(NUM_BLOCKS % NUM_CTA == 0, "NUM_BLOCKS must be a whole number of clusters");
+    static_assert(_COL_BLOCK % NUM_CTA == 0, "COL_BLOCK must split evenly across the cluster");
     static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
     // this is pipelining along the reduction dimension
-    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = _COL_BLOCK == 128 ? 7 : 5;
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = []() {
+        if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
+            return 5;
+        } else {
+            return 7;
+        }
+    }();
     // this is pipelining among different MMAs
     static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
@@ -86,10 +105,14 @@ struct fused_globals {
     // for smem staging -- keep at least
     using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / C_TILE_DIVISOR>;
 
+    static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY =
         (sizeof(A_tile) + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
         sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
-    static_assert(DYNAMIC_SHARED_MEMORY <= 227 * 1024, "SMEM allocation too large");
+    // Deliberately not a static_assert: the tuner instantiates fused_globals
+    // for every candidate so it can ask which ones fit. The hard check lives
+    // in launch_ag_gemm_kda_mla, so nothing oversized can actually launch.
+    static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
@@ -134,8 +157,8 @@ struct fused_globals {
         TMA_PRODUCER_BIT | TMA_CONSUMER_BIT | TMEM_PROUCER_BIT | TMEM_CONSUMER_BIT;
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK>
-__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globals(
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
+__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> ag_gemm_kda_mla_make_globals(
     dist::ParallelBuffer& A,
     const at::Tensor& A_local_buf,
     const at::Tensor& B,
@@ -143,7 +166,7 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globa
     int dev_idx,
     int M,
     int N) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
 
     return {
         .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
@@ -155,6 +178,179 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK> ag_gemm_kda_mla_make_globa
         .dev_idx = dev_idx,
         .M = M,
         .N = N};
+}
+
+// ---------------------------------------------------------------------------
+// Autotuning surface
+//
+// The schedule is a compile-time template, so letting the bench tune it means
+// instantiating every candidate up front and picking one at runtime. Keep the
+// lists short: each surviving combination is another kernel in the binary.
+// ---------------------------------------------------------------------------
+
+static constexpr int TUNING_COL_BLOCKS[] = {128, 256};
+static constexpr int TUNING_NUM_CTAS[] = {1, 2};
+static constexpr int TUNING_SUPERGROUP_WIDTHS[] = {5, 10, 15, 25};
+
+// A 1-CTA cluster stages the full COL_BLOCK of B per CTA instead of half, so
+// the wide tile no longer fits in SMEM. Report that rather than failing to
+// build, so the search space can be declared as a plain cross product.
+template <int COL_BLOCK, int NUM_CTA>
+constexpr bool tuning_config_fits() {
+    return fused_globals<DEFAULT_ROW_BLOCK, COL_BLOCK, NUM_CTA>::SMEM_FITS;
+}
+
+inline bool tuning_config_fits(int col_block, int num_cta) {
+    if (col_block == 128) {
+        return num_cta == 1 ? tuning_config_fits<128, 1>() : tuning_config_fits<128, 2>();
+    }
+    if (col_block == 256) {
+        return num_cta == 1 ? tuning_config_fits<256, 1>() : tuning_config_fits<256, 2>();
+    }
+    return false;
+}
+
+template <int COL_BLOCK, int NUM_CTA, int SUPERGROUP_WIDTH>
+inline bool launch_tuned(dist::ParallelBuffer& A,
+                         const at::Tensor& A_local_buf,
+                         const at::Tensor& B,
+                         at::Tensor& C,
+                         int dev_idx,
+                         int M,
+                         int N) {
+    if constexpr (tuning_config_fits<COL_BLOCK, NUM_CTA>()) {
+        auto globals = ag_gemm_kda_mla_make_globals<DEFAULT_ROW_BLOCK, COL_BLOCK, NUM_CTA>(
+            A, A_local_buf, B, C, dev_idx, M, N);
+        launch_ag_gemm_kda_mla<DEFAULT_ROW_BLOCK, COL_BLOCK, NUM_CTA, SUPERGROUP_WIDTH>(globals);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+template <int COL_BLOCK, int NUM_CTA>
+inline bool dispatch_supergroup(int supergroup_width,
+                                dist::ParallelBuffer& A,
+                                const at::Tensor& A_local_buf,
+                                const at::Tensor& B,
+                                at::Tensor& C,
+                                int dev_idx,
+                                int M,
+                                int N) {
+    switch (supergroup_width) {
+        case 5:
+            return launch_tuned<COL_BLOCK, NUM_CTA, 5>(A, A_local_buf, B, C, dev_idx, M, N);
+        case 10:
+            return launch_tuned<COL_BLOCK, NUM_CTA, 10>(A, A_local_buf, B, C, dev_idx, M, N);
+        case 15:
+            return launch_tuned<COL_BLOCK, NUM_CTA, 15>(A, A_local_buf, B, C, dev_idx, M, N);
+        case 25:
+            return launch_tuned<COL_BLOCK, NUM_CTA, 25>(A, A_local_buf, B, C, dev_idx, M, N);
+        default:
+            return false;
+    }
+}
+
+template <int COL_BLOCK>
+inline bool dispatch_num_cta(int num_cta,
+                             int supergroup_width,
+                             dist::ParallelBuffer& A,
+                             const at::Tensor& A_local_buf,
+                             const at::Tensor& B,
+                             at::Tensor& C,
+                             int dev_idx,
+                             int M,
+                             int N) {
+    switch (num_cta) {
+        case 1:
+            return dispatch_supergroup<COL_BLOCK, 1>(
+                supergroup_width, A, A_local_buf, B, C, dev_idx, M, N);
+        case 2:
+            return dispatch_supergroup<COL_BLOCK, 2>(
+                supergroup_width, A, A_local_buf, B, C, dev_idx, M, N);
+        default:
+            return false;
+    }
+}
+
+// The configs this binary can actually run, as (col_block, num_cta,
+// supergroup_width). The tuner enumerates these rather than hardcoding the
+// cross product, so a config dropped for SMEM never reaches a launch.
+std::vector<std::tuple<int, int, int>> tuning_configs() {
+    std::vector<std::tuple<int, int, int>> configs;
+    for (int col_block : TUNING_COL_BLOCKS) {
+        for (int num_cta : TUNING_NUM_CTAS) {
+            if (!tuning_config_fits(col_block, num_cta)) {
+                continue;
+            }
+            for (int supergroup_width : TUNING_SUPERGROUP_WIDTHS) {
+                configs.emplace_back(col_block, num_cta, supergroup_width);
+            }
+        }
+    }
+    return configs;
+}
+
+// Row and column granularity the caller must pad its operands to for a given
+// config. Kept here so the bench cannot drift from the kernel's own rules.
+std::tuple<int, int> tuning_config_granularity(int num_cta, int col_block) {
+    TORCH_CHECK(tuning_config_fits(col_block, num_cta),
+                "ag_gemm_kda_mla: unsupported config col_block=",
+                col_block,
+                " num_cta=",
+                num_cta);
+    // Each CTA of the cluster takes one ROW_BLOCK row tile per step.
+    return {DEFAULT_ROW_BLOCK * num_cta, col_block};
+}
+
+// Explicitly configured launch, for the bench's tuner. entrypoint() remains
+// the shipping path and keeps its own hand-picked table.
+void entrypoint_tuned(dist::ParallelBuffer& A,
+                      const at::Tensor& A_local_buf,
+                      const at::Tensor& B,
+                      at::Tensor& C,
+                      int col_block,
+                      int num_cta,
+                      int supergroup_width) {
+    const int dev_idx = A.local_rank_;
+    c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    const int M = C.size(0), N = B.size(1);
+
+    TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
+                "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
+    TORCH_CHECK(N % col_block == 0,
+                "ag_gemm_kda_mla: N=",
+                N,
+                " is not a multiple of col_block=",
+                col_block);
+    TORCH_CHECK(A.shape_[0] % (DEFAULT_ROW_BLOCK * num_cta) == 0,
+                "ag_gemm_kda_mla: shard rows=",
+                A.shape_[0],
+                " is not a multiple of ROW_BLOCK*num_cta=",
+                DEFAULT_ROW_BLOCK * num_cta);
+
+    bool launched = false;
+    switch (col_block) {
+        case 128:
+            launched = dispatch_num_cta<128>(
+                num_cta, supergroup_width, A, A_local_buf, B, C, dev_idx, M, N);
+            break;
+        case 256:
+            launched = dispatch_num_cta<256>(
+                num_cta, supergroup_width, A, A_local_buf, B, C, dev_idx, M, N);
+            break;
+        default:
+            break;
+    }
+
+    TORCH_CHECK(launched,
+                "ag_gemm_kda_mla: no instantiation for col_block=",
+                col_block,
+                " num_cta=",
+                num_cta,
+                " supergroup_width=",
+                supergroup_width);
 }
 
 void entrypoint(dist::ParallelBuffer& A,
@@ -180,7 +376,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 128>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 128, 10>(globals);
+                launch_ag_gemm_kda_mla<128, 128, 2, 10>(globals);
                 break;
             }
             case 4096:
@@ -189,14 +385,14 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 15>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 15>(globals);
                 break;
             }
             case 8192: {
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 25>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 25>(globals);
                 break;
             }
             default:
@@ -208,35 +404,35 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 128>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 128>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 128, 10>(globals);
+                launch_ag_gemm_kda_mla<128, 128, 2, 10>(globals);
                 break;
             }
             case 4096: {
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 10>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
             }
             case 8192: {
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 15>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 15>(globals);
                 break;
             }
             case 16384: {
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 25>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 25>(globals);
                 break;
             }
             case 32768: {
                 using fg = fused_globals<128, 256>;
                 fg globals =
                     ag_gemm_kda_mla_make_globals<128, 256>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_kda_mla<128, 256, 10>(globals);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
             }
             default:

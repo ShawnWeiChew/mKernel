@@ -39,6 +39,14 @@ PROJECTION_NAMES = tuple(name for name, _ in PROJECTIONS)
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 
+# mKernel's schedule is a set of template parameters, so the binary carries one
+# instantiation per candidate and picks between them at runtime. Tuning is on by
+# default so the headline number is a best-of, the same as CUTLASS and TK.
+_MKERNEL_ENV_AUTOTUNE = "MKERNEL_AUTOTUNE"
+
+# (col_block, num_cta, supergroup_width)
+MKernelConfig = tuple[int, int, int]
+
 
 ########## CUTLASS compatibility layer ##########
 _CUTLASS_ENV_ROOT = "CUTLASS_PATH"
@@ -423,6 +431,155 @@ def tune_tk_comm_sms(
     return best_comm_sms, timings
 
 
+########## mKernel schedule autotuning ##########
+
+
+def mkernel_config_label(config: MKernelConfig) -> str:
+    col_block, num_cta, supergroup_width = config
+    return (
+        f"col_block={col_block} {num_cta}-CTA "
+        f"supergroup={supergroup_width}"
+    )
+
+
+def make_mkernel_operands(
+    mod,
+    *,
+    local_m: int,
+    padded_local_m: int,
+    padded_n: int,
+    logical_n: int,
+    world_size: int,
+    local_rank: int,
+    a_local: torch.Tensor,
+    b_ref: torch.Tensor,
+) -> dict:
+    """Allocate one operand set at a given row/column padding.
+
+    Each candidate schedule states its own granularity, so a config that pads
+    differently from the shipping entrypoint needs its own operands rather
+    than a reinterpretation of somebody else's.
+    """
+    padded_m = padded_local_m * world_size
+    a = mod.DistBuffer(
+        (padded_local_m, K),
+        dtype=torch.bfloat16,
+        local_rank=local_rank,
+        local_world_size=world_size,
+        multicast=True,
+    )
+    a.data_.zero_()
+    a.data_[:local_m].copy_(a_local)
+    b = torch.zeros((K, padded_n), device="cuda", dtype=torch.bfloat16)
+    b[:, :logical_n].copy_(b_ref)
+    return {
+        "a": a,
+        "a_local_buf": torch.empty(
+            (padded_m, K), device="cuda", dtype=torch.bfloat16
+        ),
+        "b": b,
+        "c": torch.zeros(
+            (padded_m, padded_n), device="cuda", dtype=torch.bfloat16
+        ),
+        "padded_local_m": padded_local_m,
+        "padded_n": padded_n,
+    }
+
+
+def tune_mkernel(
+    mod,
+    *,
+    local_m: int,
+    logical_n: int,
+    world_size: int,
+    local_rank: int,
+    a_local: torch.Tensor,
+    b_ref: torch.Tensor,
+    c_ref: torch.Tensor,
+    operands: dict,
+    warmup: int,
+    iterations: int,
+) -> tuple[MKernelConfig | None, list[tuple[MKernelConfig, float]]]:
+    """Time every instantiated schedule and return the fastest correct one.
+
+    `operands` is a cache keyed by (padded_local_m, padded_n), seeded by the
+    caller with the set it already built for the shipping dispatch, so configs
+    that share a granularity share their tensors.
+
+    Every rank enumerates the same configs from the same binary and
+    benchmark_cuda hands them all the same max-rank time, so the winner is
+    identical everywhere without an explicit exchange. Dropping a broken
+    candidate has to stay in lockstep too, or a rank that kept one its peers
+    dropped would hang on the next collective launch.
+    """
+    timings: list[tuple[MKernelConfig, float]] = []
+    best_config: MKernelConfig | None = None
+    best_ms = float("inf")
+    tune_warmup = min(2, warmup)
+    tune_iterations = min(5, iterations)
+
+    for config in mod.ag_gemm_kda_mla_tuning_configs():
+        config = tuple(config)
+        col_block, num_cta, supergroup_width = config
+        row_granularity, col_granularity = mod.ag_gemm_kda_mla_granularity(
+            num_cta, col_block
+        )
+        key = (
+            padded_m_for_rank(local_m, row_granularity),
+            round_up(logical_n, col_granularity),
+        )
+        if key not in operands:
+            operands[key] = make_mkernel_operands(
+                mod,
+                local_m=local_m,
+                padded_local_m=key[0],
+                padded_n=key[1],
+                logical_n=logical_n,
+                world_size=world_size,
+                local_rank=local_rank,
+                a_local=a_local,
+                b_ref=b_ref,
+            )
+        operand = operands[key]
+
+        def run(operand=operand, config=config) -> None:
+            mod.ag_gemm_kda_mla_tuned(
+                operand["a"],
+                operand["a_local_buf"],
+                operand["b"],
+                operand["c"],
+                *config,
+            )
+
+        # Verify before timing. A schedule that is fast because it computes
+        # the wrong thing would otherwise win the search outright.
+        operand["c"].zero_()
+        run()
+        torch.cuda.synchronize()
+        # check_close already reduces its verdict across ranks and returns the
+        # same bool everywhere, so dropping a candidate stays in lockstep.
+        if not check_close(
+            f"ag_gemm_kda_mla {mkernel_config_label(config)}",
+            unpad_rows(
+                operand["c"],
+                local_m,
+                operand["padded_local_m"],
+                world_size,
+                logical_n,
+            ),
+            c_ref,
+        ):
+            timings.append((config, None))
+            continue
+
+        ms = benchmark_cuda(run, tune_warmup, tune_iterations)
+        timings.append((config, ms))
+        if ms < best_ms:
+            best_config, best_ms = config, ms
+
+    return best_config, timings
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Correctness and performance test for ag_gemm_kda_mla"
@@ -485,16 +642,18 @@ def padded_n_for_m_tk(m: int, logical_n: int) -> int:
     return round_up(logical_n, 256)
 
 
-def padded_m_for_rank(local_m: int) -> int:
+def padded_m_for_rank(local_m: int, row_granularity: int = 256) -> int:
     """Round one rank's A shard up to the kernel's row granularity.
 
-    The kernel walks each rank's shard in ROW_BLOCK=128 row tiles and hands
-    one tile to each CTA of its 2-CTA cluster, so a shard must be a multiple
-    of 256 rows. Padding per rank rather than globally keeps every shard at
-    the same offset in the all-gathered buffer. TK tiles rows in 256-row
-    blocks too, so it needs no separate variant the way N does.
+    The kernel walks each rank's shard in ROW_BLOCK=128 row tiles and hands one
+    tile to each CTA of its cluster, so a shard must be a multiple of 128 *
+    num_cta rows -- 256 for the 2-CTA schedule the entrypoint ships, but only
+    128 when tuning selects a 1-CTA config. Padding per rank rather than
+    globally keeps every shard at the same offset in the all-gathered buffer.
+    TK tiles rows in 256-row blocks too, so it needs no separate variant the
+    way N does.
     """
-    return round_up(local_m, 256)
+    return round_up(local_m, row_granularity)
 
 
 def unpad_rows(
@@ -712,7 +871,7 @@ def main() -> int:
         if cutlass_ok:
             try:
                 # hand the raw values to cutlass to let it handle on its own?
-                cutlass_ms, cutlass_config, cutlass_tune_log = cutlass_benchmark(
+                cutlass_result = cutlass_benchmark(
                     m=m,
                     n=padded_n,
                     k=K,
@@ -720,6 +879,7 @@ def main() -> int:
                     iterations=args.iters,
                     matched_config=cutlass_config_match,
                 )
+                cutlass_ms, cutlass_config, cutlass_tune_log = cutlass_result
             except Exception as exc:
                 cutlass_why = f"{type(exc).__name__}: {exc}"
 
@@ -843,8 +1003,70 @@ def main() -> int:
             run_all_gather()
             run_cublas_padded()
 
-        def run_kernel() -> None:
-            mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
+        # Seed the operand cache with the set the shipping dispatch uses, so
+        # candidates at the same granularity reuse it instead of reallocating.
+        mkernel_operands = {
+            (padded_local_m, padded_n): {
+                "a": A_kernel,
+                "a_local_buf": A_local_buf,
+                "b": B_kernel,
+                "c": C_kernel,
+                "padded_local_m": padded_local_m,
+                "padded_n": padded_n,
+            }
+        }
+        mkernel_config = None
+        mkernel_tune_log = []
+        best_operand = None
+        if _env_enabled(_MKERNEL_ENV_AUTOTUNE):
+            # The reference is otherwise only materialised inside the TK block,
+            # which does not run when TK is unavailable. Tuning needs it to
+            # reject a candidate that is fast because it is wrong.
+            run_all_gather()
+            run_cublas_logical()
+            dist.barrier()
+            mkernel_config, mkernel_tune_log = tune_mkernel(
+                mod,
+                local_m=local_m,
+                logical_n=logical_n,
+                world_size=world_size,
+                local_rank=local_rank,
+                a_local=A_ref_local,
+                b_ref=B_ref,
+                c_ref=C_ref,
+                operands=mkernel_operands,
+                warmup=args.warmup,
+                iterations=args.iters,
+            )
+            if mkernel_config is None:
+                raise RuntimeError(
+                    f"no ag_gemm_kda_mla config passed correctness at "
+                    f"{projection} M={m} N={logical_n}"
+                )
+
+        if mkernel_config is None:
+            def run_kernel() -> None:
+                mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel)
+        else:
+            col_block, num_cta, supergroup_width = mkernel_config
+            row_granularity, col_granularity = mod.ag_gemm_kda_mla_granularity(
+                num_cta, col_block
+            )
+            best_operand = mkernel_operands[
+                (
+                    padded_m_for_rank(local_m, row_granularity),
+                    round_up(logical_n, col_granularity),
+                )
+            ]
+
+            def run_kernel() -> None:
+                mod.ag_gemm_kda_mla_tuned(
+                    best_operand["a"],
+                    best_operand["a_local_buf"],
+                    best_operand["b"],
+                    best_operand["c"],
+                    *mkernel_config,
+                )
 
         tk_state = None
         tk_comm_sms = None
@@ -998,6 +1220,32 @@ def main() -> int:
                     f"({baseline_padded_ms / tk_ms:6.3f}x vs matched)",
                     flush=True,
                 )
+            if mkernel_config is not None:
+                print(
+                    f"  ag_gemm_kda_mla config {projection} M={m}: "
+                    f"{mkernel_config_label(mkernel_config)} (autotuned)",
+                    flush=True,
+                )
+                for config, tune_ms in sorted(
+                    mkernel_tune_log,
+                    key=lambda item: (item[1] is None, item[1]),
+                ):
+                    if tune_ms is None:
+                        print(
+                            f"    [autotune] "
+                            f"{mkernel_config_label(config)}: "
+                            f"{'incorrect':>12}",
+                            flush=True,
+                        )
+                        continue
+                    mark = " <- best" if config == mkernel_config else ""
+                    tune_tflops = useful_tflops(m, logical_n, K, tune_ms)
+                    print(
+                        f"    [autotune] {mkernel_config_label(config)}: "
+                        f"{tune_ms:8.3f} ms  "
+                        f"{tune_tflops:8.2f} TFLOP/s{mark}",
+                        flush=True,
+                    )
             kernel_line = (
                 f"  {'ag_gemm_kda_mla':<26} {kernel_ms:8.3f} ms  "
                 f"{useful_tflops(m, logical_n, K, kernel_ms):8.2f} TFLOP/s  "
@@ -1020,6 +1268,10 @@ def main() -> int:
 
         del A_ref_local, A_ref, B_ref, C_ref, A_local_padded
         del A_kernel, A_local_buf, B_kernel, C_kernel, C_padded, B_tk
+        # Candidates at a granularity the shipping dispatch does not use hold
+        # their own DistBuffer; drop them before the next shape allocates.
+        mkernel_operands.clear()
+        del run_kernel, mkernel_operands, best_operand
         tk_state = None
         dist.barrier()
 
