@@ -394,7 +394,14 @@ def write_results_json(
     if out_path.exists():
         try:
             existing = json.load(open(out_path))
-            existing_sizes = list(existing.get("sizes", []))
+            # A size written as a tuple round-trips through JSON as a list
+            # (JSON has no tuple type), and a list isn't hashable as the dict
+            # key merging needs below -- normalize back to tuples so an old
+            # file written before sizes were made hashable-safe still merges.
+            existing_sizes = [
+                tuple(s) if isinstance(s, list) else s
+                for s in existing.get("sizes", [])
+            ]
             existing_ms = list(existing.get("fused_ms", []))
         except Exception:
             existing_sizes, existing_ms = [], []

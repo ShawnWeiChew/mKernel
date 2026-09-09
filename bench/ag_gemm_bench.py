@@ -1179,13 +1179,20 @@ def main():
         for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
             fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
 
-            results = [
-                (name, benchmark_cuda(fn, args.warmup, args.iters) if should_wrap else fn())
-                for fn, name, should_wrap in fns_to_run
-            ]
+            results = []
+            for i, (fn, name, should_wrap) in enumerate(fns_to_run):
+                if i > 0:
+                    # Let the GPU settle between candidates rather than
+                    # measuring one right on the heels of another.
+                    time.sleep(5)
+                ms = benchmark_cuda(fn, args.warmup, args.iters) if should_wrap else fn()
+                results.append((name, ms))
             report_blackwell_result(config, projection, m, logical_n, results)
 
-            result_sizes.append((m, logical_n))
+            # A plain string, not a tuple: write_results_json merges with a
+            # prior run's JSON, and a size that round-trips through JSON as a
+            # list (json has no tuple type) is unhashable as a dict key there.
+            result_sizes.append(f"{projection} M={m} N={logical_n}")
             for name, res in results:
                 if name == "mkernel":
                     result_fused.append(res)

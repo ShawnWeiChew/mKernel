@@ -211,7 +211,9 @@ void entrypoint(dist::ParallelBuffer& A,
                 at::Tensor& C,
                 const int logical_global_m,  // used to determine what the actual shape being
                                             // operated on is, since M might be padded up
-                const int supergroup_width
+                const int supergroup_width = -1  // -1 = use the tuned default for this shape
+                                                  // below; the bench script's autotune sweep
+                                                  // passes an explicit candidate instead.
 ) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -227,21 +229,47 @@ void entrypoint(dist::ParallelBuffer& A,
     // TODO: this only works for TP == 8
     constexpr int KDA_N = 6400;
 
+    // Tuned defaults from bench/ag_gemm_bench.py's autotune sweep over
+    // BlackwellBenchConfig.mkernel_supergroup_widths (2026-09-08). Re-run the
+    // sweep and update these if the tile configs or hardware change.
+
     // use size of N to check which projection is being done
     if (N == KDA_N) {
         switch (logical_global_m) {
             case 2048:
                 dispatch_supergroup_width<128, 128, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, supergroup_width);
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             case 3072:
-            case 4096:
-            case 16384:
-            case 32768:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 15 : supergroup_width);
+                break;
             case 3584:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 5 : supergroup_width);
+                break;
+            case 4096:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 25 : supergroup_width);
+                break;
             case 8192:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, supergroup_width);
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 5 : supergroup_width);
+                break;
+            case 16384:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 5 : supergroup_width);
+                break;
+            case 32768:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             default:
                 TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
@@ -250,19 +278,38 @@ void entrypoint(dist::ParallelBuffer& A,
         switch (logical_global_m) {
             case 2048:
                 dispatch_supergroup_width<128, 128, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, supergroup_width);
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 25 : supergroup_width);
                 break;
             case 3072:
                 dispatch_supergroup_width<128, 128, 1>(
-                    A, A_local_buf, B, C, dev_idx, M, N, supergroup_width);
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 10 : supergroup_width);
                 break;
             case 3584:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 5 : supergroup_width);
+                break;
             case 4096:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 25 : supergroup_width);
+                break;
             case 8192:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 25 : supergroup_width);
+                break;
             case 16384:
+                dispatch_supergroup_width<128, 256, 2>(
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 15 : supergroup_width);
+                break;
             case 32768:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, supergroup_width);
+                    A, A_local_buf, B, C, dev_idx, M, N,
+                    supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             default:
                 TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
