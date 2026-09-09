@@ -304,7 +304,7 @@ def ag_gemm_hopper_prepare(config: HopperBenchConfig, mod, base_n: int, source_b
         return (bench_ngt2_fallback, "torch_fallback", True, lambda: True, lambda: True)
     else:
         run_config.a_tk = mod.DistBuffer(
-            (M_local, K), dtype=torch.bfloat16,
+            (M_node, K), dtype=torch.bfloat16,
             local_rank=config.local_rank, local_world_size=config.world_size, multicast=True
         )
         run_config.start_row = config.local_rank * M_local
@@ -1115,6 +1115,7 @@ def main():
             peer_ip = os.environ.get(f"NODE{peer_node}_IP")
             if not peer_ip:
                 raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+            config.peer_ip = peer_ip
 
         source_backing = rdma_backing()
         target_backing = source_backing

@@ -71,7 +71,7 @@ struct fused_globals {
     // this is pipelining along the reduction dimension
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = []() {
         if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
-            return 5;
+            return 6;
         } else {
             return 7;
         }
@@ -79,9 +79,9 @@ struct fused_globals {
     // this is pipelining among different MMAs
     static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
-    static constexpr int EPILOGUE_PIPELINE_STAGES = 3;
+    static constexpr int EPILOGUE_PIPELINE_STAGES = _COL_BLOCK == 128 ? 3 : 2;
     // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int C_TILE_DIVISOR = _COL_BLOCK == 128 ? 2 : 4;
+    static constexpr int C_TILE_DIVISOR = 4;
 
     static constexpr int ROW_BLOCK = _ROW_BLOCK;
     static constexpr int COL_BLOCK = _COL_BLOCK;
@@ -181,22 +181,32 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> ag_gemm_kda_mla_
 // BlackwellBenchConfig.mkernel_supergroup_widths in bench/ag_gemm_bench.py.
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA>
 __host__ inline void dispatch_supergroup_width(dist::ParallelBuffer& A,
-                                                const at::Tensor& A_local_buf,
-                                                const at::Tensor& B,
-                                                at::Tensor& C,
-                                                int dev_idx,
-                                                int M,
-                                                int N,
-                                                int supergroup_width) {
+                                               const at::Tensor& A_local_buf,
+                                               const at::Tensor& B,
+                                               at::Tensor& C,
+                                               int dev_idx,
+                                               int M,
+                                               int N,
+                                               int supergroup_width) {
     fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> globals =
         ag_gemm_kda_mla_make_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>(
             A, A_local_buf, B, C, dev_idx, M, N);
     switch (supergroup_width) {
-        case 5: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 5>(globals); break;
-        case 10: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 10>(globals); break;
-        case 15: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 15>(globals); break;
-        case 20: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 20>(globals); break;
-        case 25: launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 25>(globals); break;
+        case 5:
+            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 5>(globals);
+            break;
+        case 10:
+            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 10>(globals);
+            break;
+        case 15:
+            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 15>(globals);
+            break;
+        case 20:
+            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 20>(globals);
+            break;
+        case 25:
+            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 25>(globals);
+            break;
         default:
             TORCH_CHECK(false,
                         "ag_gemm_kda_mla: unsupported supergroup_width=",
@@ -209,11 +219,11 @@ void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                const int logical_global_m,  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
+                const int logical_global_m,      // used to determine what the actual shape being
+                                                 // operated on is, since M might be padded up
                 const int supergroup_width = -1  // -1 = use the tuned default for this shape
-                                                  // below; the bench script's autotune sweep
-                                                  // passes an explicit candidate instead.
+                                                 // below; the bench script's autotune sweep
+                                                 // passes an explicit candidate instead.
 ) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -238,37 +248,79 @@ void entrypoint(dist::ParallelBuffer& A,
         switch (logical_global_m) {
             case 2048:
                 dispatch_supergroup_width<128, 128, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             case 3072:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             case 3584:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 5 : supergroup_width);
                 break;
             case 4096:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 25 : supergroup_width);
                 break;
             case 8192:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 5 : supergroup_width);
                 break;
             case 16384:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 5 : supergroup_width);
                 break;
             case 32768:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             default:
@@ -278,37 +330,79 @@ void entrypoint(dist::ParallelBuffer& A,
         switch (logical_global_m) {
             case 2048:
                 dispatch_supergroup_width<128, 128, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 25 : supergroup_width);
                 break;
             case 3072:
                 dispatch_supergroup_width<128, 128, 1>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 10 : supergroup_width);
                 break;
             case 3584:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 5 : supergroup_width);
                 break;
             case 4096:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 25 : supergroup_width);
                 break;
             case 8192:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 25 : supergroup_width);
                 break;
             case 16384:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             case 32768:
                 dispatch_supergroup_width<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N,
+                    A,
+                    A_local_buf,
+                    B,
+                    C,
+                    dev_idx,
+                    M,
+                    N,
                     supergroup_width == -1 ? 15 : supergroup_width);
                 break;
             default:
