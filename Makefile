@@ -190,10 +190,10 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 run-ag-gemm-warp-specialized : ag-gemm-warp-specialized
-	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmups 5 --iters 20 --save-json 1 --arch blackwell --intranode-only
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmup 5 --iters 20 --save-json res.json --arch blackwell --intranode-only
 
-ag-gemm-warp-specialized : $(BUILD)/libag_gemm_kda_mla.so
+ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
 
-$(BUILD)/libag_gemm_kda_mla.so : $(SRC)/ag_gemm_kda_mla.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_kda_mla $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+$(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@

@@ -744,6 +744,13 @@ def ag_gemm_blackwell_prepare(
     )
     run_config.mkernel_c_buf = torch.zeros((mk_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
+    # The kernel's first act is to pull every peer's shard out of their
+    # DistBuffer, so no rank may launch until all of them have finished
+    # filling theirs -- and the fill is stream-ordered work that a bare
+    # dist.barrier() does not wait on.
+    torch.cuda.synchronize()
+    dist.barrier()
+
     def bench_mkernel():
         mod.ag_gemm_kda_mla(
             run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
@@ -883,6 +890,13 @@ def ag_gemm_blackwell_prepare(
             multicast=True,
         )
         run_config.tk_barrier.data_.zero_()
+
+        # ParallelKittens requires all ranks to finish initializing its
+        # multicast barrier before the first fused launch -- same race as
+        # mkernel's DistBuffer fill above, just for the TKParallelTensor
+        # buffers instead.
+        torch.cuda.synchronize()
+        dist.barrier()
 
         def run_tk(num_comm_sms):
             tk_module.all_gather_matmul(
