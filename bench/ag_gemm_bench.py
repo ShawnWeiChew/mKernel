@@ -1,5 +1,4 @@
-"""
-ag_gemm All-Gather + GEMM bench (release version).
+"""ag_gemm All-Gather + GEMM bench (release version).
 
 Hopper Benchmarks (supports intranode and internode):
 Default EFA sweep: M∈{4096,8192,16384,24576,32768}.
@@ -17,11 +16,7 @@ E.g. THUNDERKITTENS_PATH=/home/ThunderKittens CUTLASS_PATH=/home/cutlass python 
 """
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
-import time
+import argparse, json, os, sys, time
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -43,7 +38,6 @@ from common import (  # noqa: E402
     check_deterministic_rerun,
     compare_named_results,
     gather_cpu_tensors,
-    get_num_nodes,
     get_peer_ips,
     get_peer_ports,
     is_peermem_backing,
@@ -52,6 +46,7 @@ from common import (  # noqa: E402
     rdma_policy_label,
 )
 
+from common import get_num_nodes  # noqa: E402
 
 class HopperBenchConfig:
     arch = "hopper"
@@ -327,11 +322,10 @@ def ag_gemm_hopper_prepare(config: HopperBenchConfig, mod, base_n: int, source_b
             a_recv_rdma.data_.zero_()
 
         run_config.barrier = mod.DistBuffer((3, 1024, 1024), dtype=torch.int,
-                        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True)
+                       local_rank=config.local_rank, local_world_size=config.world_size, multicast=True)
         run_config.barrier.data_.zero_()
 
-        C = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
-        
+        C = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)        
         a_half_bytes = M_node * K * 2
         total_chunks = (a_half_bytes + config.chunk_bytes - 1) // config.chunk_bytes
 
@@ -582,7 +576,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         A_local_buf = torch.empty(
             (padded_m, config.default_k), device="cuda", dtype=torch.bfloat16
         )
-        # ag_gemm_kda_mla takes B pre-transposed to [N, K] (contiguous K reads
+        # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
         B_kernel = pad_cols(config, B_ref, padded_n).T.contiguous()
         C_kernel = torch.zeros(
@@ -597,13 +591,13 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel, m)
+        mod.ag_gemm_warp_specialized(A_kernel, A_local_buf, B_kernel, C_kernel, m)
         torch.cuda.synchronize()
 
         # Drop the padded rows and columns and compare the logical
         # M x logical_n result against the unpadded PyTorch reference.
         is_correct = check_close(
-            f"ag-gemm-kda-mla {projection} M={m} N={logical_n} "
+            f"ag-gemm-warp-specialized {projection} M={m} N={logical_n} "
             f"padded_m={padded_m} padded_n={padded_n}",
             unpad_rows(
                 C_kernel, local_m, padded_local_m, config.world_size, logical_n
@@ -615,7 +609,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         if config.is_chief:
             status = "passed :)" if is_correct else "FAILED :("
             print(
-                f"ag-gemm-kda-mla {projection} M={m} local_m={local_m} N={logical_n} "
+                f"ag-gemm-warp-specialized {projection} M={m} local_m={local_m} N={logical_n} "
                 f"padded_m={padded_m} padded_n={padded_n}: {status}",
                 flush=True,
             )
@@ -713,7 +707,7 @@ def report_blackwell_result(
     config: BlackwellBenchConfig, projection: str, global_m: int, logical_n: int,
     results: list[tuple[str, float]],
 ) -> None:
-    """Print one shape's candidate timings/TFLOP-s, mirroring ag_gemm_kda_mla_bench.py's report."""
+    """Print one shape's candidate timings/TFLOP-s, mirroring ag_gemm_warp_specialized_bench.py's report."""
     if not config.is_chief:
         return
 
@@ -754,7 +748,7 @@ def report_blackwell_result(
         )
     if mkernel_ms is not None:
         line = (
-            f"  {'ag_gemm_kda_mla':<26} {mkernel_ms:8.3f} ms  "
+            f"  {'ag_gemm_warp_specialized':<26} {mkernel_ms:8.3f} ms  "
             f"{tflops_for(mkernel_ms):8.2f} TFLOP/s"
         )
         if baseline_ms is not None:
@@ -811,7 +805,7 @@ def ag_gemm_blackwell_prepare(
 
     fns.append((bench_baseline, "baseline", True))
 
-    # ---- mkernel: ag_gemm_kda_mla dispatch ----
+    # ---- mkernel: ag_gemm_warp_specialized dispatch ----
     col_block, num_cta = config.mkernel_per_shape_config[(projection, global_m)]
     mk_local_m = round_up(run_config.logical_m, 128 * num_cta)
     mk_m = mk_local_m * config.world_size
@@ -820,7 +814,7 @@ def ag_gemm_blackwell_prepare(
     run_config.mkernel_padded_n = mk_n
 
     A_mk_local = pad_rows(config, A_local, mk_local_m)
-    # ag_gemm_kda_mla takes B pre-transposed to [N, K]: contiguous K reads per
+    # ag_gemm_warp_specialized takes B pre-transposed to [N, K]: contiguous K reads per
     # N-tile match the reduction axis, instead of the [K, N] layout's strided
     # per-K-step access across N.
     run_config.mkernel_b_buf = pad_cols(config, B_ref, mk_n).T.contiguous()
@@ -845,7 +839,7 @@ def ag_gemm_blackwell_prepare(
     tune_iterations = 5
 
     def run_mkernel():
-        mod.ag_gemm_kda_mla(
+        mod.ag_gemm_warp_specialized(
             run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
         )
@@ -1159,8 +1153,8 @@ def main():
         # other shapes the chart needs.
         from common import write_results_json
         write_results_json(Path(args.save_json), "ag_gemm",
-                            result_sizes, result_fused,
-                            note=f"release ag_gemm bench (world={config.world_size*config.num_nodes})")
+                           result_sizes, result_fused,
+                           note=f"release ag_gemm bench (world={config.world_size*config.num_nodes})")
         print(f"[ag_gemm] wrote {args.save_json}", flush=True)
 
     if config.is_chief and args.compare_to:

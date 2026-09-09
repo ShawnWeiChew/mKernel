@@ -114,7 +114,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
 };
 
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
-__device__ __forceinline__ void ag_gemm_kda_mla(
+__device__ __forceinline__ void ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
 
@@ -449,11 +449,11 @@ __global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM
         fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__
                                       fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> G) {
-    ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>(G);
+    ag_gemm_warp_specialized<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>(G);
 }
 
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
-inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
+inline void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;

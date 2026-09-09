@@ -6,8 +6,8 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
-    m.def("ag_gemm_kda_mla",
-          &ag_gemm_kda_mla::entrypoint,
+    m.def("ag_gemm_warp_specialized",
+          &ag_gemm_warp_specialized::entrypoint,
           pybind11::arg("A"),
           pybind11::arg("A_local_buf"),
           pybind11::arg("B"),
