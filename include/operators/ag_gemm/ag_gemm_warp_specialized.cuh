@@ -88,7 +88,11 @@ struct fused_globals {
     static constexpr int RED_BLOCK = 64;
 
     using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
-    using B_tile = kittens::st_bf<RED_BLOCK, COL_BLOCK / NUM_CLUSTERS>;
+    // B is stored [N, K] (not [K, N]) so the reduction dimension is contiguous
+    // in HBM -- the tile shape here mirrors that: rows are the N-chunk, cols
+    // are the K-chunk. The MMA call reads it back with transpose::T, and the
+    // TMA load coordinate is (n_tile, k_tile) to match.
+    using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
     // for smem staging -- keep at least
@@ -179,7 +183,9 @@ void entrypoint(dist::ParallelBuffer& A,
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    const int M = C.size(0), N = B.size(1);
+    // B is [N, K] (pre-transposed by the caller for contiguous K reads), so N
+    // is dim 0 here, not dim 1.
+    const int M = C.size(0), N = B.size(0);
     constexpr int K = fused_globals<128, 128>::K;
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,

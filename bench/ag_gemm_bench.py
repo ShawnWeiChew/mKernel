@@ -121,6 +121,7 @@ class BlackwellBenchConfig:
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     is_chief = local_rank == 0
+    num_nodes = 1
 
     projections = ( 
         # KDA proj_qkvgfab, (4 * 12288 + 96) / TP + 128.
@@ -159,8 +160,6 @@ class BlackwellBenchConfig:
     # tk configs
     tk_tile_granularity = 256
     tk_comm_sms = (2, 4, 8, 16, 32, 64)
-    # Used only for the one-shot correctness sanity check, not autotuned.
-    tk_check_comm_sms = 8
 
 @dataclass
 class BlackwellBenchVars:
@@ -190,7 +189,6 @@ class BlackwellBenchVars:
     tk_padded_m: int | None = None
     tk_padded_n: int | None = None
     tk_a_dist: DistBufferLike | None = None
-    tk_b_buf: torch.Tensor | None = None
     tk_b_transposed: torch.Tensor | None = None
     tk_c_buf: torch.Tensor | None = None
     tk_barrier: DistBufferLike | None = None
@@ -584,7 +582,9 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         A_local_buf = torch.empty(
             (padded_m, config.default_k), device="cuda", dtype=torch.bfloat16
         )
-        B_kernel = pad_cols(config, B_ref, padded_n)
+        # ag_gemm_kda_mla takes B pre-transposed to [N, K] (contiguous K reads
+        # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
+        B_kernel = pad_cols(config, B_ref, padded_n).T.contiguous()
         C_kernel = torch.zeros(
             (padded_m, padded_n), device="cuda", dtype=torch.bfloat16
         )
@@ -618,10 +618,11 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
                 flush=True,
             )
 
-        # ---- ThunderKittens: one fixed-comm_sms sanity launch ----
-        # Not autotuned here -- this only needs to prove the kernel computes
-        # the right answer at all before ag_gemm_blackwell_prepare lets it
-        # anywhere near an autotune sweep or a reported timing.
+        # ---- ThunderKittens: check every comm_sms candidate up front ----
+        # Every value in config.tk_comm_sms gets autotuned later, so every
+        # value gets verified here -- not just one fixed comm_sms -- so a
+        # candidate that's wrong (not just slow) can't win the sweep and
+        # get reported before anyone's checked its output.
         tk_ok, tk_why = load_thirdparty.tk_availability(config.world_size, "ag_gemm")
         tk_vote = torch.tensor([1 if tk_ok else 0], device="cuda")
         dist.all_reduce(tk_vote, op=dist.ReduceOp.MIN)
@@ -651,7 +652,6 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             ].copy_(pad_rows(config, A_ref_local, tk_local_m))
             # The Blackwell TK kernel declares B as [N, K] and computes A @ B^T.
             B_tk_transposed = pad_cols(config, B_ref, tk_n).T.contiguous()
-            C_tk = torch.zeros((tk_m, tk_n), device="cuda", dtype=torch.bfloat16)
             tk_barrier = tk_module.TKParallelTensor(
                 (2, 1024, 1024),
                 dtype=torch.int,
@@ -659,34 +659,43 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
                 local_world_size=config.world_size,
                 multicast=True,
             )
-            tk_barrier.data_.zero_()
 
             # Same multicast-init race as mkernel above -- no rank may launch
             # until every rank has finished filling its own TKParallelTensor.
             torch.cuda.synchronize()
             dist.barrier()
-            tk_module.all_gather_matmul(
-                A_tk, B_tk_transposed, C_tk, tk_barrier, config.tk_check_comm_sms
-            )
-            torch.cuda.synchronize()
 
-            is_correct_tk = check_close(
-                f"ThunderKittens ag-gemm {projection} M={m} N={logical_n} "
-                f"padded_m={tk_m} padded_n={tk_n}",
-                unpad_rows(C_tk, local_m, tk_local_m, config.world_size, logical_n),
-                C_ref,
-            )
-            all_correct = all_correct and is_correct_tk
+            all_tk_correct = True
+            for comm_sms in config.tk_comm_sms:
+                # Fresh barrier and output per candidate -- reusing either
+                # across launches is exactly the stale-state risk this check
+                # exists to catch, not something to introduce into it.
+                tk_barrier.data_.zero_()
+                C_tk = torch.zeros((tk_m, tk_n), device="cuda", dtype=torch.bfloat16)
+                torch.cuda.synchronize()
+                dist.barrier()
+                tk_module.all_gather_matmul(A_tk, B_tk_transposed, C_tk, tk_barrier, comm_sms)
+                torch.cuda.synchronize()
 
-            if config.is_chief:
-                status = "passed :)" if is_correct_tk else "FAILED :("
-                print(
-                    f"ThunderKittens {projection} M={m} local_m={local_m} N={logical_n} "
-                    f"padded_m={tk_m} padded_n={tk_n}: {status}",
-                    flush=True,
+                is_correct_tk = check_close(
+                    f"ThunderKittens ag-gemm {projection} M={m} N={logical_n} "
+                    f"padded_m={tk_m} padded_n={tk_n} num_comm_sms={comm_sms}",
+                    unpad_rows(C_tk, local_m, tk_local_m, config.world_size, logical_n),
+                    C_ref,
                 )
+                all_tk_correct = all_tk_correct and is_correct_tk
 
-            del A_tk, B_tk_transposed, C_tk, tk_barrier
+                if config.is_chief:
+                    status = "passed :)" if is_correct_tk else "FAILED :("
+                    print(
+                        f"ThunderKittens {projection} M={m} local_m={local_m} N={logical_n} "
+                        f"padded_m={tk_m} padded_n={tk_n} num_comm_sms={comm_sms}: {status}",
+                        flush=True,
+                    )
+                del C_tk
+
+            all_correct = all_correct and all_tk_correct
+            del A_tk, B_tk_transposed, tk_barrier
 
         del A_ref_local, A_ref, B_ref, C_ref
         del A_kernel, A_local_buf, B_kernel, C_kernel
@@ -809,7 +818,10 @@ def ag_gemm_blackwell_prepare(
     run_config.mkernel_padded_n = mk_n
 
     A_mk_local = pad_rows(config, A_local, mk_local_m)
-    run_config.mkernel_b_buf = pad_cols(config, B_ref, mk_n)
+    # ag_gemm_kda_mla takes B pre-transposed to [N, K]: contiguous K reads per
+    # N-tile match the reduction axis, instead of the [K, N] layout's strided
+    # per-K-step access across N.
+    run_config.mkernel_b_buf = pad_cols(config, B_ref, mk_n).T.contiguous()
     run_config.mkernel_a_dist = mod.DistBuffer(
         (mk_local_m, config.default_k), dtype=torch.bfloat16,
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
@@ -949,9 +961,12 @@ def ag_gemm_blackwell_prepare(
             A_mk_local if tk_local_m == mk_local_m
             else pad_rows(config, A_local, tk_local_m)
         )
-        run_config.tk_b_buf = (
+        # mkernel_b_buf is already [N, K] contiguous (see above) -- reuse it
+        # directly when the two candidates land on the same N padding,
+        # instead of transposing a second copy.
+        run_config.tk_b_transposed = (
             run_config.mkernel_b_buf if tk_n == mk_n
-            else pad_cols(config, B_ref, tk_n)
+            else pad_cols(config, B_ref, tk_n).T.contiguous()
         )
 
         tk_module = load_thirdparty.load_tk_extension("ag_gemm")
@@ -963,8 +978,6 @@ def ag_gemm_blackwell_prepare(
         run_config.tk_a_dist.data_[
             config.local_rank * tk_local_m : (config.local_rank + 1) * tk_local_m
         ].copy_(A_tk_local)
-        # The Blackwell TK kernel declares B as [N, K] and computes A @ B^T.
-        run_config.tk_b_transposed = run_config.tk_b_buf.T.contiguous()
         run_config.tk_c_buf = torch.zeros((tk_m, tk_n), device="cuda", dtype=torch.bfloat16)
         run_config.tk_barrier = tk_module.TKParallelTensor(
             (2, 1024, 1024), dtype=torch.int,

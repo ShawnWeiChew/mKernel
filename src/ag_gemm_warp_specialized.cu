@@ -76,14 +76,17 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
 
 // tcgen05 MMA with the CTA group taken from the config. mm2_AB / mma2_AB are
 // hardwired to a 2-CTA group, so spell out the ncta template argument instead.
+// B_tile is stored [N, K] (see fused_globals::B_tile), so this is really an
+// ABt-shaped MMA -- transpose::T on the B operand tells the tensor core to
+// read the [N, K] tile as B^T, producing the same A @ B result.
 template <int NUM_CTA, typename D, typename A, typename B>
 __device__ __forceinline__ void mm_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
-    kittens::mma<transpose::N, transpose::N, D, A, B, 0, NUM_CTA>(d, a, b, sem);
+    kittens::mma<transpose::N, transpose::T, D, A, B, 0, NUM_CTA>(d, a, b, sem);
 }
 
 template <int NUM_CTA, typename D, typename A, typename B>
 __device__ __forceinline__ void mma_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
-    kittens::mma<transpose::N, transpose::N, D, A, B, 1, NUM_CTA>(d, a, b, sem);
+    kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
 }  // namespace
@@ -218,9 +221,11 @@ __device__ __forceinline__ void ag_gemm_kda_mla(
                 tma::cluster::expect_bytes(
                     tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
 
+                // B_tile is [N, K], so the TMA coordinate is (n_tile, k_tile),
+                // not (k_tile, n_tile).
                 tma::cluster::load_async(B_smem,
                                          G.B,
-                                         {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
+                                         {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
                                          tma_load[input_stage_id],
                                          (uint16_t)(1 << cta_rank),
                                          0);
@@ -239,9 +244,11 @@ __device__ __forceinline__ void ag_gemm_kda_mla(
                 tma::expect_bytes(tma_load[input_stage_id],
                                   sizeof(fg::A_tile) + sizeof(fg::B_tile));
 
+                // B_tile is [N, K], so the TMA coordinate is (n_tile, k_tile),
+                // not (k_tile, n_tile).
                 tma::load_async(B_smem,
                                 G.B,
-                                {iter_k, tile_col_idx * fg::NUM_CLUSTERS + cta_rank},
+                                {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
                                 tma_load[input_stage_id]);
 
                 tma::load_async(A_smem, A_gmem, {A_tile_row_idx, iter_k}, tma_load[input_stage_id]);
