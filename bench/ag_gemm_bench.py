@@ -159,6 +159,8 @@ class BlackwellBenchConfig:
     # tk configs
     tk_tile_granularity = 256
     tk_comm_sms = (2, 4, 8, 16, 32, 64)
+    # Used only for the one-shot correctness sanity check, not autotuned.
+    tk_check_comm_sms = 8
 
 @dataclass
 class BlackwellBenchVars:
@@ -616,6 +618,76 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
                 flush=True,
             )
 
+        # ---- ThunderKittens: one fixed-comm_sms sanity launch ----
+        # Not autotuned here -- this only needs to prove the kernel computes
+        # the right answer at all before ag_gemm_blackwell_prepare lets it
+        # anywhere near an autotune sweep or a reported timing.
+        tk_ok, tk_why = load_thirdparty.tk_availability(config.world_size, "ag_gemm")
+        tk_vote = torch.tensor([1 if tk_ok else 0], device="cuda")
+        dist.all_reduce(tk_vote, op=dist.ReduceOp.MIN)
+        tk_ok = bool(tk_vote.item())
+        if not tk_ok:
+            if config.is_chief:
+                print(
+                    f"[skip] ThunderKittens correctness check {projection} M={m}: "
+                    f"{tk_why or 'unavailable on a peer'}",
+                    flush=True,
+                )
+        else:
+            tk_local_m = round_up(local_m, config.tk_tile_granularity)
+            tk_m = tk_local_m * config.world_size
+            tk_n = round_up(logical_n, config.tk_tile_granularity)
+
+            tk_module = load_thirdparty.load_tk_extension("ag_gemm")
+            A_tk = tk_module.TKParallelTensor(
+                (tk_m, config.default_k),
+                dtype=torch.bfloat16,
+                local_rank=config.local_rank,
+                local_world_size=config.world_size,
+                multicast=True,
+            )
+            A_tk.data_[
+                config.local_rank * tk_local_m : (config.local_rank + 1) * tk_local_m
+            ].copy_(pad_rows(config, A_ref_local, tk_local_m))
+            # The Blackwell TK kernel declares B as [N, K] and computes A @ B^T.
+            B_tk_transposed = pad_cols(config, B_ref, tk_n).T.contiguous()
+            C_tk = torch.zeros((tk_m, tk_n), device="cuda", dtype=torch.bfloat16)
+            tk_barrier = tk_module.TKParallelTensor(
+                (2, 1024, 1024),
+                dtype=torch.int,
+                local_rank=config.local_rank,
+                local_world_size=config.world_size,
+                multicast=True,
+            )
+            tk_barrier.data_.zero_()
+
+            # Same multicast-init race as mkernel above -- no rank may launch
+            # until every rank has finished filling its own TKParallelTensor.
+            torch.cuda.synchronize()
+            dist.barrier()
+            tk_module.all_gather_matmul(
+                A_tk, B_tk_transposed, C_tk, tk_barrier, config.tk_check_comm_sms
+            )
+            torch.cuda.synchronize()
+
+            is_correct_tk = check_close(
+                f"ThunderKittens ag-gemm {projection} M={m} N={logical_n} "
+                f"padded_m={tk_m} padded_n={tk_n}",
+                unpad_rows(C_tk, local_m, tk_local_m, config.world_size, logical_n),
+                C_ref,
+            )
+            all_correct = all_correct and is_correct_tk
+
+            if config.is_chief:
+                status = "passed :)" if is_correct_tk else "FAILED :("
+                print(
+                    f"ThunderKittens {projection} M={m} local_m={local_m} N={logical_n} "
+                    f"padded_m={tk_m} padded_n={tk_n}: {status}",
+                    flush=True,
+                )
+
+            del A_tk, B_tk_transposed, C_tk, tk_barrier
+
         del A_ref_local, A_ref, B_ref, C_ref
         del A_kernel, A_local_buf, B_kernel, C_kernel
         dist.barrier()
@@ -687,9 +759,13 @@ def report_blackwell_result(
 def ag_gemm_blackwell_prepare(
     config: BlackwellBenchConfig, mod, projection: str, global_m: int, logical_n: int,
     warmup: int, iters: int,
-) -> list[tuple[Callable[[], None], str]]:
+) -> list[tuple[Callable[[], float | None], str, bool]]:
     """
-    To be called per (projection, shape). Tunes each kernel, returning a list of callables to run for that shape.
+    To be called per (projection, shape). Tunes each kernel, returning a list of
+    (fn, name, should_wrap) to run for that shape. should_wrap tells main() whether
+    to time fn via the generic benchmark_cuda loop (True, for a bare single-launch
+    closure) or to call fn() once and use its own returned ms directly (False, for
+    a candidate -- like CUTLASS -- that already times itself internally).
     """
     run_config = BlackwellBenchVars()
 
@@ -722,7 +798,7 @@ def ag_gemm_blackwell_prepare(
         dist.all_gather_into_tensor(run_config.baseline_a_buf, run_config.baseline_a)
         torch.matmul(run_config.baseline_a_buf, run_config.baseline_b, out=run_config.baseline_c)
 
-    fns.append((bench_baseline, "baseline"))
+    fns.append((bench_baseline, "baseline", True))
 
     # ---- mkernel: ag_gemm_kda_mla dispatch ----
     col_block, num_cta = config.mkernel_per_shape_config[(projection, global_m)]
@@ -757,7 +833,7 @@ def ag_gemm_blackwell_prepare(
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
         )
 
-    fns.append((bench_mkernel, "mkernel"))
+    fns.append((bench_mkernel, "mkernel", True))
     tune_warmup = 2
     tune_iterations = 5
 
@@ -830,17 +906,23 @@ def ag_gemm_blackwell_prepare(
                     )
 
             def bench_cutlass():
-                load_thirdparty.run_cutlass_once(
+                # Upstream's run() builds a private CUDA graph per call and
+                # cannot hand the tuned launcher back to us, so rebuilding it
+                # many times over an outer benchmark_cuda loop is both wasted
+                # work and a real hang risk. Rebuild it exactly once here,
+                # driving its internal warmup/iterations with the real
+                # values, and return the ms it already measured.
+                return load_thirdparty.run_cutlass_once(
                     cutlass_kernel_name,
                     m=cutlass_padded_m,
                     n=cutlass_padded_n,
                     k=config.default_k,
                     config=best_config,
-                    warmup=0,
-                    iterations=1,
+                    warmup=warmup,
+                    iterations=iters,
                 )
 
-            fns.append((bench_cutlass, "cutlass"))
+            fns.append((bench_cutlass, "cutlass", False))
 
     # ---- ThunderKittens: all_gather_matmul ----
     tk_ok, tk_why = load_thirdparty.tk_availability(config.world_size, "ag_gemm")
@@ -936,7 +1018,7 @@ def ag_gemm_blackwell_prepare(
         def bench_tk():
             run_tk(best_comm_sms)
 
-        fns.append((bench_tk, "TK"))
+        fns.append((bench_tk, "TK", True))
 
     return fns
 
@@ -1038,8 +1120,8 @@ def main():
             fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
 
             results = [
-                (name, benchmark_cuda(fn, args.warmup, args.iters))
-                for fn, name in fns_to_run
+                (name, benchmark_cuda(fn, args.warmup, args.iters) if should_wrap else fn())
+                for fn, name, should_wrap in fns_to_run
             ]
             report_blackwell_result(config, projection, m, logical_n, results)
 
