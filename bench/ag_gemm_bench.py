@@ -466,7 +466,6 @@ def ag_gemm_hopper_prepare(config: HopperBenchConfig, mod, base_n: int, source_b
 
             return (bench_mkernel, "mKernel", False, check, invariant_check)
 
-
 def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
