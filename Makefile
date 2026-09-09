@@ -190,7 +190,7 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 run-ag-gemm-warp-specialized : ag-gemm-warp-specialized
-	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmup 5 --iters 20 --save-json res.json --arch blackwell --intranode-only
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmup 20 --iters 50 --arch blackwell --intranode-only
 
 ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
 

@@ -25,7 +25,7 @@
 #include "memory/tk_ops_group_group.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 
-namespace ag_gemm_kda_mla {
+namespace ag_gemm_warp_specialized {
 
 // CTAs per cluster, i.e. the tcgen05 MMA CTA group. 2 splits COL_BLOCK across
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
@@ -173,63 +173,16 @@ __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> ag_gemm_kda_mla_
         .N = N};
 }
 
-// Candidate SUPERGROUP_WIDTH values the bench script can autotune over.
-// SUPERGROUP_WIDTH is a compile-time template argument (it sizes the L2
-// snake-traversal pattern at launch-config granularity), so "tuning" it from
-// Python means selecting among these pre-compiled instantiations at runtime
-// rather than passing a free integer through -- keep this list in sync with
-// BlackwellBenchConfig.mkernel_supergroup_widths in bench/ag_gemm_bench.py.
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA>
-__host__ inline void dispatch_supergroup_width(dist::ParallelBuffer& A,
-                                               const at::Tensor& A_local_buf,
-                                               const at::Tensor& B,
-                                               at::Tensor& C,
-                                               int dev_idx,
-                                               int M,
-                                               int N,
-                                               int supergroup_width) {
-    fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> globals =
-        ag_gemm_kda_mla_make_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>(
-            A, A_local_buf, B, C, dev_idx, M, N);
-    switch (supergroup_width) {
-        case 5:
-            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 5>(globals);
-            break;
-        case 10:
-            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 10>(globals);
-            break;
-        case 15:
-            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 15>(globals);
-            break;
-        case 20:
-            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 20>(globals);
-            break;
-        case 25:
-            launch_ag_gemm_kda_mla<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, 25>(globals);
-            break;
-        default:
-            TORCH_CHECK(false,
-                        "ag_gemm_kda_mla: unsupported supergroup_width=",
-                        supergroup_width,
-                        " (must be one of 5, 10, 15, 20, 25)");
-    }
-}
-
 void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                const int logical_global_m,      // used to determine what the actual shape being
-                                                 // operated on is, since M might be padded up
-                const int supergroup_width = -1  // -1 = use the tuned default for this shape
-                                                 // below; the bench script's autotune sweep
-                                                 // passes an explicit candidate instead.
+                const int logical_global_m  // used to determine what the actual shape being
+                                            // operated on is, since M might be padded up
 ) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    // B is [N, K] (pre-transposed by the caller for contiguous K reads), so N
-    // is dim 0 here, not dim 1.
     const int M = C.size(0), N = B.size(0);
     constexpr int K = fused_globals<128, 128>::K;
 
@@ -239,175 +192,115 @@ void entrypoint(dist::ParallelBuffer& A,
     // TODO: this only works for TP == 8
     constexpr int KDA_N = 6400;
 
-    // Tuned defaults from bench/ag_gemm_bench.py's autotune sweep over
-    // BlackwellBenchConfig.mkernel_supergroup_widths (2026-09-08). Re-run the
-    // sweep and update these if the tile configs or hardware change.
-
     // use size of N to check which projection is being done
     if (N == KDA_N) {
         switch (logical_global_m) {
-            case 2048:
-                dispatch_supergroup_width<128, 128, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 15 : supergroup_width);
+            case 2048: {
+                using fg = fused_globals<128, 128, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 128, 2, 15>(globals);
                 break;
-            case 3072:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 15 : supergroup_width);
+            }
+            case 3072: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 15>(globals);
                 break;
-            case 3584:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 5 : supergroup_width);
+            }
+            case 3584: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 20>(globals);
                 break;
-            case 4096:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 25 : supergroup_width);
+            }
+            case 4096: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 5>(globals);
                 break;
-            case 8192:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 5 : supergroup_width);
+            }
+            case 8192: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 20>(globals);
                 break;
-            case 16384:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 5 : supergroup_width);
+            }
+            case 16384: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 5>(globals);
                 break;
-            case 32768:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 15 : supergroup_width);
+            }
+            case 32768: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
+            }
             default:
                 TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
         }
     } else {
         switch (logical_global_m) {
-            case 2048:
-                dispatch_supergroup_width<128, 128, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 25 : supergroup_width);
+            case 2048: {
+                using fg = fused_globals<128, 128, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 128, 2, 25>(globals);
                 break;
-            case 3072:
-                dispatch_supergroup_width<128, 128, 1>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 10 : supergroup_width);
+            }
+            case 3072: {
+                using fg = fused_globals<128, 128, 1>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 128, 1>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 128, 1, 20>(globals);
                 break;
-            case 3584:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 5 : supergroup_width);
+            }
+            case 3584: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
-            case 4096:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 25 : supergroup_width);
+            }
+            case 4096: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
-            case 8192:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 25 : supergroup_width);
+            }
+            case 8192: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 10>(globals);
                 break;
-            case 16384:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 15 : supergroup_width);
+            }
+            case 16384: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 15>(globals);
                 break;
-            case 32768:
-                dispatch_supergroup_width<128, 256, 2>(
-                    A,
-                    A_local_buf,
-                    B,
-                    C,
-                    dev_idx,
-                    M,
-                    N,
-                    supergroup_width == -1 ? 15 : supergroup_width);
+            }
+            case 32768: {
+                using fg = fused_globals<128, 256, 2>;
+                fg globals =
+                    ag_gemm_kda_mla_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_kda_mla<128, 256, 2, 20>(globals);
                 break;
+            }
             default:
                 TORCH_CHECK(false, "ag_gemm_kda_mla: no tile config for M=", M, " N=", N);
         }
     }
 }
-};  // namespace ag_gemm_kda_mla
+};  // namespace ag_gemm_warp_specialized

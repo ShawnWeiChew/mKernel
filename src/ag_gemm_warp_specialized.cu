@@ -42,11 +42,9 @@
 #include "memory/tk_ops_group_util_util.cuh"
 // clang-format on
 
-// MAJOR TODO: think about how to deal with bad shapes!
-
 using namespace kittens;
 
-namespace ag_gemm_kda_mla {
+namespace ag_gemm_warp_specialized {
 
 namespace {
 
@@ -80,12 +78,12 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
 // ABt-shaped MMA -- transpose::T on the B operand tells the tensor core to
 // read the [N, K] tile as B^T, producing the same A @ B result.
 template <int NUM_CTA, typename D, typename A, typename B>
-__device__ __forceinline__ void mm_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
+__device__ __forceinline__ void mm_ABt_ncta(D& d, const A& a, const B& b, semaphore& sem) {
     kittens::mma<transpose::N, transpose::T, D, A, B, 0, NUM_CTA>(d, a, b, sem);
 }
 
 template <int NUM_CTA, typename D, typename A, typename B>
-__device__ __forceinline__ void mma_AB_ncta(D& d, const A& a, const B& b, semaphore& sem) {
+__device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semaphore& sem) {
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
@@ -268,7 +266,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
-            mm_AB_ncta<fg::NUM_CTA>(
+            mm_ABt_ncta<fg::NUM_CTA>(
                 tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -282,7 +280,7 @@ __device__ __forceinline__ void ag_gemm_kda_mla(
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
-            mma_AB_ncta<fg::NUM_CTA>(
+            mma_ABt_ncta<fg::NUM_CTA>(
                 tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -484,6 +482,7 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _
 
     // Stage one complete shard per remote device in the same ring order used
     // by the persistent kernel. The local shard is read directly from G.A.
+#pragma unroll
     for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
@@ -513,6 +512,6 @@ inline void launch_ag_gemm_kda_mla(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _
     this_kernel<<<grid, num_threads, smem_size, stream>>>(launch_G);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
-};  // namespace ag_gemm_kda_mla
+};  // namespace ag_gemm_warp_specialized
 
 #include "operators/ag_gemm/ag_gemm_warp_specialized_session.cuh"
