@@ -160,6 +160,11 @@ class BlackwellBenchConfig:
     # tk configs
     tk_tile_granularity = 256
     tk_comm_sms = (2, 4, 8, 16, 32, 64)
+    # mkernel autotune: SUPERGROUP_WIDTH is a compile-time template arg on the
+    # C++ side, so these are the only values that actually exist as launchable
+    # instantiations -- keep in sync with the switch in
+    # dispatch_supergroup_width() in ag_gemm_warp_specialized.cuh.
+    mkernel_supergroup_widths = (5, 10, 15, 20, 25)
 
 @dataclass
 class BlackwellBenchVars:
@@ -595,28 +600,37 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         # dist.barrier() does not wait on.
         torch.cuda.synchronize()
         dist.barrier()
-        mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel, m)
-        torch.cuda.synchronize()
 
-        # Drop the padded rows and columns and compare the logical
-        # M x logical_n result against the unpadded PyTorch reference.
-        is_correct = check_close(
-            f"ag-gemm-kda-mla {projection} M={m} N={logical_n} "
-            f"padded_m={padded_m} padded_n={padded_n}",
-            unpad_rows(
-                C_kernel, local_m, padded_local_m, config.world_size, logical_n
-            ),
-            C_ref,
-        )
-        all_correct = all_correct and is_correct
+        # Every SUPERGROUP_WIDTH in config.mkernel_supergroup_widths gets
+        # autotuned later, so every one gets verified here first -- same
+        # reasoning as the ThunderKittens comm_sms sweep below.
+        all_mkernel_correct = True
+        for supergroup_width in config.mkernel_supergroup_widths:
+            C_kernel.zero_()
+            mod.ag_gemm_kda_mla(A_kernel, A_local_buf, B_kernel, C_kernel, m, supergroup_width)
+            torch.cuda.synchronize()
 
-        if config.is_chief:
-            status = "passed :)" if is_correct else "FAILED :("
-            print(
-                f"{projection} M={m} local_m={local_m} N={logical_n} "
-                f"padded_m={padded_m} padded_n={padded_n}: {status}",
-                flush=True,
+            # Drop the padded rows and columns and compare the logical
+            # M x logical_n result against the unpadded PyTorch reference.
+            is_correct = check_close(
+                f"ag-gemm-kda-mla {projection} M={m} N={logical_n} "
+                f"padded_m={padded_m} padded_n={padded_n} supergroup_width={supergroup_width}",
+                unpad_rows(
+                    C_kernel, local_m, padded_local_m, config.world_size, logical_n
+                ),
+                C_ref,
             )
+            all_mkernel_correct = all_mkernel_correct and is_correct
+
+            if config.is_chief:
+                status = "passed :)" if is_correct else "FAILED :("
+                print(
+                    f"ag-gemm-kda-mla {projection} M={m} local_m={local_m} N={logical_n} "
+                    f"padded_m={padded_m} padded_n={padded_n} "
+                    f"supergroup_width={supergroup_width}: {status}",
+                    flush=True,
+                )
+        all_correct = all_correct and all_mkernel_correct
 
         # ---- ThunderKittens: check every comm_sms candidate up front ----
         # Every value in config.tk_comm_sms gets autotuned later, so every
@@ -839,15 +853,48 @@ def ag_gemm_blackwell_prepare(
     torch.cuda.synchronize()
     dist.barrier()
 
-    def bench_mkernel():
+    tune_warmup = 2
+    tune_iterations = 5
+
+    def run_mkernel(supergroup_width):
         mod.ag_gemm_kda_mla(
             run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            supergroup_width,
         )
 
+    timings = []
+    best_supergroup_width = None
+    best_ms = float("inf")
+    for supergroup_width in config.mkernel_supergroup_widths:
+        ms = benchmark_cuda(
+            lambda supergroup_width=supergroup_width: run_mkernel(supergroup_width),
+            tune_warmup, tune_iterations,
+        )
+        timings.append((supergroup_width, ms))
+        if ms < best_ms:
+            best_supergroup_width, best_ms = supergroup_width, ms
+    assert best_supergroup_width is not None
+
+    if config.is_chief:
+        print(
+            f"  mkernel config {projection} M={global_m}: "
+            f"supergroup_width={best_supergroup_width} (autotuned)",
+            flush=True,
+        )
+        for supergroup_width, tune_ms in sorted(timings, key=lambda item: item[1]):
+            mark = " <- best" if supergroup_width == best_supergroup_width else ""
+            tune_tflops = useful_tflops(global_m, logical_n, config.default_k, tune_ms)
+            print(
+                f"    [autotune] supergroup_width={supergroup_width}: "
+                f"{tune_ms:8.3f} ms  {tune_tflops:8.2f} TFLOP/s{mark}",
+                flush=True,
+            )
+
+    def bench_mkernel():
+        run_mkernel(best_supergroup_width)
+
     fns.append((bench_mkernel, "mkernel", True))
-    tune_warmup = 2
-    tune_iterations = 5
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
