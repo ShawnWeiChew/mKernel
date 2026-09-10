@@ -138,6 +138,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     // round up to the nearest multiple of the COL_BLOCK
     const int num_col_tiles = (G.N + _COL_BLOCK - 1) / _COL_BLOCK;
     const int cluster_tiles_per_device = cluster_rows_per_device * num_col_tiles;
+    const int total_num_tiles = cluster_tiles_per_device * fg::NUM_DEVICES;
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
@@ -153,6 +154,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     __shared__ semaphore epilogue_ready[fg::TMEM_PIPELINE_STAGES];
     __shared__ semaphore epilogue_tmem_finished[fg::TMEM_PIPELINE_STAGES];
 
+    __shared__ semaphore tmem_allocated;
     __shared__ semaphore tmem_finished;
 
     __shared__ uint32_t tmem_addr;
@@ -177,18 +179,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         }
 
         // every CTA in the cluster arrives here, itself included
+        init_semaphore(tmem_allocated, 1);
         init_semaphore(tmem_finished, fg::NUM_CTA);
-    } else if (warp_id == 1) {
-        tm_alloc.provision(tmem_addr);
     }
 
-    tensor_before_thread_sync();
-    __syncthreads();
-    tensor_after_thread_sync();
-    tm_alloc.set_addr(tmem_addr);
-
     // flush to ensure the mbarriers are visible
-    everyone::tma::cluster::sync();
+    everyone::tma::cluster::arrive_aligned();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
         const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
@@ -301,7 +297,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         int tile_col_idx,
                         typename fg::C_tt_tile* tmem,
                         int& epilogue_stage_id,
-                        int& epilogue_transfer_stage_id) {
+                        int& epilogue_transfer_stage_id,
+                        bool is_last_tile) {
         const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
@@ -325,6 +322,11 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             } else {
                 arrive(epilogue_tmem_finished[epilogue_stage_id]);
             }
+        }
+
+        if (is_last_tile) {
+            warpgroup::sync(1);
+            pdl::arrive();
         }
 
 #pragma unroll
@@ -356,17 +358,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     };
 
     if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
+        warpgroup::decrease_registers<168>();
+
         if (warp_id == 4) {
+            pdl::wait();
+            everyone::tma::cluster::wait();
+
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
-                for (int tile_id = cluster_idx;
-                     tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
+                for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_comp_clusters) {
                     // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
                     auto [local_row_id, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
                         cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
 
                     int target_device = tile_id / cluster_tiles_per_device;
+
                     load(local_row_id * fg::NUM_CLUSTERS + cta_rank,
                          tile_col_idx,
                          target_device,
@@ -374,11 +381,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                 }
             }
         } else if (warp_id == 5) {
-            if (cta_rank == 0 && elect_warp_leader()) {
-                int input_stage_id = 0;
-                int epilogue_stage_id = 0;
+            int input_stage_id = 0;
+            int epilogue_stage_id = 0;
+            typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
-                typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
+            // wait for PDL
+            everyone::tma::cluster::wait();
+            tm_alloc.provision(tmem_addr);
+            tm_alloc.set_addr(tmem_addr);
+            arrive(tmem_allocated);
+
+            if (cta_rank == 0 && elect_warp_leader()) {
 #pragma unroll
                 for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
                     tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
@@ -396,13 +409,16 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         int epilogue_transfer_stage_id = 0;
         typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
+        // wait for PDL and tmem
+        everyone::tma::cluster::wait();
+        wait(tmem_allocated, 0);
+
 #pragma unroll
         for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
             tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
         }
 
-        for (int tile_id = cluster_idx; tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
-             tile_id += num_comp_clusters) {
+        for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_comp_clusters) {
             // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
             auto [local_tile_row, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
                 cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
@@ -414,7 +430,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                      tile_col_idx,
                      tmem,
                      epilogue_stage_id,
-                     epilogue_transfer_stage_id);
+                     epilogue_transfer_stage_id,
+                     tile_id + num_comp_clusters >= total_num_tiles);
         }
 
         // wait for store to complete before deallocation of tmem
@@ -453,7 +470,8 @@ __global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM
 }
 
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
-inline void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
+inline void launch_ag_gemm_warp_specialized(
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
@@ -483,7 +501,7 @@ inline void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL
     // Stage one complete shard per remote device in the same ring order used
     // by the persistent kernel. The local shard is read directly from G.A.
 #pragma unroll
-    for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+    for (int distance = 1; distance < 4; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr;
@@ -509,7 +527,37 @@ inline void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    this_kernel<<<grid, num_threads, smem_size, stream>>>(launch_G);
+    cudaLaunchAttribute pdl_attr = {};
+    pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    pdl_attr.val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = grid;
+    launch_config.blockDim = num_threads;
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = stream;
+    launch_config.attrs = &pdl_attr;
+    launch_config.numAttrs = 1;
+
+    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
+
+#pragma unroll
+    for (int distance = 4; distance < fg::NUM_DEVICES; ++distance) {
+        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const auto* src = G.A[peer].raw_ptr;
+
+        MKERNEL_CUDACHECK(
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+
+        // Keep the default pre-write barrier: it publishes the copied shard
+        // before the completion epoch. The kernel-side load only needs GPU
+        // scope because it reads a flag and payload resident on this device.
+        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
+                                             copy_state.epoch,
+                                             CU_STREAM_WRITE_VALUE_DEFAULT));
+    }
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 };  // namespace ag_gemm_warp_specialized
