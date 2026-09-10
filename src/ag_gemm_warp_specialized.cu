@@ -358,8 +358,6 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     };
 
     if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
-        warpgroup::decrease_registers<168>();
-
         if (warp_id == 4) {
             pdl::wait();
             everyone::tma::cluster::wait();
@@ -380,16 +378,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                          input_stage_id);
                 }
             }
+
+            pdl::arrive();
         } else if (warp_id == 5) {
             int input_stage_id = 0;
             int epilogue_stage_id = 0;
             typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
             // wait for PDL
+            pdl::wait();
             everyone::tma::cluster::wait();
             tm_alloc.provision(tmem_addr);
             tm_alloc.set_addr(tmem_addr);
-            arrive(tmem_allocated);
+
+            if (elect_warp_leader()) {
+                arrive(tmem_allocated);
+            }
 
             if (cta_rank == 0 && elect_warp_leader()) {
 #pragma unroll
@@ -403,6 +407,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                     consume(tmem, input_stage_id, epilogue_stage_id);
                 }
             }
+
+            pdl::arrive();
         }
     } else {
         int epilogue_stage_id = 0;
