@@ -98,22 +98,23 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
 // this warp owns, one float per lane per column -- see DeepGEMM's
 // Blackwell epilogue for the same technique. N is the number of TMEM
 // columns read per lane (must be a valid tcgen05 "num" for .32x32b: a
-// power of two) -- kept narrow (16, see LD_COLS in epilogue() below)
-// specifically to bound this function's live registers: wider N values
-// (32, 64) measured real register spill at COL_BLOCK=256 despite needing
-// fewer total instructions, so only the specialization actually used is
-// kept here.
+// power of two, see LD_COLS in epilogue() below for the value actually
+// used).
 template <int N>
 __device__ __forceinline__ void tcgen05_ld_32x32b(float (&dst)[N], uint32_t taddr);
 
 template <>
-__device__ __forceinline__ void tcgen05_ld_32x32b<16>(float (&dst)[16], uint32_t taddr) {
+__device__ __forceinline__ void tcgen05_ld_32x32b<32>(float (&dst)[32], uint32_t taddr) {
     asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, "
-        "%11, %12, %13, %14, %15}, [%16];\n"
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, "
+        "%11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, "
+        "%28, %29, %30, %31}, [%32];\n"
         : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]), "=f"(dst[4]), "=f"(dst[5]),
           "=f"(dst[6]), "=f"(dst[7]), "=f"(dst[8]), "=f"(dst[9]), "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
+          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]), "=f"(dst[16]),
+          "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]), "=f"(dst[20]), "=f"(dst[21]),
+          "=f"(dst[22]), "=f"(dst[23]), "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]),
+          "=f"(dst[27]), "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31])
         : "r"(taddr));
 }
 
@@ -363,7 +364,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // shape always drives all 32 lanes regardless of the .xN repeat
         // count, so narrowing N trades more load instructions for fewer
         // live registers per load without losing the 32-lane-vs-16-lane win.
-        constexpr int LD_COLS = C_CHUNK_COLS < 16 ? C_CHUNK_COLS : 16;
+        constexpr int LD_COLS = C_CHUNK_COLS < 32 ? C_CHUNK_COLS : 32;
         static_assert(C_CHUNK_COLS % LD_COLS == 0, "C_CHUNK_COLS must be a whole number of loads");
         const int lane_row = warp_id * ROWS_PER_WARP + kittens::laneid();
 
@@ -375,11 +376,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
         // Single pass per chunk: load from TMEM, convert, swizzle into SMEM,
         // TMA out -- rather than loading all C_TILE_DIVISOR chunks into a
-        // register array before draining any of them. Deliberately NOT
-        // #pragma unroll'd here (unlike the inner loops): fully unrolling
-        // gives the scheduler license to overlap chunk i+1's load with chunk
-        // i's store, which reopens the cross-chunk register overlap this
-        // restructuring is trying to close off.
+        // register array before draining any of them. #pragma unroll 1 (not
+        // just omitting #pragma unroll) here: omitting it is only a hint,
+        // and ptxas was still free to auto-unroll this fixed-trip-count loop
+        // on its own, reopening the cross-chunk register overlap this
+        // restructuring is trying to close off. unroll 1 forbids it outright.
+#pragma unroll 1
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
             // need to know that there is at least 1 slot of smem in C tile that is free
             dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
@@ -551,14 +553,11 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             // Single epilogue warpgroup drains every consumer's accumulator
             // for this tile in turn (see the header comment on
             // EPILOGUE_WARPGROUPS for why this isn't split across warpgroups).
-            // Not #pragma unroll'd, for the same reason as the loop inside
-            // epilogue() above: unrolling gives the scheduler license to
-            // overlap one consumer's epilogue call with the next's. This
-            // measurably reduced (but did not eliminate) register spill at
-            // CONSUMER_WARPS=2 -- COL_BLOCK=256 with CONSUMER_WARPS=2 still
-            // spills ~400-600 bytes at the 255-register ceiling; finding the
-            // remaining source needs on-hardware profiling (ncu), not more
-            // source-level guessing.
+            // #pragma unroll 1 (not just omitting #pragma unroll -- see the
+            // loop inside epilogue() above for why that alone wasn't enough):
+            // forbids the scheduler from overlapping one consumer's epilogue
+            // call with the next's.
+#pragma unroll 1
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 epilogue(target_device * row_tiles_per_device + cta_row_base + c,
                          tile_col_idx,
