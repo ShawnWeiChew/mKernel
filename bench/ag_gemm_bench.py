@@ -124,7 +124,7 @@ class BlackwellBenchConfig:
         # MLA qkvg proj, 576 + 1536 + 12288 / TP.
         ("MLA", 576 + 1536 + 12288 // world_size),
     )
-    shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
+    shapes_to_test = [16384, 32768]
     default_k = 7168
     
     # mkernel configs

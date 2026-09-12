@@ -31,7 +31,15 @@ namespace ag_gemm_warp_specialized {
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
+// Number of consumer warps issuing independent MMA chains per CTA, each into
+// its own row-tile's TMEM accumulator while sharing the same producer-loaded
+// B tile. 2 amortizes the B-tile TMA load over twice the row extent (mirrors
+// gemm_ar_blackwell's CONSUMER_WARPS), at the cost of TMEM_PIPELINE_STAGES
+// headroom since accumulators for all consumers must be concurrently live.
+static constexpr int DEFAULT_CONSUMER_WARPS = 1;
+
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA,
+          int _CONSUMER_WARPS = DEFAULT_CONSUMER_WARPS>
 struct fused_globals;
 
 // Number of tile columns visited before the snake pattern steps to the next
@@ -41,22 +49,31 @@ static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
-          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH>
-void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G);
+          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
+          int _CONSUMER_WARPS = DEFAULT_CONSUMER_WARPS>
+void launch_ag_gemm_warp_specialized(
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>& G);
 
 static constexpr int DEFAULT_ROW_BLOCK = 128;
 static constexpr int DEFAULT_COL_BLOCK = 128;
 
 // for M < 512, this should be 128
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _CONSUMER_WARPS>
 struct fused_globals {
     // config items
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 
     // not sure if I want to use a warp specialized or sm specialized strategy yet
     static constexpr int NUM_BLOCKS = 148;
-    static constexpr int CONSUMER_WARPS = 1;
+    // Number of consumer warps, each issuing its own MMA chain into its own
+    // row-tile's TMEM accumulator, sharing one producer-loaded B tile.
+    static constexpr int CONSUMER_WARPS = _CONSUMER_WARPS;
+    static_assert(CONSUMER_WARPS == 1 || CONSUMER_WARPS == 2,
+                  "ag_gemm_warp_specialized only supports 1 or 2 consumer warps");
     static constexpr int PRODUCER_WARPS = 1;
+    // Deliberately NOT scaled with CONSUMER_WARPS: a single epilogue
+    // warpgroup drains every consumer's accumulator sequentially so adding
+    // consumer warps doesn't cost a whole extra warpgroup of register budget.
     static constexpr int EPILOGUE_WARPGROUPS = 1;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
     // CTAs per cluster. 2-CTA MMA is preferred for shapes that divide cleanly;
@@ -68,16 +85,32 @@ struct fused_globals {
     static_assert(_COL_BLOCK % NUM_CTA == 0, "COL_BLOCK must split evenly across the cluster");
     static constexpr int NUM_THREADS = (CONSUMER_WARPS + PRODUCER_WARPS + EPILOGUE_WARPS) * 32;
 
-    // this is pipelining along the reduction dimension
+    // warp indices within the producer/consumer tail warpgroup(s)
+    static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
+    static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
+
+    // this is pipelining along the reduction dimension. Each stage now
+    // carries CONSUMER_WARPS-many A tiles, so a second consumer needs fewer
+    // stages to stay within the SMEM budget -- 4 keeps the pipeline_inputs
+    // footprint at COL_BLOCK=256 exactly equal to the single-consumer
+    // 6-stage footprint (verified against SMEM_FITS below).
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = []() {
-        if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
+        if constexpr (CONSUMER_WARPS == 2) {
+            return 4;
+        } else if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
             return 6;
         } else {
             return 7;
         }
     }();
-    // this is pipelining among different MMAs
-    static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
+    // this is pipelining among different MMAs. With CONSUMER_WARPS > 1, every
+    // consumer's accumulator must be concurrently live in TMEM, so the
+    // available column budget is divided across consumers first.
+    static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / (_COL_BLOCK * CONSUMER_WARPS);
+    static_assert(TMEM_PIPELINE_STAGES >= 1,
+                  "COL_BLOCK * CONSUMER_WARPS exceeds available tensor memory columns");
+    // total number of (stage, consumer) TMEM accumulator slots live at once
+    static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
     // this is the number of epilogue stages that can be in flight at any time
     static constexpr int EPILOGUE_PIPELINE_STAGES = _COL_BLOCK == 128 ? 3 : 2;
     // this is the number of partitions for the epilogue tile in SMEM
@@ -95,12 +128,14 @@ struct fused_globals {
     using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;
 
     using C_tt_tile = kittens::tt<float, ROW_BLOCK, COL_BLOCK>;
+    static_assert(CONSUMER_WARPS * C_tt_tile::cols <= kittens::MAX_TENSOR_COLS,
+                  "The TMEM accumulators for all consumer warps must fit in tensor memory");
     // for smem staging -- keep at least
     using C_tile = kittens::st_bf<ROW_BLOCK, COL_BLOCK / C_TILE_DIVISOR>;
 
     static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY =
-        (sizeof(A_tile) + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
+        (sizeof(A_tile) * CONSUMER_WARPS + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
         sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
     // Deliberately not a static_assert: the tuner instantiates fused_globals
     // for every candidate so it can ask which ones fit. The hard check lives
@@ -128,7 +163,8 @@ struct fused_globals {
     static constexpr int K = 7168;
 
     struct pipeline_inputs {
-        A_tile A;
+        // one A tile per consumer warp; all consumers share the same B tile
+        A_tile A[CONSUMER_WARPS];
         B_tile B;
     };
 
@@ -140,26 +176,32 @@ struct fused_globals {
      * bit 0: TMA producer -- starts with 1 (PRODUCER WARP)
      * bit 1: TMA consumer -- starts with 0 (CONSUMER WARP)
      * bit 2: TMEM producer -- starts with 1 (CONSUMER WARP)
-     * bit 3: TMEM consumer -- starts with 0 (EPILOGUE WARP)
+     * bits 3..3+CONSUMER_WARPS-1: TMEM consumer -- starts with 0 (EPILOGUE WARP)
+     *   one bit per consumer since a single epilogue warpgroup drains every
+     *   consumer's accumulator ring with its own local phasebits variable.
      */
     static constexpr int TMA_PRODUCER_BIT = 0b1;
     static constexpr int TMA_CONSUMER_BIT = 0b00;
     static constexpr int TMEM_PROUCER_BIT = 0b100;
     static constexpr int TMEM_CONSUMER_BIT = 0b0000;
+    static constexpr int PHASE_BIT_EPILOGUE_READY_BASE = 3;
+    static_assert(PHASE_BIT_EPILOGUE_READY_BASE + CONSUMER_WARPS <= 32,
+                  "phase bits must fit in a single 32-bit word");
     static constexpr int PHASE_BITS_INIT =
         TMA_PRODUCER_BIT | TMA_CONSUMER_BIT | TMEM_PROUCER_BIT | TMEM_CONSUMER_BIT;
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
-__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> ag_gemm_warp_specialized_make_globals(
-    dist::ParallelBuffer& A,
-    const at::Tensor& A_local_buf,
-    const at::Tensor& B,
-    at::Tensor& C,
-    int dev_idx,
-    int M,
-    int N) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA,
+          int _CONSUMER_WARPS = DEFAULT_CONSUMER_WARPS>
+__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>
+ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
+                                      const at::Tensor& A_local_buf,
+                                      const at::Tensor& B,
+                                      at::Tensor& C,
+                                      int dev_idx,
+                                      int M,
+                                      int N) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>;
 
     return {
         .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
@@ -177,9 +219,14 @@ void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                const int logical_global_m  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
-) {
+                const int logical_global_m,  // used to determine what the actual shape being
+                                             // operated on is, since M might be padded up
+                // -1 = use the tuned default (2 consumer warps at the KDA
+                // shapes it's tuned for); pass 1 or 2 to force a path for
+                // A/B testing. Only honored at KDA M in {16384, 32768} --
+                // every other shape ignores this and uses its own tuned
+                // (single-consumer) config.
+                const int consumer_warps = -1) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -231,17 +278,35 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                TORCH_CHECK(cw == 1 || cw == 2, "consumer_warps must be 1 or 2, got ", cw);
+                if (cw == 2) {
+                    using fg = fused_globals<128, 256, 2, 2>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                } else {
+                    using fg = fused_globals<128, 256, 2, 1>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1>(globals);
+                }
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                TORCH_CHECK(cw == 1 || cw == 2, "consumer_warps must be 1 or 2, got ", cw);
+                if (cw == 2) {
+                    using fg = fused_globals<128, 256, 2, 2>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 10, 2>(globals);
+                } else {
+                    using fg = fused_globals<128, 256, 2, 1>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1>(globals);
+                }
                 break;
             }
             default:

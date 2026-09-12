@@ -113,10 +113,10 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH, int _CONSUMER_WARPS>
 __device__ __forceinline__ void ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>& G) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -132,7 +132,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
     const int local_m = G.A.rows();
     const int row_tiles_per_device = local_m / fg::ROW_BLOCK;
-    const int cluster_rows_per_device = row_tiles_per_device / fg::NUM_CLUSTERS;
+    // A "cluster iteration" now covers NUM_CLUSTERS * CONSUMER_WARPS physical
+    // row tiles: NUM_CLUSTERS via the 2-CTA multicast MMA, CONSUMER_WARPS via
+    // independent consumer warps sharing one producer-loaded B tile.
+    const int cluster_rows_per_device = row_tiles_per_device / (fg::NUM_CLUSTERS * fg::CONSUMER_WARPS);
     const int num_comp_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
 
     // round up to the nearest multiple of the COL_BLOCK
@@ -151,8 +154,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     __shared__ semaphore tma_load[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
     __shared__ semaphore mma_finish[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
 
-    __shared__ semaphore epilogue_ready[fg::TMEM_PIPELINE_STAGES];
-    __shared__ semaphore epilogue_tmem_finished[fg::TMEM_PIPELINE_STAGES];
+    // flat-indexed by (epilogue_stage_id * CONSUMER_WARPS + consumer_id): the
+    // single epilogue warpgroup drains every consumer's ring through these.
+    __shared__ semaphore epilogue_ready[fg::NUM_TMEM_SLOTS];
+    __shared__ semaphore epilogue_tmem_finished[fg::NUM_TMEM_SLOTS];
 
     __shared__ semaphore tmem_allocated;
     __shared__ semaphore tmem_finished;
@@ -167,12 +172,13 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         for (int i = 0; i < fg::PRODUCER_CONSUMER_PIPELINE_STAGES; i++) {
             // tma finish has to be broadcasted to mma warp
             init_semaphore(tma_load[i], 0, fg::NUM_CLUSTERS);
-            // mma warp will broadcast finish
-            init_semaphore(mma_finish[i], 0, 1);
+            // every consumer warp reading this stage must finish before the
+            // producer can reuse it
+            init_semaphore(mma_finish[i], 0, fg::CONSUMER_WARPS);
         }
 
 #pragma unroll
-        for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
+        for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
             init_semaphore(epilogue_ready[i], 0, 1);
             // tmem finish has to be broadcasted back
             init_semaphore(epilogue_tmem_finished[i], WARPGROUP_WARPS * fg::NUM_CLUSTERS);
@@ -202,18 +208,21 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
         const typename fg::A_local_tensor& A_gmem =
             is_local ? G.A[actual_target_device] : G.A_local_buf;
-        const int A_tile_row_idx =
+        // tile_row_idx is the first of CONSUMER_WARPS consecutive row tiles;
+        // consumer c reads A_tile_row_base + c.
+        const int A_tile_row_base =
             is_local ? tile_row_idx : actual_target_device * row_tiles_per_device + tile_row_idx;
 
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
-            typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
 
             wait(mma_finish[input_stage_id], (phasebits >> 0 & 0b1));
 
             if constexpr (_NUM_CTA == 2) {
-                tma::cluster::expect_bytes(
-                    tma_load[input_stage_id], sizeof(fg::A_tile) + sizeof(fg::B_tile), 0);
+                tma::cluster::expect_bytes(tma_load[input_stage_id],
+                                           sizeof(fg::A_tile) * fg::CONSUMER_WARPS +
+                                               sizeof(fg::B_tile),
+                                           0);
 
                 // B_tile is [N, K], so the TMA coordinate is (n_tile, k_tile),
                 // not (k_tile, n_tile).
@@ -224,19 +233,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                                          (uint16_t)(1 << cta_rank),
                                          0);
 
-                tma::cluster::load_async(A_smem,
-                                         A_gmem,
-                                         {A_tile_row_idx, iter_k},
-                                         tma_load[input_stage_id],
-                                         (uint16_t)(1 << cta_rank),
-                                         0);
+#pragma unroll
+                for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
+                    tma::cluster::load_async(inputs_smem[input_stage_id].A[c],
+                                             A_gmem,
+                                             {A_tile_row_base + c, iter_k},
+                                             tma_load[input_stage_id],
+                                             (uint16_t)(1 << cta_rank),
+                                             0);
+                }
             } else {
                 // A 1-CTA cluster has nothing to multicast to and nothing to
                 // map: the barrier is this CTA's own. The cluster overloads
                 // would still emit cta_group::2.multicast::cluster loads, so
                 // take the plain CTA-scope TMA path instead.
                 tma::expect_bytes(tma_load[input_stage_id],
-                                  sizeof(fg::A_tile) + sizeof(fg::B_tile));
+                                  sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile));
 
                 // B_tile is [N, K], so the TMA coordinate is (n_tile, k_tile),
                 // not (k_tile, n_tile).
@@ -245,7 +257,13 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                                 {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
                                 tma_load[input_stage_id]);
 
-                tma::load_async(A_smem, A_gmem, {A_tile_row_idx, iter_k}, tma_load[input_stage_id]);
+#pragma unroll
+                for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
+                    tma::load_async(inputs_smem[input_stage_id].A[c],
+                                    A_gmem,
+                                    {A_tile_row_base + c, iter_k},
+                                    tma_load[input_stage_id]);
+                }
             }
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -254,11 +272,15 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             }
         }
     };
-    auto consume = [&](typename fg::C_tt_tile* tmem, int& input_stage_id, int& epilogue_stage_id) {
-        wait(epilogue_tmem_finished[epilogue_stage_id], (phasebits >> 2) & 0b1);
+    auto consume = [&](typename fg::C_tt_tile* tmem,
+                       int& input_stage_id,
+                       int& epilogue_stage_id,
+                       const int consumer_id) {
+        wait(epilogue_tmem_finished[epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id],
+             (phasebits >> 2) & 0b1);
 
         {
-            typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
@@ -272,7 +294,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         }
 
         for (int iter_k = 1; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
-            typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A;
+            typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
 
@@ -285,7 +307,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             }
         }
 
-        kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[epilogue_stage_id]);
+        kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(
+            epilogue_ready[epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id]);
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
 
         if (epilogue_stage_id == 0) {
@@ -298,12 +321,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         typename fg::C_tt_tile* tmem,
                         int& epilogue_stage_id,
                         int& epilogue_transfer_stage_id,
+                        const int consumer_id,
                         bool is_last_tile) {
         const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
 
-        wait(epilogue_ready[epilogue_stage_id], (phasebits >> 3) & 0b1);
+        // One epilogue warpgroup drains every consumer's ring in turn, so its
+        // phasebits variable needs one independent bit per consumer here.
+        const int phase_bit = fg::PHASE_BIT_EPILOGUE_READY_BASE + consumer_id;
+        const int flat_slot = epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id;
+        wait(epilogue_ready[flat_slot], (phasebits >> phase_bit) & 0b1);
 
 #pragma unroll
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
@@ -318,9 +346,9 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
         if (elect_warp_leader()) {
             if constexpr (_NUM_CTA == 2) {
-                tma::cluster::arrive(epilogue_tmem_finished[epilogue_stage_id], 0);
+                tma::cluster::arrive(epilogue_tmem_finished[flat_slot], 0);
             } else {
-                arrive(epilogue_tmem_finished[epilogue_stage_id]);
+                arrive(epilogue_tmem_finished[flat_slot]);
             }
         }
 
@@ -353,12 +381,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
         if (epilogue_stage_id == 0) {
-            phasebits ^= (0b1 << 3);
+            phasebits ^= (0b1 << phase_bit);
         }
     };
 
     if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
-        if (warp_id == 4) {
+        if (warp_id == fg::PRODUCER_WARP_ID) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -372,7 +400,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
                     int target_device = tile_id / cluster_tiles_per_device;
 
-                    load(local_row_id * fg::NUM_CLUSTERS + cta_rank,
+                    load(local_row_id * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
+                             cta_rank * fg::CONSUMER_WARPS,
                          tile_col_idx,
                          target_device,
                          input_stage_id);
@@ -380,7 +409,9 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             }
 
             pdl::arrive();
-        } else if (warp_id == 5) {
+        } else if (warp_id >= fg::FIRST_CONSUMER_WARP_ID &&
+                   warp_id < fg::FIRST_CONSUMER_WARP_ID + fg::CONSUMER_WARPS) {
+            const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
             int input_stage_id = 0;
             int epilogue_stage_id = 0;
             typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
@@ -388,40 +419,52 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             // wait for PDL
             pdl::wait();
             everyone::tma::cluster::wait();
-            tm_alloc.provision(tmem_addr);
-            tm_alloc.set_addr(tmem_addr);
 
-            if (elect_warp_leader()) {
-                arrive(tmem_allocated);
+            // Only consumer 0 actually provisions TMEM (it is a whole-CTA
+            // allocation); the other consumer warps just wait for the
+            // broadcast address like the epilogue warpgroup does.
+            if (consumer_id == 0) {
+                tm_alloc.provision(tmem_addr);
+                tm_alloc.set_addr(tmem_addr);
+                if (elect_warp_leader()) {
+                    arrive(tmem_allocated);
+                }
+            } else {
+                wait(tmem_allocated, 0);
+                tm_alloc.set_addr(tmem_addr);
             }
 
             if (cta_rank == 0 && elect_warp_leader()) {
 #pragma unroll
                 for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
-                    tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
+                    tmem[i] = tm_alloc.template allocate<typename fg::C_tt_tile>(
+                        (i * fg::CONSUMER_WARPS + consumer_id) * fg::COL_BLOCK);
                 }
 
-                for (int tile_id = cluster_idx;
-                     tile_id < cluster_tiles_per_device * fg::NUM_DEVICES;
+                for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_comp_clusters) {
-                    consume(tmem, input_stage_id, epilogue_stage_id);
+                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_id);
                 }
             }
 
             pdl::arrive();
         }
     } else {
-        int epilogue_stage_id = 0;
         int epilogue_transfer_stage_id = 0;
-        typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
+        int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
+        typename fg::C_tt_tile tmem[fg::CONSUMER_WARPS][fg::TMEM_PIPELINE_STAGES];
 
         // wait for PDL and tmem
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
 
 #pragma unroll
-        for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
-            tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
+        for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
+#pragma unroll
+            for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
+                tmem[c][i] = tm_alloc.template allocate<typename fg::C_tt_tile>(
+                    (i * fg::CONSUMER_WARPS + c) * fg::COL_BLOCK);
+            }
         }
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_comp_clusters) {
@@ -431,13 +474,23 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
             const int target_device =
                 (tile_id / cluster_tiles_per_device + G.dev_idx) % fg::NUM_DEVICES;
-            const int local_cta_row = local_tile_row * fg::NUM_CLUSTERS + cta_rank;
-            epilogue(target_device * row_tiles_per_device + local_cta_row,
-                     tile_col_idx,
-                     tmem,
-                     epilogue_stage_id,
-                     epilogue_transfer_stage_id,
-                     tile_id + num_comp_clusters >= total_num_tiles);
+            const int cta_row_base =
+                local_tile_row * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank * fg::CONSUMER_WARPS;
+            const bool is_last_tile = tile_id + num_comp_clusters >= total_num_tiles;
+
+            // Single epilogue warpgroup drains every consumer's accumulator
+            // for this tile in turn (see the header comment on
+            // EPILOGUE_WARPGROUPS for why this isn't split across warpgroups).
+#pragma unroll
+            for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
+                epilogue(target_device * row_tiles_per_device + cta_row_base + c,
+                         tile_col_idx,
+                         tmem[c],
+                         epilogue_stage_id[c],
+                         epilogue_transfer_stage_id,
+                         c,
+                         is_last_tile);
+            }
         }
 
         // wait for store to complete before deallocation of tmem
@@ -466,21 +519,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     }
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
-__global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM_CLUSTERS, 1, 1)
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH, int _CONSUMER_WARPS>
+__global__ __cluster_dims__(fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
-        fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>::NUM_THREADS,
+        fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__
-                                      fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> G) {
-    ag_gemm_warp_specialized<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>(G);
+                                      fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>
+                                          G) {
+    ag_gemm_warp_specialized<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _CONSUMER_WARPS>(G);
 }
 
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int SUPERGROUP_WIDTH, int _CONSUMER_WARPS>
 inline void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G) {
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
@@ -528,7 +582,8 @@ inline void launch_ag_gemm_warp_specialized(
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH>;
+    auto this_kernel =
+        fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _CONSUMER_WARPS>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
