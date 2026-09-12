@@ -131,6 +131,22 @@ class BlackwellBenchConfig:
     shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
     default_k = 7168
 
+    # ag_gemm_warp_specialized's (supergroup_width, consumer_warps) candidates,
+    # autotuned per (projection, global_m) for the shapes in
+    # mkernel_tunable_shapes below. Every other shape ignores these and just
+    # runs its shipped tuned default (the kernel picks it when both args are -1).
+    mkernel_autotune_configs = (
+        (5, 1), (5, 2),
+        (10, 1), (10, 2),
+        (15, 1), (15, 2),
+        (20, 1), (20, 2),
+        (25, 1), (25, 2),
+    )
+    mkernel_tunable_shapes = frozenset({
+        ("KDA", 8192), ("KDA", 16384), ("KDA", 32768),
+        ("MLA", 8192), ("MLA", 16384), ("MLA", 32768),
+    })
+
     # cutlass configs
     cutlass_autotune_configs = (
         ((256, 128), (2, 1), True),
@@ -822,10 +838,46 @@ def ag_gemm_blackwell_prepare(
     tune_warmup = 2
     tune_iterations = 5
 
+    best_sw, best_cw = -1, -1
+    if (projection, global_m) in config.mkernel_tunable_shapes:
+        timings = []
+        best_ms = float("inf")
+        for sw, cw in config.mkernel_autotune_configs:
+            def run_candidate(sw=sw, cw=cw):
+                mod.ag_gemm_warp_specialized(
+                    run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
+                    run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+                    sw, cw,
+                )
+            # Every candidate here is a config already compiled into the
+            # binary, run with identical inputs on every rank, so unlike the
+            # CUTLASS sweep below there's no per-rank can_implement() skew to
+            # vote on -- a bad candidate fails the same way on every rank.
+            ms = benchmark_cuda(run_candidate, tune_warmup, tune_iterations)
+            timings.append(((sw, cw), ms))
+            if ms < best_ms:
+                best_sw, best_cw, best_ms = sw, cw, ms
+
+        if config.is_chief:
+            print(
+                f"  mkernel config {projection} M={global_m}: "
+                f"supergroup_width={best_sw} consumer_warps={best_cw} (autotuned)",
+                flush=True,
+            )
+            for (sw, cw), tune_ms in sorted(timings, key=lambda item: item[1]):
+                mark = " <- best" if (sw, cw) == (best_sw, best_cw) else ""
+                tune_tflops = useful_tflops(global_m, logical_n, config.default_k, tune_ms)
+                print(
+                    f"    [autotune] supergroup_width={sw:>2} consumer_warps={cw}: "
+                    f"{tune_ms:8.3f} ms  {tune_tflops:8.2f} TFLOP/s{mark}",
+                    flush=True,
+                )
+
     def run_mkernel():
         mod.ag_gemm_warp_specialized(
             run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            best_sw, best_cw,
         )
 
     fns.append((run_mkernel, "mkernel", True))

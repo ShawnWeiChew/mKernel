@@ -190,13 +190,33 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .N = N};
 }
 
+// Runtime-to-compile-time dispatch for the shapes under active autotuning:
+// `sw`/`cw` are runtime ints (already defaulted from supergroup_width /
+// consumer_warps), and this expands to a chain of `if`s picking the matching
+// compile-time instantiation. Every (SW, CW) pair used across the tunable
+// shapes below compiles to the same handful of unique kernel instantiations
+// (the template args don't depend on M), so listing it in every tunable case
+// doesn't multiply compile time by the number of shapes.
+#define AG_GEMM_TUNE_CASE(SW, CW)                                                  \
+    if (sw == (SW) && cw == (CW)) {                                                \
+        using fg = fused_globals<128, 256, 2, (CW)>;                               \
+        fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, (CW)>(     \
+            A, A_local_buf, B, C, dev_idx, M, N);                                  \
+        launch_ag_gemm_warp_specialized<128, 256, 2, (SW), (CW)>(globals);         \
+    } else
+
 void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                const int logical_global_m  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
-) {
+                const int logical_global_m,  // used to determine what the actual shape being
+                                             // operated on is, since M might be padded up
+                // Autotuning knobs for the shapes under active tuning (KDA/MLA
+                // at M in {8192, 16384, 32768}); -1 (the default) uses that
+                // shape's currently-tuned default. Every other shape ignores
+                // both arguments and always uses its own tuned config.
+                const int supergroup_width = -1,
+                const int consumer_warps = -1) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -208,7 +228,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
 
     // TODO: this only works for TP == 8
-    constexpr int KDA_N = 6400;
+    constexpr int KDA_N = 6288;
 
     // use size of N to check which projection is being done
     if (N == KDA_N) {
@@ -242,28 +262,54 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+                const int sw = supergroup_width < 0 ? 20 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 1 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             case 16384: {
-                // 2-consumer-warp, 2-CTA path: KDA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                const int sw = supergroup_width < 0 ? 5 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             case 32768: {
-                // 2-consumer-warp, 2-CTA path: KDA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10, 2>(globals);
+                const int sw = supergroup_width < 0 ? 10 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             default:
@@ -300,26 +346,54 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                const int sw = supergroup_width < 0 ? 10 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 1 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                const int sw = supergroup_width < 0 ? 15 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 1 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             case 32768: {
-                // 2-consumer-warp, 2-CTA path: MLA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
-                    A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20, 2>(globals);
+                const int sw = supergroup_width < 0 ? 20 : supergroup_width;
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                AG_GEMM_TUNE_CASE(5, 1) AG_GEMM_TUNE_CASE(5, 2)
+                AG_GEMM_TUNE_CASE(10, 1) AG_GEMM_TUNE_CASE(10, 2)
+                AG_GEMM_TUNE_CASE(15, 1) AG_GEMM_TUNE_CASE(15, 2)
+                AG_GEMM_TUNE_CASE(20, 1) AG_GEMM_TUNE_CASE(20, 2)
+                AG_GEMM_TUNE_CASE(25, 1) AG_GEMM_TUNE_CASE(25, 2) {
+                    TORCH_CHECK(false,
+                                "ag_gemm_warp_specialized: no tuned config for "
+                                "supergroup_width=",
+                                sw,
+                                " consumer_warps=",
+                                cw);
+                }
                 break;
             }
             default:
@@ -327,4 +401,5 @@ void entrypoint(dist::ParallelBuffer& A,
         }
     }
 }
+#undef AG_GEMM_TUNE_CASE
 };  // namespace ag_gemm_warp_specialized
