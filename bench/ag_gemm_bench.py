@@ -126,7 +126,15 @@ class BlackwellBenchConfig:
     )
     shapes_to_test = [16384, 32768]
     default_k = 7168
-    
+
+    # ag_gemm_warp_specialized's consumer_warps override for A/B testing the
+    # 1-consumer vs. 2-consumer mainloop at M=16384/32768 (KDA). -1 = kernel's
+    # tuned default (2 consumer warps at those two shapes); every other shape
+    # ignores this and always uses its own tuned (1-consumer) config.
+    # Set via `MKERNEL_AG_GEMM_CONSUMER_WARPS=1` or `=2` to force a path.
+    ag_gemm_consumer_warps = int(os.environ.get("MKERNEL_AG_GEMM_CONSUMER_WARPS", "-1"))
+
+
     # mkernel configs
     mkernel_per_shape_config = {  # noqa: RUF012
         # (projection, logical global M): (COL_BLOCK, NUM_CTA)
@@ -591,7 +599,10 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        mod.ag_gemm_warp_specialized(A_kernel, A_local_buf, B_kernel, C_kernel, m)
+        mod.ag_gemm_warp_specialized(
+            A_kernel, A_local_buf, B_kernel, C_kernel, m,
+            consumer_warps=config.ag_gemm_consumer_warps,
+        )
         torch.cuda.synchronize()
 
         # Drop the padded rows and columns and compare the logical
@@ -842,6 +853,7 @@ def ag_gemm_blackwell_prepare(
         mod.ag_gemm_warp_specialized(
             run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            consumer_warps=config.ag_gemm_consumer_warps,
         )
 
     fns.append((run_mkernel, "mkernel", True))
