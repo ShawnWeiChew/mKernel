@@ -261,10 +261,15 @@ void entrypoint(dist::ParallelBuffer& A,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
 
     // TODO: this only works for TP == 8
-    constexpr int KDA_N = 6400;
+    // KDA's true (unpadded) N -- proj_qkvgfab's (4 * 12288 + 96) / TP + 128
+    // at TP == 8. The caller only needs to round N up to a multiple of 16
+    // now (not a COL_BLOCK multiple), so this checks a [logical, logical+16)
+    // range instead of one padded constant that only matched one specific
+    // padding scheme.
+    constexpr int KDA_LOGICAL_N = 6284;
 
     // use size of N to check which projection is being done
-    if (N == KDA_N) {
+    if (N >= KDA_LOGICAL_N && N < KDA_LOGICAL_N + 16) {
         switch (logical_global_m) {
             case 2048: {
                 using fg = fused_globals<128, 128, 2>;
