@@ -87,6 +87,36 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
+// Raw tcgen05.ld.sync.aligned.32x32b for the epilogue's TMEM->register read.
+// TK's warpgroup::load_async only implements the 16x{64,128,256}b shapes,
+// which address 16 TMEM rows per instruction and replicate each row's data
+// across a pair of lanes -- that pairing matches the MMA fragment layout
+// needed to feed the result back into another MMA, but wastes half the
+// warp's lanes for a pure epilogue readout that never does that. The
+// 32x32b shape instead assigns one distinct TMEM row to each of the 32
+// lanes, so a single instruction below reads N columns for all 32 rows
+// this warp owns, one float per lane per column -- see DeepGEMM's
+// Blackwell epilogue for the same technique. N is the number of TMEM
+// columns read per lane (must be a valid tcgen05 "num" for .32x32b: a
+// power of two) -- kept narrow (16, see LD_COLS in epilogue() below)
+// specifically to bound this function's live registers: wider N values
+// (32, 64) measured real register spill at COL_BLOCK=256 despite needing
+// fewer total instructions, so only the specialization actually used is
+// kept here.
+template <int N>
+__device__ __forceinline__ void tcgen05_ld_32x32b(float (&dst)[N], uint32_t taddr);
+
+template <>
+__device__ __forceinline__ void tcgen05_ld_32x32b<16>(float (&dst)[16], uint32_t taddr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, "
+        "%11, %12, %13, %14, %15}, [%16];\n"
+        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]), "=f"(dst[4]), "=f"(dst[5]),
+          "=f"(dst[6]), "=f"(dst[7]), "=f"(dst[8]), "=f"(dst[9]), "=f"(dst[10]), "=f"(dst[11]),
+          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
+        : "r"(taddr));
+}
+
 }  // namespace
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
@@ -325,7 +355,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         bool is_last_tile) {
         const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
-        rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
+        constexpr int ROWS_PER_WARP = fg::ROW_BLOCK / WARPGROUP_WARPS;
+        static_assert(ROWS_PER_WARP == 32,
+                      "raw tcgen05.32x32b epilogue read assumes 32 accumulator rows per warp");
+        static_assert(C_CHUNK_COLS % 2 == 0, "epilogue bf16 packing assumes an even chunk width");
+        // Cap each raw tcgen05.ld's live register footprint: the .32x32b
+        // shape always drives all 32 lanes regardless of the .xN repeat
+        // count, so narrowing N trades more load instructions for fewer
+        // live registers per load without losing the 32-lane-vs-16-lane win.
+        constexpr int LD_COLS = C_CHUNK_COLS < 16 ? C_CHUNK_COLS : 16;
+        static_assert(C_CHUNK_COLS % LD_COLS == 0, "C_CHUNK_COLS must be a whole number of loads");
+        const int lane_row = warp_id * ROWS_PER_WARP + kittens::laneid();
 
         // One epilogue warpgroup drains every consumer's ring in turn, so its
         // phasebits variable needs one independent bit per consumer here.
@@ -333,37 +373,67 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         const int flat_slot = epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id;
         wait(epilogue_ready[flat_slot], (phasebits >> phase_bit) & 0b1);
 
-#pragma unroll
-        for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
-            warpgroup::load_async(
-                c_reg[i],
-                // TODO: review this indexing
-                tmem[epilogue_stage_id].template subtile<tt<float, fg::ROW_BLOCK, C_CHUNK_COLS>>(
-                    i * C_CHUNK_COLS));
-        }
-
-        tensor_load_wait();
-
-        if (elect_warp_leader()) {
-            if constexpr (_NUM_CTA == 2) {
-                tma::cluster::arrive(epilogue_tmem_finished[flat_slot], 0);
-            } else {
-                arrive(epilogue_tmem_finished[flat_slot]);
-            }
-        }
-
-        if (is_last_tile) {
-            warpgroup::sync(1);
-            pdl::arrive();
-        }
-
-#pragma unroll
+        // Single pass per chunk: load from TMEM, convert, swizzle into SMEM,
+        // TMA out -- rather than loading all C_TILE_DIVISOR chunks into a
+        // register array before draining any of them. Deliberately NOT
+        // #pragma unroll'd here (unlike the inner loops): fully unrolling
+        // gives the scheduler license to overlap chunk i+1's load with chunk
+        // i's store, which reopens the cross-chunk register overlap this
+        // restructuring is trying to close off.
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
             // need to know that there is at least 1 slot of smem in C tile that is free
             dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
             warpgroup::sync(1);
-            // this already does the swizzle inside it
-            warpgroup::store(C_smem[epilogue_transfer_stage_id], c_reg[i]);
+
+#pragma unroll
+            for (int sub = 0; sub < C_CHUNK_COLS; sub += LD_COLS) {
+                float raw[LD_COLS];
+                tcgen05_ld_32x32b<LD_COLS>(
+                    raw,
+                    tmem[epilogue_stage_id]
+                        .template subtile<tt<float, ROWS_PER_WARP, LD_COLS>>(
+                            warp_id * ROWS_PER_WARP, i * C_CHUNK_COLS + sub)
+                        .addr);
+                // tcgen05.ld is async; wait per load (not once after every
+                // load in the tile) so raw[] is dead before the next load
+                // reuses its registers.
+                tensor_load_wait();
+
+                // TMEM for this (stage, consumer) is only fully drained once
+                // every load above has completed, so the free-tmem signal and
+                // the is_last_tile PDL handoff have to wait for the very last
+                // one -- but nothing else here depends on that, so they fire
+                // inline instead of gating a separate pass over every load.
+                if (i == fg::C_TILE_DIVISOR - 1 && sub + LD_COLS == C_CHUNK_COLS) {
+                    if (elect_warp_leader()) {
+                        if constexpr (_NUM_CTA == 2) {
+                            tma::cluster::arrive(epilogue_tmem_finished[flat_slot], 0);
+                        } else {
+                            arrive(epilogue_tmem_finished[flat_slot]);
+                        }
+                    }
+                    if (is_last_tile) {
+                        warpgroup::sync(1);
+                        pdl::arrive();
+                    }
+                }
+
+                // Manual swizzle: reuse the C_tile's own idx() (the same
+                // address math warpgroup::store applies internally) so the
+                // layout still matches what the TMA descriptor below expects,
+                // but driven by our own lane-owns-one-row register layout
+                // instead of TK's stsm4-based path (which requires the
+                // MMA-fragment register layout that the 16-lane TMEM load
+                // produces).
+#pragma unroll
+                for (int j = 0; j < LD_COLS; j += 2) {
+                    const comm::bf16_2 pair = __floats2bfloat162_rn(raw[j], raw[j + 1]);
+                    *fg::C_tile::idx(&C_smem[epilogue_transfer_stage_id].data[0],
+                                     {lane_row, sub + j}) = pair.x;
+                    *fg::C_tile::idx(&C_smem[epilogue_transfer_stage_id].data[0],
+                                     {lane_row, sub + j + 1}) = pair.y;
+                }
+            }
             warpgroup::sync(1);
 
             if (warpgroup::laneid() == 0) {
@@ -481,7 +551,14 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             // Single epilogue warpgroup drains every consumer's accumulator
             // for this tile in turn (see the header comment on
             // EPILOGUE_WARPGROUPS for why this isn't split across warpgroups).
-#pragma unroll
+            // Not #pragma unroll'd, for the same reason as the loop inside
+            // epilogue() above: unrolling gives the scheduler license to
+            // overlap one consumer's epilogue call with the next's. This
+            // measurably reduced (but did not eliminate) register spill at
+            // CONSUMER_WARPS=2 -- COL_BLOCK=256 with CONSUMER_WARPS=2 still
+            // spills ~400-600 bytes at the 255-register ceiling; finding the
+            // remaining source needs on-hardware profiling (ncu), not more
+            // source-level guessing.
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 epilogue(target_device * row_tiles_per_device + cta_row_base + c,
                          tile_col_idx,
