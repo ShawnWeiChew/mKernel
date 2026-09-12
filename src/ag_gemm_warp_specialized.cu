@@ -135,9 +135,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
     const int local_m = G.A.rows();
-    const int row_tiles_per_device = local_m / fg::ROW_BLOCK;
+    const int row_tiles_per_device = (local_m + fg::ROW_BLOCK - 1) / fg::ROW_BLOCK;
     const int cluster_rows_per_device =
-        row_tiles_per_device / fg::NUM_CLUSTERS / fg::CONSUMER_WARPS;
+        (row_tiles_per_device + fg::NUM_CLUSTERS * fg::CONSUMER_WARPS - 1) /
+        (fg::NUM_CLUSTERS * fg::CONSUMER_WARPS);
     const int num_comp_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
 
     // round up to the nearest multiple of the COL_BLOCK
@@ -206,16 +207,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             }
         }
 
-        const typename fg::A_local_tensor& A_gmem =
-            is_local ? G.A[actual_target_device] : G.A_local_buf;
-
         // tile_row_idx is consumer 0's row tile; each additional consumer
         // warp c owns the row tile NUM_CLUSTERS further along -- see the
         // matching offset in the consumer/epilogue loops below.
-        auto a_tile_row_idx_for = [&](int c) {
-            const int local_row = tile_row_idx + c * fg::NUM_CLUSTERS;
-            return is_local ? local_row : actual_target_device * row_tiles_per_device + local_row;
-        };
+        auto a_tile_row_idx_for = [&](int c) { return tile_row_idx + c * fg::NUM_CLUSTERS; };
 
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile(&A_smem)[fg::CONSUMER_WARPS] = inputs_smem[input_stage_id].A;
@@ -240,12 +235,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
 #pragma unroll
                 for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-                    tma::cluster::load_async(A_smem[c],
-                                             A_gmem,
-                                             {a_tile_row_idx_for(c), iter_k},
-                                             tma_load[input_stage_id],
-                                             (uint16_t)(1 << cta_rank),
-                                             0);
+                    if (is_local) {
+                        tma::cluster::load_async(A_smem[c],
+                                                 G.A[G.dev_idx],
+                                                 {a_tile_row_idx_for(c), iter_k},
+                                                 tma_load[input_stage_id],
+                                                 (uint16_t)(1 << cta_rank),
+                                                 0);
+                    } else {
+                        tma::cluster::load_async(
+                            A_smem[c],
+                            G.A_local_buf,
+                            {actual_target_device, a_tile_row_idx_for(c), iter_k},
+                            tma_load[input_stage_id],
+                            (uint16_t)(1 << cta_rank),
+                            0);
+                    }
                 }
 
             } else {
@@ -265,8 +270,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
 #pragma unroll
                 for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-                    tma::load_async(
-                        A_smem[c], A_gmem, {a_tile_row_idx_for(c), iter_k}, tma_load[input_stage_id]);
+                    if (is_local) {
+                        tma::load_async(A_smem[c],
+                                        G.A[G.dev_idx],
+                                        {a_tile_row_idx_for(c), iter_k},
+                                        tma_load[input_stage_id]);
+                    } else {
+                        tma::load_async(A_smem[c],
+                                        G.A_local_buf,
+                                        {actual_target_device, a_tile_row_idx_for(c), iter_k},
+                                        tma_load[input_stage_id]);
+                    }
                 }
             }
 
@@ -321,7 +335,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         }
     };
 
-    auto epilogue = [&](int tile_row_idx,
+    auto epilogue = [&](int target_device,
+                        int tile_row_idx,
                         int tile_col_idx,
                         typename fg::C_tt_tile* tmem,
                         const int consumer_id,
@@ -382,7 +397,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                 dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                     C_out,
                     C_smem[epilogue_transfer_stage_id],
-                    {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
+                    {target_device, tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
             }
 
             epilogue_transfer_stage_id =
@@ -491,7 +506,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                 // the row tile NUM_CLUSTERS further along than consumer 0.
                 const int local_cta_row =
                     (local_row_id * fg::CONSUMER_WARPS + c) * fg::NUM_CLUSTERS + cta_rank;
-                epilogue(target_device * row_tiles_per_device + local_cta_row,
+                epilogue(target_device,
+                         local_cta_row,
                          tile_col_idx,
                          &tmem[c * fg::TMEM_PIPELINE_STAGES],
                          c,
@@ -533,9 +549,7 @@ template <int _ROW_BLOCK,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS>
 __global__ __cluster_dims__(
-    fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS,
-    1,
-    1)
+    fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
         fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_ROW_BLOCK,

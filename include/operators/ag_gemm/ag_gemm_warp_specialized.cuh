@@ -116,11 +116,15 @@ struct fused_globals {
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
+
+    // we declare a separate A tensor here that is indexed as ((NUM_DEVICES, local_m), K), so that
+    // TMA loads that go out of bounds will naturally zero themselves out
+    using A_replicated_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
+    using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
 
     A_distributed_tensor A;
-    A_local_tensor A_local_buf;
+    A_replicated_tensor A_local_buf;
     B_local_tensor B;
     C_local_tensor C;
 
@@ -174,16 +178,16 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
                                       int N) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
-    return {
-        .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-        .A_local_buf = ::dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A_local_buf),
-        .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-        .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
-        .A_copy_ready = nullptr,
-        .A_copy_epoch = 0,
-        .dev_idx = dev_idx,
-        .M = M,
-        .N = N};
+    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .A_local_buf =
+                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
+            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .A_copy_ready = nullptr,
+            .A_copy_epoch = 0,
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N};
 }
 
 void entrypoint(dist::ParallelBuffer& A,
@@ -196,7 +200,8 @@ void entrypoint(dist::ParallelBuffer& A,
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    const int M = C.size(0), N = B.size(0);
+    // C is now [NUM_DEVICES, local_m, N];
+    const int M = C.size(0) * C.size(1), N = B.size(0);
     constexpr int K = fused_globals<128, 128>::K;
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
