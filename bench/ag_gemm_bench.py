@@ -128,10 +128,11 @@ class BlackwellBenchConfig:
     default_k = 7168
 
     # ag_gemm_warp_specialized's consumer_warps override for A/B testing the
-    # 1-consumer vs. 2-consumer mainloop at M=16384/32768 (KDA). -1 = kernel's
-    # tuned default (2 consumer warps at those two shapes); every other shape
-    # ignores this and always uses its own tuned (1-consumer) config.
-    # Set via `MKERNEL_AG_GEMM_CONSUMER_WARPS=1` or `=2` to force a path.
+    # 1-consumer vs. 2-consumer mainloop at M=16384/32768 (both KDA and MLA).
+    # -1 = kernel's tuned default (2 consumer warps at those two shapes);
+    # every other shape ignores this and always uses its own tuned
+    # (1-consumer) config. Set via `MKERNEL_AG_GEMM_CONSUMER_WARPS=1` or `=2`
+    # to force a path.
     ag_gemm_consumer_warps = int(os.environ.get("MKERNEL_AG_GEMM_CONSUMER_WARPS", "-1"))
 
 

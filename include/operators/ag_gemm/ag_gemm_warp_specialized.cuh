@@ -71,10 +71,16 @@ struct fused_globals {
     static_assert(CONSUMER_WARPS == 1 || CONSUMER_WARPS == 2,
                   "ag_gemm_warp_specialized only supports 1 or 2 consumer warps");
     static constexpr int PRODUCER_WARPS = 1;
-    // Deliberately NOT scaled with CONSUMER_WARPS: a single epilogue
-    // warpgroup drains every consumer's accumulator sequentially so adding
-    // consumer warps doesn't cost a whole extra warpgroup of register budget.
-    static constexpr int EPILOGUE_WARPGROUPS = 1;
+    // One epilogue warpgroup per consumer, each draining its own consumer's
+    // accumulator concurrently (rather than one shared warpgroup draining
+    // every consumer's ring in sequence). Needs a C_smem staging ring per
+    // warpgroup (see DYNAMIC_SHARED_MEMORY), but C_TILE_DIVISOR below scales
+    // with EPILOGUE_WARPGROUPS to keep that ring's total footprint constant,
+    // so this doesn't cost any K-pipeline depth
+    // (PRODUCER_CONSUMER_PIPELINE_STAGES) -- just more warps/registers and
+    // more (narrower) epilogue TMA stores, in exchange for running the
+    // epilogues in parallel instead of back-to-back.
+    static constexpr int EPILOGUE_WARPGROUPS = CONSUMER_WARPS;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
     // CTAs per cluster. 2-CTA MMA is preferred for shapes that divide cleanly;
     // NUM_CLUSTERS is the cluster dimension the kernel launches with.
@@ -89,11 +95,10 @@ struct fused_globals {
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
 
-    // this is pipelining along the reduction dimension. Each stage now
-    // carries CONSUMER_WARPS-many A tiles, so a second consumer needs fewer
-    // stages to stay within the SMEM budget -- 4 keeps the pipeline_inputs
-    // footprint at COL_BLOCK=256 exactly equal to the single-consumer
-    // 6-stage footprint (verified against SMEM_FITS below).
+    // this is pipelining along the reduction dimension. Each stage carries
+    // CONSUMER_WARPS-many A tiles -- 4 keeps the pipeline_inputs footprint at
+    // COL_BLOCK=256 within the SMEM budget alongside the C_smem rings sized
+    // by C_TILE_DIVISOR below (verified against SMEM_FITS below).
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = []() {
         if constexpr (CONSUMER_WARPS == 2) {
             return 4;
@@ -113,8 +118,14 @@ struct fused_globals {
     static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
     // this is the number of epilogue stages that can be in flight at any time
     static constexpr int EPILOGUE_PIPELINE_STAGES = _COL_BLOCK == 128 ? 3 : 2;
-    // this is the number of partitions for the epilogue tile in SMEM
-    static constexpr int C_TILE_DIVISOR = 4;
+    // this is the number of partitions for the epilogue tile in SMEM. Scales
+    // with EPILOGUE_WARPGROUPS so the total C_smem footprint (C_tile size *
+    // EPILOGUE_PIPELINE_STAGES * EPILOGUE_WARPGROUPS, in DYNAMIC_SHARED_MEMORY
+    // below) stays constant as more warpgroups are added -- narrower/deeper
+    // SMEM staging tiles instead of multiplying the total SMEM budget and
+    // eating into PRODUCER_CONSUMER_PIPELINE_STAGES. Independent of the raw
+    // TMEM load width (LD_COLS in epilogue()), which stays the same either way.
+    static constexpr int C_TILE_DIVISOR = 4 * EPILOGUE_WARPGROUPS;
 
     static constexpr int ROW_BLOCK = _ROW_BLOCK;
     static constexpr int COL_BLOCK = _COL_BLOCK;
@@ -136,7 +147,7 @@ struct fused_globals {
     static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY =
         (sizeof(A_tile) * CONSUMER_WARPS + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
-        sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
+        sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES * EPILOGUE_WARPGROUPS + 1024;
     // Deliberately not a static_assert: the tuner instantiates fused_globals
     // for every candidate so it can ask which ones fit. The hard check lives
     // in launch_ag_gemm_warp_specialized, so nothing oversized can actually launch.
@@ -221,11 +232,11 @@ void entrypoint(dist::ParallelBuffer& A,
                 at::Tensor& C,
                 const int logical_global_m,  // used to determine what the actual shape being
                                              // operated on is, since M might be padded up
-                // -1 = use the tuned default (2 consumer warps at the KDA
-                // shapes it's tuned for); pass 1 or 2 to force a path for
-                // A/B testing. Only honored at KDA M in {16384, 32768} --
-                // every other shape ignores this and uses its own tuned
-                // (single-consumer) config.
+                // -1 = use the tuned default (2 consumer warps at M in
+                // {16384, 32768}, for both the KDA and MLA projections);
+                // pass 1 or 2 to force a path for A/B testing. Every other
+                // shape ignores this and uses its own tuned (single-consumer)
+                // config.
                 const int consumer_warps = -1) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -350,17 +361,35 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                TORCH_CHECK(cw == 1 || cw == 2, "consumer_warps must be 1 or 2, got ", cw);
+                if (cw == 2) {
+                    using fg = fused_globals<128, 256, 2, 2>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2>(globals);
+                } else {
+                    using fg = fused_globals<128, 256, 2, 1>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1>(globals);
+                }
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+                const int cw = consumer_warps < 0 ? 2 : consumer_warps;
+                TORCH_CHECK(cw == 1 || cw == 2, "consumer_warps must be 1 or 2, got ", cw);
+                if (cw == 2) {
+                    using fg = fused_globals<128, 256, 2, 2>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 20, 2>(globals);
+                } else {
+                    using fg = fused_globals<128, 256, 2, 1>;
+                    fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                        A, A_local_buf, B, C, dev_idx, M, N);
+                    launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1>(globals);
+                }
                 break;
             }
             default:

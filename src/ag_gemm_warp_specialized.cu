@@ -179,14 +179,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
     typename fg::pipeline_inputs(&inputs_smem)[fg::PRODUCER_CONSUMER_PIPELINE_STAGES] =
         smem_allocator.allocate<fg::pipeline_inputs, fg::PRODUCER_CONSUMER_PIPELINE_STAGES>();
-    typename fg::C_tile(&C_smem)[fg::EPILOGUE_PIPELINE_STAGES] =
-        smem_allocator.allocate<fg::C_tile, fg::EPILOGUE_PIPELINE_STAGES>();
+    // one C_smem ring per epilogue warpgroup: with EPILOGUE_WARPGROUPS
+    // concurrent warpgroups now draining different consumers' accumulators
+    // at once, they can't safely share a single staging ring.
+    typename fg::C_tile(&C_smem)[fg::EPILOGUE_WARPGROUPS][fg::EPILOGUE_PIPELINE_STAGES] =
+        smem_allocator.allocate<fg::C_tile, fg::EPILOGUE_WARPGROUPS, fg::EPILOGUE_PIPELINE_STAGES>();
 
     __shared__ semaphore tma_load[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
     __shared__ semaphore mma_finish[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
 
-    // flat-indexed by (epilogue_stage_id * CONSUMER_WARPS + consumer_id): the
-    // single epilogue warpgroup drains every consumer's ring through these.
+    // flat-indexed by (epilogue_stage_id * CONSUMER_WARPS + consumer_id): one
+    // epilogue warpgroup per consumer drains its own ring through these.
     __shared__ semaphore epilogue_ready[fg::NUM_TMEM_SLOTS];
     __shared__ semaphore epilogue_tmem_finished[fg::NUM_TMEM_SLOTS];
 
@@ -366,12 +369,25 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // live registers per load without losing the 32-lane-vs-16-lane win.
         constexpr int LD_COLS = C_CHUNK_COLS < 32 ? C_CHUNK_COLS : 32;
         static_assert(C_CHUNK_COLS % LD_COLS == 0, "C_CHUNK_COLS must be a whole number of loads");
-        const int lane_row = warp_id * ROWS_PER_WARP + kittens::laneid();
+        // warp_id is absolute within the whole block; this warpgroup's own
+        // consumer_id-th epilogue instance still needs a 0..3 row index into
+        // its own 128-row tile.
+        const int local_warp_id = warp_id % WARPGROUP_WARPS;
+        const int lane_row = local_warp_id * ROWS_PER_WARP + kittens::laneid();
 
-        // One epilogue warpgroup drains every consumer's ring in turn, so its
-        // phasebits variable needs one independent bit per consumer here.
+        // consumer_id is fixed per physical epilogue warpgroup (== its own
+        // warpgroup_id), so this bit and this C_smem ring are exclusively
+        // this warpgroup's own -- but every consumer_id still gets its own
+        // bit/ring/barrier id since EPILOGUE_WARPGROUPS warpgroups all run
+        // concurrently and must not collide with each other.
         const int phase_bit = fg::PHASE_BIT_EPILOGUE_READY_BASE + consumer_id;
         const int flat_slot = epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id;
+        // Barrier ids 1..EPILOGUE_WARPGROUPS, one per consumer -- distinct
+        // from each other (these warpgroups run concurrently and would
+        // otherwise corrupt each other's rendezvous count on a shared id)
+        // and from the cleanup path's group<EPILOGUE_WARPS>::sync, which
+        // uses EPILOGUE_WARPGROUPS+1 for exactly that reason.
+        const int epilogue_barrier = consumer_id + 1;
         wait(epilogue_ready[flat_slot], (phasebits >> phase_bit) & 0b1);
 
         // Single pass per chunk: load from TMEM, convert, swizzle into SMEM,
@@ -385,7 +401,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
             // need to know that there is at least 1 slot of smem in C tile that is free
             dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
-            warpgroup::sync(1);
+            warpgroup::sync(epilogue_barrier);
 
 #pragma unroll
             for (int sub = 0; sub < C_CHUNK_COLS; sub += LD_COLS) {
@@ -394,7 +410,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                     raw,
                     tmem[epilogue_stage_id]
                         .template subtile<tt<float, ROWS_PER_WARP, LD_COLS>>(
-                            warp_id * ROWS_PER_WARP, i * C_CHUNK_COLS + sub)
+                            local_warp_id * ROWS_PER_WARP, i * C_CHUNK_COLS + sub)
                         .addr);
                 // tcgen05.ld is async; wait per load (not once after every
                 // load in the tile) so raw[] is dead before the next load
@@ -415,7 +431,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         }
                     }
                     if (is_last_tile) {
-                        warpgroup::sync(1);
+                        warpgroup::sync(epilogue_barrier);
                         pdl::arrive();
                     }
                 }
@@ -430,20 +446,20 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 #pragma unroll
                 for (int j = 0; j < LD_COLS; j += 2) {
                     const comm::bf16_2 pair = __floats2bfloat162_rn(raw[j], raw[j + 1]);
-                    *fg::C_tile::idx(&C_smem[epilogue_transfer_stage_id].data[0],
+                    *fg::C_tile::idx(&C_smem[consumer_id][epilogue_transfer_stage_id].data[0],
                                      {lane_row, sub + j}) = pair.x;
-                    *fg::C_tile::idx(&C_smem[epilogue_transfer_stage_id].data[0],
+                    *fg::C_tile::idx(&C_smem[consumer_id][epilogue_transfer_stage_id].data[0],
                                      {lane_row, sub + j + 1}) = pair.y;
                 }
             }
-            warpgroup::sync(1);
+            warpgroup::sync(epilogue_barrier);
 
             if (warpgroup::laneid() == 0) {
                 // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
                 // column coordinate counts chunks, not COL_BLOCK tiles.
                 dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                     C_out,
-                    C_smem[epilogue_transfer_stage_id],
+                    C_smem[consumer_id][epilogue_transfer_stage_id],
                     {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
             }
 
@@ -522,21 +538,22 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             pdl::arrive();
         }
     } else {
+        // One epilogue warpgroup per consumer: this warpgroup's own identity
+        // fixes which consumer it exclusively drains, concurrently with the
+        // other epilogue warpgroup(s) draining theirs.
+        const int consumer_id = warpgroup_id;
         int epilogue_transfer_stage_id = 0;
-        int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
-        typename fg::C_tt_tile tmem[fg::CONSUMER_WARPS][fg::TMEM_PIPELINE_STAGES];
+        int epilogue_stage_id = 0;
+        typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
         // wait for PDL and tmem
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
 
 #pragma unroll
-        for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-#pragma unroll
-            for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
-                tmem[c][i] = tm_alloc.template allocate<typename fg::C_tt_tile>(
-                    (i * fg::CONSUMER_WARPS + c) * fg::COL_BLOCK);
-            }
+        for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
+            tmem[i] = tm_alloc.template allocate<typename fg::C_tt_tile>(
+                (i * fg::CONSUMER_WARPS + consumer_id) * fg::COL_BLOCK);
         }
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_comp_clusters) {
@@ -550,23 +567,13 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                 local_tile_row * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank * fg::CONSUMER_WARPS;
             const bool is_last_tile = tile_id + num_comp_clusters >= total_num_tiles;
 
-            // Single epilogue warpgroup drains every consumer's accumulator
-            // for this tile in turn (see the header comment on
-            // EPILOGUE_WARPGROUPS for why this isn't split across warpgroups).
-            // #pragma unroll 1 (not just omitting #pragma unroll -- see the
-            // loop inside epilogue() above for why that alone wasn't enough):
-            // forbids the scheduler from overlapping one consumer's epilogue
-            // call with the next's.
-#pragma unroll 1
-            for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-                epilogue(target_device * row_tiles_per_device + cta_row_base + c,
-                         tile_col_idx,
-                         tmem[c],
-                         epilogue_stage_id[c],
-                         epilogue_transfer_stage_id,
-                         c,
-                         is_last_tile);
-            }
+            epilogue(target_device * row_tiles_per_device + cta_row_base + consumer_id,
+                     tile_col_idx,
+                     tmem,
+                     epilogue_stage_id,
+                     epilogue_transfer_stage_id,
+                     consumer_id,
+                     is_last_tile);
         }
 
         // wait for store to complete before deallocation of tmem
@@ -574,8 +581,13 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             dist::tma::store_async_wait();
         }
 
+        // Barrier spans every epilogue warpgroup (not just this one), so
+        // deprovisioning below only happens once every consumer's epilogue
+        // -- not just this warpgroup's own -- has finished draining TMEM.
+        // EPILOGUE_WARPGROUPS+1 keeps it clear of each warpgroup's own
+        // per-consumer barrier id (consumer_id+1, see epilogue()).
         tensor_before_thread_sync();
-        group<fg::EPILOGUE_WARPS>::sync(1);
+        group<fg::EPILOGUE_WARPS>::sync(fg::EPILOGUE_WARPGROUPS + 1);
 
         if (group<fg::EPILOGUE_WARPS>::warpid() == 0) {
             if (elect_warp_leader()) {
