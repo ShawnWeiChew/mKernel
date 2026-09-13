@@ -314,10 +314,10 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2, 1>;
+                using fg = fused_globals<128, 256, 2>;
                 fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1>(globals);
+                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
                 break;
             }
             default:
