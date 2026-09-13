@@ -242,10 +242,10 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2>(
+                using fg = fused_globals<128, 256, 2, 2>;
+                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
                     A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
                 break;
             }
             case 16384: {
@@ -263,7 +263,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
                     A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10, 2>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
                 break;
             }
             default:
@@ -314,12 +314,10 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 32768: {
-                // 2-consumer-warp, 2-CTA path: MLA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                using fg = fused_globals<128, 256, 2, 1>;
+                fg globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                     A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20, 2>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1>(globals);
                 break;
             }
             default:

@@ -510,13 +510,7 @@ def unpad_rows(
     logical_n: int,
 ) -> torch.Tensor:
     """Return the logical [M, logical_n] block of a row/column padded C.
-
-    Each rank contributes padded_local_m rows to the all-gathered output but
-    only the first local_m of them carry real data, so the padding rows sit
-    between rank shards rather than after the last one.
     """
-    if padded_local_m == local_m:
-        return c[:, :logical_n]
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
