@@ -16,11 +16,7 @@ E.g. THUNDERKITTENS_PATH=/home/ThunderKittens CUTLASS_PATH=/home/cutlass python 
 """
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
-import time
+import argparse, json, os, sys, time
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -42,7 +38,6 @@ from common import (  # noqa: E402
     check_deterministic_rerun,
     compare_named_results,
     gather_cpu_tensors,
-    get_num_nodes,  # noqa: E402
     get_peer_ips,
     get_peer_ports,
     is_peermem_backing,
@@ -51,6 +46,7 @@ from common import (  # noqa: E402
     rdma_policy_label,
 )
 
+from common import get_num_nodes  # noqa: E402
 
 class HopperBenchConfig:
     arch = "hopper"
