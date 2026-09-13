@@ -208,7 +208,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
 
     // TODO: this only works for TP == 8
-    constexpr int KDA_N = 6400;
+    constexpr int KDA_N = 6288;
 
     // use size of N to check which projection is being done
     if (N == KDA_N) {
