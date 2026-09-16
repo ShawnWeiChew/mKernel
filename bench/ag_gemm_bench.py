@@ -126,25 +126,7 @@ class BlackwellBenchConfig:
     )
     shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
     default_k = 7168
-    
-    # mkernel configs
-    mkernel_per_shape_config = {  # noqa: RUF012
-        # (projection, logical global M): (COL_BLOCK, NUM_CTA)
-        ("KDA", 2048): (128, 2),
-        ("KDA", 3072): (256, 2),
-        ("KDA", 3584): (256, 2),
-        ("KDA", 4096): (256, 2),
-        ("KDA", 8192): (256, 2),
-        ("KDA", 16384): (256, 2),
-        ("KDA", 32768): (256, 2),
-        ("MLA", 2048): (128, 2),
-        ("MLA", 3072): (128, 1),
-        ("MLA", 3584): (256, 2),
-        ("MLA", 4096): (256, 2),
-        ("MLA", 8192): (256, 2),
-        ("MLA", 16384): (256, 2),
-        ("MLA", 32768): (256, 2),
-    }
+
     # cutlass configs
     cutlass_autotune_configs = (
         ((256, 128), (2, 1), True),
@@ -524,13 +506,7 @@ def unpad_rows(
     logical_n: int,
 ) -> torch.Tensor:
     """Return the logical [M, logical_n] block of a row/column padded C.
-
-    Each rank contributes padded_local_m rows to the all-gathered output but
-    only the first local_m of them carry real data, so the padding rows sit
-    between rank shards rather than after the last one.
     """
-    if padded_local_m == local_m:
-        return c[:, :logical_n]
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
@@ -541,10 +517,9 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             raise ValueError(f"global M={m} is not divisible by {config.world_size=}")
 
         local_m = m // config.world_size
-        col_block, num_cta = config.mkernel_per_shape_config[(projection, m)]
-        padded_local_m = round_up(local_m, 128 * num_cta)
+        padded_local_m = round_up(local_m, 16)
         padded_m = padded_local_m * config.world_size
-        padded_n = round_up(logical_n, col_block)
+        padded_n = round_up(logical_n, 16)
 
         torch.manual_seed(42 + config.local_rank)
         torch.cuda.manual_seed(42 + config.local_rank)
@@ -574,13 +549,13 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         )
         A_kernel.data_.copy_(pad_rows(config, A_ref_local, padded_local_m))
         A_local_buf = torch.empty(
-            (padded_m, config.default_k), device="cuda", dtype=torch.bfloat16
+            (config.world_size, padded_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
         )
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
         B_kernel = pad_cols(config, B_ref, padded_n).T.contiguous()
         C_kernel = torch.zeros(
-            (padded_m, padded_n), device="cuda", dtype=torch.bfloat16
+            (config.world_size, padded_local_m, padded_n), device="cuda", dtype=torch.bfloat16
         )
 
         # The kernel's first act is to pull every peer's shard out of their
@@ -806,10 +781,9 @@ def ag_gemm_blackwell_prepare(
     fns.append((bench_baseline, "baseline", True))
 
     # ---- mkernel: ag_gemm_warp_specialized dispatch ----
-    col_block, num_cta = config.mkernel_per_shape_config[(projection, global_m)]
-    mk_local_m = round_up(run_config.logical_m, 128 * num_cta)
+    mk_local_m = round_up(run_config.logical_m, 16)
     mk_m = mk_local_m * config.world_size
-    mk_n = round_up(run_config.logical_n, col_block)
+    mk_n = round_up(run_config.logical_n, 16)
     run_config.mkernel_padded_m = mk_m
     run_config.mkernel_padded_n = mk_n
 
@@ -824,9 +798,9 @@ def ag_gemm_blackwell_prepare(
     )
     run_config.mkernel_a_dist.data_.copy_(A_mk_local)
     run_config.mkernel_a_local_buf = torch.empty(
-        (mk_m, config.default_k), device="cuda", dtype=torch.bfloat16
+        (config.world_size, mk_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
     )
-    run_config.mkernel_c_buf = torch.zeros((mk_m, mk_n), device="cuda", dtype=torch.bfloat16)
+    run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
     # The kernel's first act is to pull every peer's shard out of their
     # DistBuffer, so no rank may launch until all of them have finished
