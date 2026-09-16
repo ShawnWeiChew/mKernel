@@ -208,10 +208,10 @@ void entrypoint(dist::ParallelBuffer& A,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
 
     // TODO: this only works for TP == 8
-    constexpr int KDA_N = 6288;
+    constexpr int MIN_LARGE_GEMM_N = 6288;
 
     // use size of N to check which projection is being done
-    if (N == KDA_N) {
+    if (N >= MIN_LARGE_GEMM_N) {
         switch (logical_global_m) {
             case 2048: {
                 using fg = fused_globals<128, 128, 2>;
@@ -249,8 +249,6 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 16384: {
-                // 2-consumer-warp, 2-CTA path: KDA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
@@ -258,8 +256,6 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 32768: {
-                // 2-consumer-warp, 2-CTA path: KDA at this shape divides
-                // evenly across NUM_CLUSTERS * NUM_CONSUMER_WARPS.
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);

@@ -1,8 +1,3 @@
-/**
- * AG-GEMM but for KDA's proj_qkvgfab and MLA's qkvg proj. Putting it in a different file just in
- * case more operations have to be fused later, depending on how well communication is hidden
- */
-
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
