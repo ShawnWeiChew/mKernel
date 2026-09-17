@@ -118,17 +118,12 @@ struct fused_globals {
     // in launch_ag_gemm_warp_specialized, so nothing oversized can actually launch.
     static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
 
-    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
+    using A_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
-
-    // we declare a separate A tensor here that is indexed as ((NUM_DEVICES, local_m), K), so that
-    // TMA loads that go out of bounds will naturally zero themselves out
-    using A_replicated_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
 
     A_distributed_tensor A;
-    A_replicated_tensor A_local_buf;
     B_local_tensor B;
     C_local_tensor C;
 
@@ -181,14 +176,8 @@ template <typename DistributedTensor,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
-ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
-                                      const LocalTensor& A_local_buf,
-                                      const LocalTensor& B,
-                                      LocalTensor& C,
-                                      int dev_idx,
-                                      int M,
-                                      int N,
-                                      int K) {
+ag_gemm_warp_specialized_make_globals(
+    DistributedTensor& A, const LocalTensor& B, LocalTensor& C, int dev_idx, int M, int N, int K) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
     // currently, we want to accomodate both bf16* and at::Tensors
@@ -196,14 +185,8 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                   dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16>) {
         return {
             .A = ::dist::make_dbuf<typename fg::A_distributed_tensor>(
-                static_cast<uint64_t>(A.mc_ptr),
-                static_cast<uint64_t*>(A.uc_ptrs),
-                1,
-                1,
-                M / fg::NUM_DEVICES,
-                K),
-            .A_local_buf = ::dist::make_local_tensor<typename fg::A_replicated_tensor>(
-                reinterpret_cast<uint64_t>(A_local_buf),
+                reinterpret_cast<uint64_t>(A.mc),
+                reinterpret_cast<uint64_t*>(A.uc_ptrs),
                 1,
                 fg::NUM_DEVICES,
                 M / fg::NUM_DEVICES,
@@ -224,8 +207,6 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                          std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
         return {
             .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-            .A_local_buf =
-                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .A_copy_ready = nullptr,
@@ -246,7 +227,6 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
 
 template <typename DistributedTensor, typename LocalTensor>
 void entrypoint(DistributedTensor& A,
-                const LocalTensor& A_local_buf,
                 const LocalTensor& B,
                 LocalTensor& C,
                 const int logical_global_m,  // used to determine what the actual shape being
@@ -277,8 +257,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
                 break;
             }
@@ -288,8 +267,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
                 break;
             }
@@ -299,8 +277,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
                 break;
             }
@@ -310,8 +287,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
                 break;
             }
@@ -322,8 +298,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
                 break;
             }
@@ -334,8 +309,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
                 break;
             }
@@ -346,8 +320,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
                 break;
             }
@@ -362,8 +335,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
                 break;
             }
@@ -373,8 +345,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   1>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   1>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
                 break;
             }
@@ -384,8 +355,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
                 break;
             }
@@ -395,8 +365,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
                 break;
             }
@@ -406,8 +375,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
                 break;
             }
@@ -417,8 +385,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
                 break;
             }
@@ -428,8 +395,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(
-                    A, A_local_buf, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
                 break;
             }

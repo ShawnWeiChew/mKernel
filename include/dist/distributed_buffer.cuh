@@ -484,13 +484,13 @@ __host__ inline DistributedTensor make_dbuf(uint64_t mc, uint64_t* data, int b, 
 // helper types to define interfaces for raw parallel buffers
 template <typename T, typename dtype>
 concept RawDistributedMulticastTensorLike = requires (const T& mapping) {
-    { mapping.mc_ptr } -> std::same_as<dtype*>;
-    { mapping.uc_ptrs } -> std::same_as<dtype**>;
+    { mapping.mc } -> std::convertible_to<dtype*>;
+    { mapping.uc_ptrs } -> std::convertible_to<dtype**>;
 };
 
 template <typename T, typename dtype>
 concept RawDistributedTensorLike = requires (const T& mapping) {
-    { mapping.mc_ptr } -> std::same_as<dtype*>;
+    { mapping.mc } -> std::convertible_to<dtype*>;
 };
 
 } // namespace dist
