@@ -123,7 +123,6 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
     if (warp_id == 0 && elect_warp_leader()) {
         G.A[G.dev_idx].template prefetch_tma<typename fg::A_tile>();
-        G.A_local_buf.template prefetch_tma<typename fg::A_tile>();
         G.B.template prefetch_tma<typename fg::B_tile>();
         G.C.template prefetch_tma<typename fg::C_tile>();
     }
@@ -230,22 +229,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
 #pragma unroll
                 for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-                    if (is_local) {
-                        tma::cluster::load_async(A_smem[c],
-                                                 G.A[G.dev_idx],
-                                                 {a_tile_row_idx_for(c), iter_k},
-                                                 tma_load[input_stage_id],
-                                                 (uint16_t)(1 << cta_rank),
-                                                 0);
-                    } else {
-                        tma::cluster::load_async(
-                            A_smem[c],
-                            G.A_local_buf,
-                            {actual_target_device, a_tile_row_idx_for(c), iter_k},
-                            tma_load[input_stage_id],
-                            (uint16_t)(1 << cta_rank),
-                            0);
-                    }
+                    tma::cluster::load_async(A_smem[c],
+                                             G.A[G.dev_idx],
+                                             {actual_target_device, a_tile_row_idx_for(c), iter_k},
+                                             tma_load[input_stage_id],
+                                             (uint16_t)(1 << cta_rank),
+                                             0);
                 }
 
             } else {
@@ -265,17 +254,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
 #pragma unroll
                 for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
-                    if (is_local) {
-                        tma::load_async(A_smem[c],
-                                        G.A[G.dev_idx],
-                                        {a_tile_row_idx_for(c), iter_k},
-                                        tma_load[input_stage_id]);
-                    } else {
-                        tma::load_async(A_smem[c],
-                                        G.A_local_buf,
-                                        {actual_target_device, a_tile_row_idx_for(c), iter_k},
-                                        tma_load[input_stage_id]);
-                    }
+                    tma::load_async(A_smem[c],
+                                    G.A[G.dev_idx],
+                                    {actual_target_device, a_tile_row_idx_for(c), iter_k},
+                                    tma_load[input_stage_id]);
                 }
             }
 
@@ -589,8 +571,8 @@ inline void launch_ag_gemm_warp_specialized(
     launch_G.A_copy_epoch = copy_state.epoch;
 
     // Capture prior work on the caller's stream. On repeated invocations this
-    // prevents the copy stream from overwriting A_local_buf until the previous
-    // persistent kernel on the caller stream has finished consuming it.
+    // prevents the copy stream from overwriting A's staged peer slots until the
+    // previous persistent kernel on the caller stream has finished consuming them.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
@@ -598,12 +580,14 @@ inline void launch_ag_gemm_warp_specialized(
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
 
     // Stage one complete shard per remote device in the same ring order used
-    // by the persistent kernel. The local shard is read directly from G.A.
+    // by the persistent kernel. Rank r's source shard remains in slot r on its
+    // owning device, so peer copies never overwrite any rank's source data.
+    constexpr int eager_copy_end = fg::NUM_DEVICES < 4 ? fg::NUM_DEVICES : 4;
 #pragma unroll
-    for (int distance = 1; distance < 4; ++distance) {
+    for (int distance = 1; distance < eager_copy_end; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
+        auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
 
         MKERNEL_CUDACHECK(
             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
@@ -642,10 +626,10 @@ inline void launch_ag_gemm_warp_specialized(
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
 
 #pragma unroll
-    for (int distance = 4; distance < fg::NUM_DEVICES; ++distance) {
+    for (int distance = eager_copy_end; distance < fg::NUM_DEVICES; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
+        auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
 
         MKERNEL_CUDACHECK(
             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));

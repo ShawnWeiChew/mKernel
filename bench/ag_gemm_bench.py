@@ -158,7 +158,6 @@ class BlackwellBenchVars:
     mkernel_padded_m: int | None = None
     mkernel_padded_n: int | None = None
     mkernel_a_dist: DistBufferLike | None = None
-    mkernel_a_local_buf: torch.Tensor | None = None
     mkernel_b_buf: torch.Tensor | None = None
     mkernel_c_buf: torch.Tensor | None = None
 
@@ -541,15 +540,14 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         # dispatched schedule tiles at. The padding rows and columns are zero,
         # so they contribute zero to C and cost only the tiles spent on them.
         A_kernel = mod.DistBuffer(
-            (padded_local_m, config.default_k),
+            (config.world_size, padded_local_m, config.default_k),
             dtype=torch.bfloat16,
             local_rank=config.local_rank,
             local_world_size=config.world_size,
             multicast=True,
         )
-        A_kernel.data_.copy_(pad_rows(config, A_ref_local, padded_local_m))
-        A_local_buf = torch.empty(
-            (config.world_size, padded_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
+        A_kernel.data_[config.local_rank].copy_(
+            pad_rows(config, A_ref_local, padded_local_m)
         )
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
@@ -566,7 +564,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        mod.ag_gemm_warp_specialized(A_kernel, A_local_buf, B_kernel, C_kernel, m)
+        mod.ag_gemm_warp_specialized(A_kernel, B_kernel, C_kernel, m)
         torch.cuda.synchronize()
 
         # Drop the padded rows and columns and compare the logical
@@ -669,7 +667,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             del A_tk, B_tk_transposed, tk_barrier
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_local_buf, B_kernel, C_kernel
+        del A_kernel, B_kernel, C_kernel
         dist.barrier()
 
     if not all_correct:
@@ -793,13 +791,10 @@ def ag_gemm_blackwell_prepare(
     # per-K-step access across N.
     run_config.mkernel_b_buf = pad_cols(config, B_ref, mk_n).T.contiguous()
     run_config.mkernel_a_dist = mod.DistBuffer(
-        (mk_local_m, config.default_k), dtype=torch.bfloat16,
+        (config.world_size, mk_local_m, config.default_k), dtype=torch.bfloat16,
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
-    run_config.mkernel_a_dist.data_.copy_(A_mk_local)
-    run_config.mkernel_a_local_buf = torch.empty(
-        (config.world_size, mk_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
-    )
+    run_config.mkernel_a_dist.data_[config.local_rank].copy_(A_mk_local)
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
     # The kernel's first act is to pull every peer's shard out of their
@@ -814,8 +809,8 @@ def ag_gemm_blackwell_prepare(
 
     def run_mkernel():
         mod.ag_gemm_warp_specialized(
-            run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
-            run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            run_config.mkernel_a_dist, run_config.mkernel_b_buf,
+            run_config.mkernel_c_buf, global_m,
         )
 
     fns.append((run_mkernel, "mkernel", True))
