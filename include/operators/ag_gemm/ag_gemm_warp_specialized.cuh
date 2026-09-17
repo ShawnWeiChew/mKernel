@@ -192,49 +192,61 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                                       int K) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
-    typename fg::A_distributed_tensor A_dist;
-    typename fg::A_replicated_tensor A_local_replicated;
-    typename fg::B_local_tensor B_local;
-    typename fg::C_local_tensor C_local;
-
     // currently, we want to accomodate both bf16* and at::Tensors
     if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
                   dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16>) {
-        A_dist =
-            ::dist::make_dbuf<typename fg::A_distributed_tensor>(static_cast<uint64_t>(A.mc_ptr),
-                                                                 static_cast<uint64_t*>(A.uc_ptrs),
-                                                                 1,
-                                                                 1,
-                                                                 M / fg::NUM_DEVICES,
-                                                                 K);
-        A_local_replicated = ::dist::make_local_tensor<typename fg::A_replicated_tensor>(
-            A_local_buf, 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, K);
-        B_local = ::dist::make_local_tensor<typename fg::B_local_tensor>(B, 1, 1, N, K);
-        C_local = ::dist::make_local_tensor<typename fg::C_local_tensor>(
-            C, 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, N);
+        return {
+            .A = ::dist::make_dbuf<typename fg::A_distributed_tensor>(
+                static_cast<uint64_t>(A.mc_ptr),
+                static_cast<uint64_t*>(A.uc_ptrs),
+                1,
+                1,
+                M / fg::NUM_DEVICES,
+                K),
+            .A_local_buf = ::dist::make_local_tensor<typename fg::A_replicated_tensor>(
+                reinterpret_cast<uint64_t>(A_local_buf),
+                1,
+                fg::NUM_DEVICES,
+                M / fg::NUM_DEVICES,
+                K),
+            .B = ::dist::make_local_tensor<typename fg::B_local_tensor>(
+                reinterpret_cast<uint64_t>(B), 1, 1, N, K),
+            .C = ::dist::make_local_tensor<typename fg::C_local_tensor>(
+                reinterpret_cast<uint64_t>(C),
+                1,
+                fg::NUM_DEVICES,
+                M / fg::NUM_DEVICES,
+                N),
+            .A_copy_ready = nullptr,
+            .A_copy_epoch = 0,
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .stream = nullptr,
+        };
     } else if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                          std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
-        A_dist = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A);
-        A_local_replicated =
-            ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf);
-        B_local = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B);
-        C_local = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C);
+        return {
+            .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .A_local_buf =
+                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
+            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .A_copy_ready = nullptr,
+            .A_copy_epoch = 0,
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .stream = nullptr,
+        };
     } else {
         static_assert(
             always_false_v<LocalTensor>,
             "LocalTensor must be either __nv_bfloat16* or at::Tensor, while DistributedTensor must "
             "either satisfy dist::RawDistributedMulticastTensorLike or ParallelBuffer");
     }
-
-    return {.A = A_dist,
-            .A_local_buf = A_local_replicated,
-            .B = B_local,
-            .C = C_local,
-            .A_copy_ready = nullptr,
-            .A_copy_epoch = 0,
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N};
 }
 
 template <typename DistributedTensor, typename LocalTensor>

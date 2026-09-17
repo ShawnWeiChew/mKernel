@@ -565,9 +565,12 @@ template <int _ROW_BLOCK,
           int _NUM_CONSUMER_WARPS>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
+    cudaStream_t stream = G.stream;
+
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-    if (!G.stream)
-        G.stream = at::cuda::getCurrentCUDAStream();
+    if (!G.stream) {
+        stream = at::cuda::getCurrentCUDAStream().stream();
+    }
 #endif
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
@@ -632,7 +635,7 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.gridDim = grid;
     launch_config.blockDim = num_threads;
     launch_config.dynamicSmemBytes = smem_size;
-    launch_config.stream = G.stream;
+    launch_config.stream = stream;
     launch_config.attrs = &pdl_attr;
     launch_config.numAttrs = 1;
 
