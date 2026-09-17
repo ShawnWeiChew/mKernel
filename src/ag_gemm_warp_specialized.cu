@@ -565,7 +565,10 @@ template <int _ROW_BLOCK,
           int _NUM_CONSUMER_WARPS>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    if (!G.stream)
+        G.stream = at::cuda::getCurrentCUDAStream();
+#endif
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
@@ -629,7 +632,7 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.gridDim = grid;
     launch_config.blockDim = num_threads;
     launch_config.dynamicSmemBytes = smem_size;
-    launch_config.stream = stream;
+    launch_config.stream = G.stream;
     launch_config.attrs = &pdl_attr;
     launch_config.numAttrs = 1;
 
