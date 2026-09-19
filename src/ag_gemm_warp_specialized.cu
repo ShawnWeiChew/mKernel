@@ -1,5 +1,9 @@
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+#include "dist/dbuf_buffer_bridge.cuh"
+#endif
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 
@@ -21,7 +25,6 @@
 #include "common/tk_types_shared_st.cuh"
 #include "common/tk_types_tensor.cuh"
 #include "common/types.cuh"
-#include "dist/dbuf_buffer_bridge.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
 #include "memory/tk_ops_group_group.cuh"
