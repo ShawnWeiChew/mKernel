@@ -179,7 +179,7 @@ template <typename DistributedTensor,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
 ag_gemm_warp_specialized_make_globals(
-    DistributedTensor& A, const LocalTensor& B, LocalTensor& C, int dev_idx, int M, int N, int K) {
+    DistributedTensor& A, const LocalTensor& B, LocalTensor& C, int dev_idx, int M, int N, int K, cudaStream_t stream) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
     // currently, we want to accomodate both bf16* and at::Tensors
@@ -203,7 +203,7 @@ ag_gemm_warp_specialized_make_globals(
             .M = M,
             .N = N,
             .K = K,
-            .stream = nullptr,
+            .stream = stream,
         };
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     } else if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
@@ -218,7 +218,7 @@ ag_gemm_warp_specialized_make_globals(
             .M = M,
             .N = N,
             .K = K,
-            .stream = nullptr,
+            .stream = stream,
         };
 #endif
     } else {
@@ -236,7 +236,9 @@ void entrypoint(DistributedTensor& A,
                 int M = -1,
                 int N = -1,
                 int K = -1,
-                int dev_idx = -1) {
+                int dev_idx = -1,
+                cudaStream_t stream = nullptr,
+            ) {
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     dev_idx = dev_idx == -1 ? A.local_rank_ : dev_idx;
     M = M == -1 ? C.size(0) * C.size(1) : M;
@@ -258,7 +260,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
         } else if (M <= 3072) {
                 using fg = fused_globals<128, 256, 2>;
@@ -266,7 +268,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         } else if (M <= 3584) {
                 using fg = fused_globals<128, 256, 2>;
@@ -274,7 +276,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
         } else if (M <= 4096) {
                 using fg = fused_globals<128, 256, 2>;
@@ -282,7 +284,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
         } else if (M <= 8192) {
                 using fg = fused_globals<128, 256, 2, 2>;
@@ -291,7 +293,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         } else if (M <= 16384) {
                 using fg = fused_globals<128, 256, 2, 2>;
@@ -300,7 +302,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         } else {
                 using fg = fused_globals<128, 256, 2, 2>;
@@ -309,7 +311,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    256,
                                                                    2,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         }
     } else {
@@ -319,7 +321,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
         } else if (M <= 3072) {
                 using fg = fused_globals<128, 128, 1>;
@@ -327,7 +329,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    128,
-                                                                   1>(A, B, C, dev_idx, M, N, K);
+                                                                   1>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
         } else if (M <= 3584) {
                 using fg = fused_globals<128, 256, 2>;
@@ -335,7 +337,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 4096) {
                 using fg = fused_globals<128, 256, 2>;
@@ -343,7 +345,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 8192) {
                 using fg = fused_globals<128, 256, 2>;
@@ -351,7 +353,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 16384) {
                 using fg = fused_globals<128, 256, 2>;
@@ -359,7 +361,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         } else {
                 using fg = fused_globals<128, 256, 2>;
@@ -367,7 +369,7 @@ void entrypoint(DistributedTensor& A,
                                                                    LocalTensor,
                                                                    128,
                                                                    256,
-                                                                   2>(A, B, C, dev_idx, M, N, K);
+                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         }
     }
