@@ -649,4 +649,6 @@ inline void launch_ag_gemm_warp_specialized(
 }
 };  // namespace ag_gemm_warp_specialized
 
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include "operators/ag_gemm/ag_gemm_warp_specialized_session.cuh"
+#endif
