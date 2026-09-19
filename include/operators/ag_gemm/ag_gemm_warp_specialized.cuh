@@ -238,8 +238,7 @@ void entrypoint(DistributedTensor& A,
                 int N = -1,
                 int K = -1,
                 int dev_idx = -1,
-                cudaStream_t stream = nullptr,
-            ) {
+                cudaStream_t stream = nullptr) {
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     dev_idx = dev_idx == -1 ? A.local_rank_ : dev_idx;
     M = M == -1 ? C.size(0) * C.size(1) : M;
