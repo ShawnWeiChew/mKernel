@@ -234,8 +234,6 @@ template <typename DistributedTensor, typename LocalTensor>
 void entrypoint(DistributedTensor& A,
                 const LocalTensor& B,
                 LocalTensor& C,
-                const int logical_global_m,  // used to determine what the actual shape being
-                                             // operated on is, since M might be padded up
                 int M = -1,
                 int N = -1,
                 int K = -1,
@@ -255,7 +253,7 @@ void entrypoint(DistributedTensor& A,
 
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
-        if (logical_global_m <= 2048) {
+        if (M <= 2048) {
                 using fg = fused_globals<128, 128, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -263,7 +261,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
-        } else if (logical_global_m <= 3072) {
+        } else if (M <= 3072) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -271,7 +269,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
-        } else if (logical_global_m <= 3584) {
+        } else if (M <= 3584) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -279,7 +277,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
-        } else if (logical_global_m <= 4096) {
+        } else if (M <= 4096) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -287,7 +285,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
-        } else if (logical_global_m <= 8192) {
+        } else if (M <= 8192) {
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -296,7 +294,7 @@ void entrypoint(DistributedTensor& A,
                                                                    2,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
-        } else if (logical_global_m <= 16384) {
+        } else if (M <= 16384) {
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -316,7 +314,7 @@ void entrypoint(DistributedTensor& A,
                 launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         }
     } else {
-        if (logical_global_m <= 2048) {
+        if (M <= 2048) {
                 using fg = fused_globals<128, 128, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -324,7 +322,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
-        } else if (logical_global_m <= 3072) {
+        } else if (M <= 3072) {
                 using fg = fused_globals<128, 128, 1>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -332,7 +330,7 @@ void entrypoint(DistributedTensor& A,
                                                                    128,
                                                                    1>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
-        } else if (logical_global_m <= 3584) {
+        } else if (M <= 3584) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -340,7 +338,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-        } else if (logical_global_m <= 4096) {
+        } else if (M <= 4096) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -348,7 +346,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-        } else if (logical_global_m <= 8192) {
+        } else if (M <= 8192) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
@@ -356,7 +354,7 @@ void entrypoint(DistributedTensor& A,
                                                                    256,
                                                                    2>(A, B, C, dev_idx, M, N, K);
                 launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-        } else if (logical_global_m <= 16384) {
+        } else if (M <= 16384) {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                    LocalTensor,
