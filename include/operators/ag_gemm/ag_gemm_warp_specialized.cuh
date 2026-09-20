@@ -25,11 +25,11 @@
 #include "common/types.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
-#include "memory/tk_ops_thread_memory_tile_tma.cuh"
-#include "memory/tk_ops_thread_util_tma.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
+#include "memory/tk_ops_thread_util_tma.cuh"
 
 namespace ag_gemm_warp_specialized {
 
@@ -123,7 +123,17 @@ struct fused_globals {
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
+
+    // NOTE: TK rounds up the tensor map to the nearest multiple of the swizzle
+    // we dont want that behavior as that would give us OOB writes
+    // The solution is therefore to create our own tensormap, with the same
+    // swizzle as C_tile, while maintaining correctness
+    struct C_local_tensor {
+        comm::bf16* data;
+        CUtensorMap map;
+
+        __device__ inline void prefetch_tma() const { dist::tma::prefetch_tensormap(&map); }
+    };
 
     A_distributed_tensor A;
     B_local_tensor B;
@@ -179,13 +189,64 @@ template <typename DistributedTensor,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
-ag_gemm_warp_specialized_make_globals(
-    DistributedTensor& A, const LocalTensor& B, LocalTensor& C, int dev_idx, int M, int N, int K, cudaStream_t stream) {
+ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
+                                      const LocalTensor& B,
+                                      LocalTensor& C,
+                                      int dev_idx,
+                                      int M,
+                                      int N,
+                                      int K,
+                                      cudaStream_t stream) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+
+    // create the C tensor map
+    // NOTE: requriement is that M % NUM_DEVICES == 0
+    const int local_m = M / fg::NUM_DEVICES;
+    typename fg::C_local_tensor C_tensor;
+
+    uint64_t global_dim[3] = {
+        N,                // columns
+        local_m,          // rows per device
+        fg::NUM_DEVICES,  // devices
+    };
+
+    uint64_t global_stride[2] = {
+        N * sizeof(comm::bf16),
+        local_m * N * sizeof(comm::bf16),
+    };
+
+    uint32_t box_dim[3] = {
+        fg::C_tile::cols,
+        fg::C_tile::rows,
+        1,
+    };
+
+    uint32_t element_stride[3] = {1, 1, 1};
+
+    // Must match the swizzle TK chose for the smem C_tile (128B for 64 bf16
+    // columns, 64B for 32), else the TMA store decodes the staged tile wrongly.
+    constexpr CUtensorMapSwizzle c_swizzle =
+        fg::C_tile::swizzle_bytes == 128  ? CU_TENSOR_MAP_SWIZZLE_128B
+        : fg::C_tile::swizzle_bytes == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
+                                          : CU_TENSOR_MAP_SWIZZLE_32B;
 
     // currently, we want to accomodate both bf16* and at::Tensors
     if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
                   dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16>) {
+        C_tensor.data = C;
+        cuTensorMapEncodeTiled(&C_tensor.map,
+                               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                               3,
+                               C_tensor.data,
+                               global_dim,
+                               global_stride,
+                               box_dim,
+                               element_stride,
+                               CU_TENSOR_MAP_INTERLEAVE_NONE,
+                               c_swizzle,
+                               CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
         return {
             .A = ::dist::make_dbuf<typename fg::A_distributed_tensor>(
                 reinterpret_cast<uint64_t>(A.mc),
@@ -196,8 +257,7 @@ ag_gemm_warp_specialized_make_globals(
                 K),
             .B = ::dist::make_local_tensor<typename fg::B_local_tensor>(
                 reinterpret_cast<uint64_t>(B), 1, 1, N, K),
-            .C = ::dist::make_local_tensor<typename fg::C_local_tensor>(
-                reinterpret_cast<uint64_t>(C), 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, N),
+            .C = C_tensor,
             .A_copy_ready = nullptr,
             .A_copy_epoch = 0,
             .dev_idx = dev_idx,
@@ -209,10 +269,24 @@ ag_gemm_warp_specialized_make_globals(
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     } else if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                          std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
+        C_tensor.data = reinterpret_cast<comm::bf16*>(C.data_ptr());
+        cuTensorMapEncodeTiled(&C_tensor.map,
+                               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                               3,
+                               C_tensor.data,
+                               global_dim,
+                               global_stride,
+                               box_dim,
+                               element_stride,
+                               CU_TENSOR_MAP_INTERLEAVE_NONE,
+                               c_swizzle,
+                               CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
         return {
             .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .C = C_tensor,
             .A_copy_ready = nullptr,
             .A_copy_epoch = 0,
             .dev_idx = dev_idx,
@@ -255,122 +329,103 @@ void entrypoint(DistributedTensor& A,
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
         if (M <= 2048) {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   128,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
+            using fg = fused_globals<128, 128, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
         } else if (M <= 3072) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         } else if (M <= 3584) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
         } else if (M <= 4096) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
         } else if (M <= 8192) {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            using fg = fused_globals<128, 256, 2, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor,
+                                                      LocalTensor,
+                                                      128,
+                                                      256,
+                                                      2,
+                                                      2>(A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         } else if (M <= 16384) {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            using fg = fused_globals<128, 256, 2, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor,
+                                                      LocalTensor,
+                                                      128,
+                                                      256,
+                                                      2,
+                                                      2>(A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         } else {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            using fg = fused_globals<128, 256, 2, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor,
+                                                      LocalTensor,
+                                                      128,
+                                                      256,
+                                                      2,
+                                                      2>(A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
         }
     } else {
         if (M <= 2048) {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   128,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
+            using fg = fused_globals<128, 128, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
         } else if (M <= 3072) {
-                using fg = fused_globals<128, 128, 1>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   128,
-                                                                   1>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
+            using fg = fused_globals<128, 128, 1>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 1>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
         } else if (M <= 3584) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 4096) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 8192) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
         } else if (M <= 16384) {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         } else {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                   LocalTensor,
-                                                                   128,
-                                                                   256,
-                                                                   2>(A, B, C, dev_idx, M, N, K, stream);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            using fg = fused_globals<128, 256, 2>;
+            fg globals =
+                ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
+                    A, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         }
     }
 }

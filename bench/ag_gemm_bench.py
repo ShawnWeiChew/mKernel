@@ -1096,6 +1096,10 @@ def main():
 
     else:
         check_correctness_ag_gemm_blackwell(config, mod)
+        if args.mode == "check":
+            # check_correctness_ag_gemm_blackwell already exits nonzero on failure.
+            dist.destroy_process_group()
+            return 0
         for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
             fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
 

@@ -1,6 +1,7 @@
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+
 #include "dist/dbuf_buffer_bridge.cuh"
 #endif
 
@@ -85,6 +86,24 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
+template <typename ST>
+__device__ inline void store_async_3d(
+    const CUtensorMap& map, const ST& src, int column, int row, int device) {
+    uint64_t map_ptr = reinterpret_cast<uint64_t>(&map);
+    uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
+
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+        " [%0, {%2, %3, %4}], [%1];"
+        :
+        : "l"(map_ptr), "r"(src_ptr), "r"(column), "r"(row), "r"(device)
+        : "memory");
+
+    kittens::tma::store_commit_group();
+}
+
 }  // namespace
 
 // traverse the grid in a snake like pattern to raise L2 cache reuse
@@ -127,7 +146,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     if (warp_id == 0 && elect_warp_leader()) {
         G.A[G.dev_idx].template prefetch_tma<typename fg::A_tile>();
         G.B.template prefetch_tma<typename fg::B_tile>();
-        G.C.template prefetch_tma<typename fg::C_tile>();
+        G.C.prefetch_tma();
     }
 
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
@@ -372,12 +391,13 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             warpgroup::sync(1);
 
             if (warpgroup::laneid() == 0) {
-                // C_tile is only COL_BLOCK / EPILOGUE_STAGES wide, so the TMA
-                // column coordinate counts chunks, not COL_BLOCK tiles.
-                dist::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                    C_out,
-                    C_smem[epilogue_transfer_stage_id],
-                    {target_device, tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
+                const int chunk = tile_col_idx * fg::C_TILE_DIVISOR + i;
+
+                const int column = chunk * C_CHUNK_COLS;
+                const int row = tile_row_idx * fg::ROW_BLOCK;
+
+                store_async_3d(
+                    G.C.map, C_smem[epilogue_transfer_stage_id], column, row, target_device);
             }
 
             epilogue_transfer_stage_id =
