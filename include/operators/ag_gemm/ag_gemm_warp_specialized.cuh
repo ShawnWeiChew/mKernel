@@ -25,11 +25,12 @@
 #include "common/types.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
+#include "memory/tk_ops_thread_memory_tile_tma.cuh"
+#include "memory/tk_ops_thread_util_tma.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
-#include "memory/tk_ops_thread_memory_tile_tma.cuh"
+
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
-#include "memory/tk_ops_thread_util_tma.cuh"
 
 namespace ag_gemm_warp_specialized {
 
