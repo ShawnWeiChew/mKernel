@@ -128,8 +128,7 @@ struct fused_globals {
     B_local_tensor B;
     C_local_tensor C;
 
-    // Copy-engine completion is published into local HBM. There is one
-    // monotonically increasing epoch per source device.
+    // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
     static constexpr uint32_t A_copy_epoch = 1;
 
