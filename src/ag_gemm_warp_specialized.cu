@@ -571,14 +571,14 @@ template <int _ROW_BLOCK,
           int _NUM_CONSUMER_WARPS>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
-    cudaStream_t main_stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
     MKERNEL_CUDACHECK(
-        cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), main_stream));
+        cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
 
     fg launch_G = G;
     launch_G.A_copy_ready = copy_state.ready;
@@ -586,7 +586,7 @@ inline void launch_ag_gemm_warp_specialized(
     // Capture prior work on the caller's stream. On repeated invocations this
     // prevents the copy stream from overwriting A_local_buf until the previous
     // persistent kernel on the caller stream has finished consuming it.
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, main_stream));
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
@@ -630,7 +630,7 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.gridDim = grid;
     launch_config.blockDim = num_threads;
     launch_config.dynamicSmemBytes = smem_size;
-    launch_config.stream = main_stream;
+    launch_config.stream = stream;
     launch_config.attrs = &pdl_attr;
     launch_config.numAttrs = 1;
 
@@ -656,7 +656,7 @@ inline void launch_ag_gemm_warp_specialized(
 
     // have the copy stream join the main stream again to ensure cudagraph compatibility
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
-    MKERNEL_CUDACHECK(cudaStreamWaitEvent(main_stream, copy_state.copy_completion));
+    MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
 
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
