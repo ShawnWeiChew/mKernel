@@ -128,10 +128,9 @@ struct fused_globals {
     B_local_tensor B;
     C_local_tensor C;
 
-    // Copy-engine completion is published into local HBM. There is one
-    // monotonically increasing epoch per source device.
+    // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
-    uint32_t A_copy_epoch;
+    static constexpr uint32_t A_copy_epoch = 1;
 
     int dev_idx;
     int M;
@@ -184,7 +183,6 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .A_copy_ready = nullptr,
-            .A_copy_epoch = 0,
             .dev_idx = dev_idx,
             .M = M,
             .N = N};

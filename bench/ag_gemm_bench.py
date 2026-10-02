@@ -818,7 +818,49 @@ def ag_gemm_blackwell_prepare(
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
         )
 
-    fns.append((run_mkernel, "mkernel", True))
+    mkernel_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph):
+        run_mkernel()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Check correctness agains the cudagraph
+    A_ref = torch.empty(
+        (global_m, config.default_k), device="cuda", dtype=torch.bfloat16
+    )
+    dist.all_gather_into_tensor(A_ref, A_local)
+    C_ref = torch.mm(A_ref, B_ref)
+    run_config.mkernel_c_buf.zero_()
+    mkernel_graph.replay()
+    torch.cuda.synchronize()
+    graph_ok = check_close(
+        f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
+        unpad_rows(
+            run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
+            config.world_size, logical_n,
+        ),
+        C_ref,
+    )
+    # Vote so every rank bails together; a rank that kept going alone would
+    # hang in the next collective.
+    graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
+    dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
+    if not graph_vote.item():
+        if config.is_chief:
+            print(
+                f"ag-gemm-warp-specialized cudagraph {projection} M={global_m}: "
+                f"FAILED :( -- skipping benchmarks.",
+                flush=True,
+            )
+        dist.destroy_process_group()
+        sys.exit(1)
+    del A_ref, C_ref
+    dist.barrier()
+
+    def bench_mkernel():
+        mkernel_graph.replay()
+
+    fns.append((bench_mkernel, "mkernel", True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"

@@ -49,7 +49,7 @@ struct ACopyPipelineState {
     cudaStream_t stream = nullptr;
     cudaEvent_t main_pre_event = nullptr;
     uint32_t* ready = nullptr;
-    uint32_t epoch = 0;
+    cudaEvent_t copy_completion = nullptr;
     bool initialized = false;
 };
 
@@ -58,10 +58,16 @@ ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
 inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     ACopyPipelineState& state = A_copy_states[dev_idx];
     if (!state.initialized) {
+        // The first call may happen inside a CUDA graph capture (no eager
+        // warmup). None of these calls enqueue stream work, so relax this
+        // thread's capture mode to keep cudaMalloc from invalidating the capture.
+        cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeRelaxed;
+        MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
+        MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.copy_completion, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
-        MKERNEL_CUDACHECK(cudaMemset(state.ready, 0, INTRA_NUM_DEVICES * sizeof(uint32_t)));
+        MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         state.initialized = true;
     }
     return state;
@@ -197,7 +203,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // acquire is sufficient for the consumer.
         if (!is_local) {
             while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
-                   G.A_copy_epoch) {
+                   fg::A_copy_epoch) {
                 __nanosleep(16);
             }
         }
@@ -571,16 +577,11 @@ inline void launch_ag_gemm_warp_specialized(
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
-    copy_state.epoch++;
-    if (copy_state.epoch == 0) {
-        // Zero is reserved for the process-startup not-ready state.
-        MKERNEL_CUDACHECK(cudaMemset(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t)));
-        copy_state.epoch = 1;
-    }
+    MKERNEL_CUDACHECK(
+        cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
 
     fg launch_G = G;
     launch_G.A_copy_ready = copy_state.ready;
-    launch_G.A_copy_epoch = copy_state.epoch;
 
     // Capture prior work on the caller's stream. On repeated invocations this
     // prevents the copy stream from overwriting A_local_buf until the previous
@@ -607,7 +608,7 @@ inline void launch_ag_gemm_warp_specialized(
         // scope because it reads a flag and payload resident on this device.
         MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
                                              reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             copy_state.epoch,
+                                             fg::A_copy_epoch,
                                              CU_STREAM_WRITE_VALUE_DEFAULT));
     }
 
@@ -649,9 +650,14 @@ inline void launch_ag_gemm_warp_specialized(
         // scope because it reads a flag and payload resident on this device.
         MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
                                              reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             copy_state.epoch,
+                                             fg::A_copy_epoch,
                                              CU_STREAM_WRITE_VALUE_DEFAULT));
     }
+
+    // have the copy stream join the main stream again to ensure cudagraph compatibility
+    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
+    MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
+
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 };  // namespace ag_gemm_warp_specialized
