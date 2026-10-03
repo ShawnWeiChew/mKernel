@@ -205,9 +205,9 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
     typename fg::C_local_tensor C_tensor;
 
     uint64_t global_dim[3] = {
-        N,                // columns
-        local_m,          // rows per device
-        fg::NUM_DEVICES,  // devices
+        static_cast<uint64_t>(N),        // columns
+        static_cast<uint64_t>(local_m),  // rows per device
+        fg::NUM_DEVICES,                 // devices
     };
 
     uint64_t global_stride[2] = {
@@ -225,8 +225,8 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
 
     // Must match the swizzle TK chose for the smem C_tile (128B for 64 bf16
     // columns, 64B for 32), else the TMA store decodes the staged tile wrongly.
-    constexpr CUtensorMapSwizzle c_swizzle =
-        fg::C_tile::swizzle_bytes == 128  ? CU_TENSOR_MAP_SWIZZLE_128B
+    constexpr CUtensorMapSwizzle c_swizzle = fg::C_tile::swizzle_bytes == 128
+        ? CU_TENSOR_MAP_SWIZZLE_128B
         : fg::C_tile::swizzle_bytes == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
                                           : CU_TENSOR_MAP_SWIZZLE_32B;
 
@@ -259,7 +259,6 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                 reinterpret_cast<uint64_t>(B), 1, 1, N, K),
             .C = C_tensor,
             .A_copy_ready = nullptr,
-            .A_copy_epoch = 0,
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
@@ -288,7 +287,6 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = C_tensor,
             .A_copy_ready = nullptr,
-            .A_copy_epoch = 0,
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
