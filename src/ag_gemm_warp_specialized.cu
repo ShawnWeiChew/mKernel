@@ -603,12 +603,8 @@ inline void launch_ag_gemm_warp_specialized(
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
 
-    // Stage one complete shard per remote device in the same ring order used
-    // by the persistent kernel. Rank r's source shard remains in slot r on its
-    // owning device, so peer copies never overwrite any rank's source data.
-    constexpr int eager_copy_end = fg::NUM_DEVICES < 4 ? fg::NUM_DEVICES : 4;
 #pragma unroll
-    for (int distance = 1; distance < eager_copy_end; ++distance) {
+    for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
@@ -648,24 +644,6 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.numAttrs = 1;
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
-
-#pragma unroll
-    for (int distance = eager_copy_end; distance < fg::NUM_DEVICES; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
-    }
 
     // have the copy stream join the main stream again to ensure cudagraph compatibility
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
