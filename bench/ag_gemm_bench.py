@@ -118,13 +118,10 @@ class BlackwellBenchConfig:
     is_chief = local_rank == 0
     num_nodes = 1
 
-    projections = ( 
-        # KDA proj_qkvgfab, (4 * 12288 + 96) / TP + 128.
-        ("KDA", (4 * 12288 + 96) // world_size + 128),
-        # MLA qkvg proj, 576 + 1536 + 12288 / TP.
-        ("MLA", 576 + 1536 + 12288 // world_size),
-    )
-    shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
+    # BEGIN temporary M=8192, N=3648 memcpy-slice benchmark shape.
+    projections = (("MLA", 3648),)
+    shapes_to_test = [8192]
+    # END temporary M=8192, N=3648 memcpy-slice benchmark shape.
     default_k = 7168
 
     # cutlass configs
@@ -688,7 +685,12 @@ def report_blackwell_result(
     baseline_ms = ms_by_name.get("baseline")
     cutlass_ms = ms_by_name.get("cutlass")
     tk_ms = ms_by_name.get("TK")
-    mkernel_ms = ms_by_name.get("mkernel")
+    # BEGIN temporary memcpy-slice sweep reporting.
+    mkernel_slice_results = (
+        (1, ms_by_name.get("mkernel memcpy slices=1")),
+        (2, ms_by_name.get("mkernel memcpy slices=2")),
+        (4, ms_by_name.get("mkernel memcpy slices=4")),
+    )
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -719,9 +721,11 @@ def report_blackwell_result(
             f"{tflops_for(tk_ms):8.2f} TFLOP/s{vs_baseline}",
             flush=True,
         )
-    if mkernel_ms is not None:
+    for memcpy_slices, mkernel_ms in mkernel_slice_results:
+        if mkernel_ms is None:
+            continue
         line = (
-            f"  {'ag_gemm_warp_specialized':<26} {mkernel_ms:8.3f} ms  "
+            f"  {f'ag_gemm memcpy slices={memcpy_slices}':<26} {mkernel_ms:8.3f} ms  "
             f"{tflops_for(mkernel_ms):8.2f} TFLOP/s"
         )
         if baseline_ms is not None:
@@ -733,6 +737,7 @@ def report_blackwell_result(
             verdict = "BEATS" if mkernel_ms < tk_ms else "behind"
             line += f"  {tk_ms / mkernel_ms:6.3f}x vs ThunderKittens ({verdict})"
         print(line, flush=True)
+    # END temporary memcpy-slice sweep reporting.
 
 def ag_gemm_blackwell_prepare(
     config: BlackwellBenchConfig, mod, projection: str, global_m: int, logical_n: int,
@@ -807,35 +812,63 @@ def ag_gemm_blackwell_prepare(
     tune_warmup = 2
     tune_iterations = 5
 
-    def run_mkernel():
-        mod.ag_gemm_warp_specialized(
+    # BEGIN temporary copy-pasted memcpy-slice sweep.
+    def run_mkernel_memcpy_slices_1():
+        mod.ag_gemm_warp_specialized_memcpy_slices_1(
             run_config.mkernel_a_dist, run_config.mkernel_b_buf,
             run_config.mkernel_c_buf, global_m,
         )
 
-    mkernel_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(mkernel_graph):
-        run_mkernel()
+    mkernel_graph_memcpy_slices_1 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph_memcpy_slices_1):
+        run_mkernel_memcpy_slices_1()
+
+    def run_mkernel_memcpy_slices_2():
+        mod.ag_gemm_warp_specialized_memcpy_slices_2(
+            run_config.mkernel_a_dist, run_config.mkernel_b_buf,
+            run_config.mkernel_c_buf, global_m,
+        )
+
+    mkernel_graph_memcpy_slices_2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph_memcpy_slices_2):
+        run_mkernel_memcpy_slices_2()
+
+    def run_mkernel_memcpy_slices_4():
+        mod.ag_gemm_warp_specialized_memcpy_slices_4(
+            run_config.mkernel_a_dist, run_config.mkernel_b_buf,
+            run_config.mkernel_c_buf, global_m,
+        )
+
+    mkernel_graph_memcpy_slices_4 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph_memcpy_slices_4):
+        run_mkernel_memcpy_slices_4()
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Check correctness agains the cudagraph
+    # Check correctness against each cudagraph.
     A_ref = torch.empty(
         (global_m, config.default_k), device="cuda", dtype=torch.bfloat16
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
-    run_config.mkernel_c_buf.zero_()
-    mkernel_graph.replay()
-    torch.cuda.synchronize()
-    graph_ok = check_close(
-        f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
-        unpad_rows(
-            run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
-            config.world_size, logical_n,
-        ),
-        C_ref,
-    )
+    graph_ok = True
+    for memcpy_slices, mkernel_graph in (
+        (1, mkernel_graph_memcpy_slices_1),
+        (2, mkernel_graph_memcpy_slices_2),
+        (4, mkernel_graph_memcpy_slices_4),
+    ):
+        run_config.mkernel_c_buf.zero_()
+        mkernel_graph.replay()
+        torch.cuda.synchronize()
+        graph_ok = check_close(
+            f"ag-gemm-warp-specialized memcpy_slices={memcpy_slices} cudagraph "
+            f"{projection} M={global_m} N={logical_n}",
+            unpad_rows(
+                run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
+                config.world_size, logical_n,
+            ),
+            C_ref,
+        ) and graph_ok
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
     graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
@@ -852,10 +885,21 @@ def ag_gemm_blackwell_prepare(
     del A_ref, C_ref
     dist.barrier()
 
-    def bench_mkernel():
-        mkernel_graph.replay()
+    def bench_mkernel_memcpy_slices_1():
+        mkernel_graph_memcpy_slices_1.replay()
 
-    fns.append((bench_mkernel, "mkernel", True))
+    fns.append((bench_mkernel_memcpy_slices_1, "mkernel memcpy slices=1", True))
+
+    def bench_mkernel_memcpy_slices_2():
+        mkernel_graph_memcpy_slices_2.replay()
+
+    fns.append((bench_mkernel_memcpy_slices_2, "mkernel memcpy slices=2", True))
+
+    def bench_mkernel_memcpy_slices_4():
+        mkernel_graph_memcpy_slices_4.replay()
+
+    fns.append((bench_mkernel_memcpy_slices_4, "mkernel memcpy slices=4", True))
+    # END temporary copy-pasted memcpy-slice sweep.
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
@@ -1131,18 +1175,20 @@ def main():
 
             if config.is_chief:
                 print(f"[ag_gemm] M={base_n} wall={wall_ms:.3f} ms", flush=True)
-            
+
 
             result_sizes.append(f"M={base_n}")
             result_fused.append(wall_ms)
 
     else:
+        blackwell_shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
+        config.shapes_to_test = blackwell_shapes
         check_correctness_ag_gemm_blackwell(config, mod)
         if args.mode == "check":
             # check_correctness_ag_gemm_blackwell already exits nonzero on failure.
             dist.destroy_process_group()
             return 0
-        for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
+        for (projection, logical_n), m in product(config.projections, blackwell_shapes):
             fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
 
             results = []
@@ -1160,7 +1206,7 @@ def main():
             # list (json has no tuple type) is unhashable as a dict key there.
             result_sizes.append(f"{projection} M={m} N={logical_n}")
             for name, res in results:
-                if name == "mkernel":
+                if name == "mkernel memcpy slices=1":
                     result_fused.append(res)
 
     if config.is_chief and args.save_json:
