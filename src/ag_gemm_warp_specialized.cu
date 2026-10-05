@@ -57,10 +57,11 @@ struct ACopyPipelineState {
     bool initialized = false;
 };
 
-ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
-
+template <int MEMCPY_SLICES>
 inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
-    ACopyPipelineState& state = A_copy_states[dev_idx];
+    static_assert(MEMCPY_SLICES > 0, "MEMCPY_SLICES must be greater than zero");
+    static ACopyPipelineState states[INTRA_NUM_DEVICES];
+    ACopyPipelineState& state = states[dev_idx];
     if (!state.initialized) {
         // The first call may happen inside a CUDA graph capture (no eager
         // warmup). None of these calls enqueue stream work, so relax this
@@ -70,7 +71,8 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
         MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.copy_completion, cudaEventDisableTiming));
-        MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
+        MKERNEL_CUDACHECK(
+            cudaMalloc(&state.ready, INTRA_NUM_DEVICES * MEMCPY_SLICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         state.initialized = true;
     }
@@ -140,10 +142,11 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES>
 __device__ __forceinline__ void ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -161,6 +164,7 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     const int cluster_rows_per_device =
         (row_tiles_per_device + fg::NUM_CLUSTERS * fg::CONSUMER_WARPS - 1) /
         (fg::NUM_CLUSTERS * fg::CONSUMER_WARPS);
+    const int rows_per_memcpy_slice = (local_m + fg::MEMCPY_SLICES - 1) / fg::MEMCPY_SLICES;
     const int num_comp_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
 
     // round up to the nearest multiple of the COL_BLOCK
@@ -223,7 +227,16 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // D2D copy. Both the payload and flag reside in local HBM, so GPU-scope
         // acquire is sufficient for the consumer.
         if (!is_local) {
-            while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
+            // A producer iteration loads one row tile per consumer warp. Wait
+            // for the slice containing the final row touched by that group;
+            // copies for earlier slices are ordered before it on the same stream.
+            const int last_tile_row = tile_row_idx + (fg::CONSUMER_WARPS - 1) * fg::NUM_CLUSTERS;
+            const int last_required_row = min((last_tile_row + 1) * fg::ROW_BLOCK, local_m) - 1;
+            const int memcpy_slice =
+                min(last_required_row / rows_per_memcpy_slice, fg::MEMCPY_SLICES - 1);
+            const int ready_idx = actual_target_device * fg::MEMCPY_SLICES + memcpy_slice;
+
+            while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[ready_idx]) <
                    fg::A_copy_epoch) {
                 __nanosleep(16);
             }
@@ -553,29 +566,37 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES>
 __global__ __cluster_dims__(
-    fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
+    fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>::
+        NUM_CLUSTERS,
+    1,
+    1)
     __launch_bounds__(
-        fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_THREADS,
+        fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>::
+            NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_ROW_BLOCK,
                                                                         _COL_BLOCK,
                                                                         _NUM_CTA,
-                                                                        _NUM_CONSUMER_WARPS> G) {
+                                                                        _NUM_CONSUMER_WARPS,
+                                                                        _MEMCPY_SLICES> G) {
     ag_gemm_warp_specialized<_ROW_BLOCK,
                              _COL_BLOCK,
                              _NUM_CTA,
                              SUPERGROUP_WIDTH,
-                             _NUM_CONSUMER_WARPS>(G);
+                             _NUM_CONSUMER_WARPS,
+                             _MEMCPY_SLICES>(G);
 }
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES>
 inline void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -584,12 +605,12 @@ inline void launch_ag_gemm_warp_specialized(
     }
 #endif
 
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
-    ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
+    ACopyPipelineState& copy_state = get_A_copy_state<fg::MEMCPY_SLICES>(G.dev_idx);
 
-    MKERNEL_CUDACHECK(
-        cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
+    MKERNEL_CUDACHECK(cudaMemsetAsync(
+        copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t) * fg::MEMCPY_SLICES, stream));
 
     fg launch_G = G;
     launch_G.A_copy_ready = copy_state.ready;
@@ -600,33 +621,55 @@ inline void launch_ag_gemm_warp_specialized(
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
-    const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
-    const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+    const size_t shard_rows = static_cast<size_t>(G.A.rows());
+    const size_t row_elements = static_cast<size_t>(G.K);
+    const size_t shard_elements = shard_rows * row_elements;
+    const size_t rows_per_slice = (shard_rows + fg::MEMCPY_SLICES - 1) / fg::MEMCPY_SLICES;
 
 #pragma unroll
     for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const size_t peer_offset = static_cast<size_t>(peer) * shard_elements;
 
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+#pragma unroll
+        for (int slice = 0; slice < fg::MEMCPY_SLICES; ++slice) {
+            const size_t row_begin =
+                std::min(static_cast<size_t>(slice) * rows_per_slice, shard_rows);
+            const size_t row_end = std::min(row_begin + rows_per_slice, shard_rows);
+            const size_t slice_elements = (row_end - row_begin) * row_elements;
+            const size_t slice_offset = row_begin * row_elements;
 
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
+            if (slice_elements > 0) {
+                auto* dst = G.A[G.dev_idx].raw_ptr + peer_offset + slice_offset;
+                const auto* src = G.A[peer].raw_ptr + peer_offset + slice_offset;
+
+                MKERNEL_CUDACHECK(
+                    cudaMemcpyAsync(dst,
+                                    src,
+                                    slice_elements * sizeof(typename fg::A_local_tensor::dtype),
+                                    cudaMemcpyDeviceToDevice,
+                                    copy_state.stream));
+            }
+
+            const int ready_idx = peer * fg::MEMCPY_SLICES + slice;
+            MKERNEL_CUCHECK(
+                cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+                                     reinterpret_cast<CUdeviceptr>(copy_state.ready + ready_idx),
+                                     fg::A_copy_epoch,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT));
+        }
     }
 
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel =
-        fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _NUM_CONSUMER_WARPS>;
+    auto this_kernel = fused_kernel_stub<_ROW_BLOCK,
+                                         _COL_BLOCK,
+                                         _NUM_CTA,
+                                         SUPERGROUP_WIDTH,
+                                         _NUM_CONSUMER_WARPS,
+                                         _MEMCPY_SLICES>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

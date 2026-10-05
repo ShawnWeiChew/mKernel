@@ -25,12 +25,11 @@
 #include "common/types.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
-#include "memory/tk_ops_thread_memory_tile_tma.cuh"
-#include "memory/tk_ops_thread_util_tma.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
-
+#include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
+#include "memory/tk_ops_thread_util_tma.cuh"
 
 namespace ag_gemm_warp_specialized {
 
@@ -38,11 +37,13 @@ namespace ag_gemm_warp_specialized {
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 1;
+static constexpr int DEFAULT_MEMCPY_SLICES = 1;
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES = DEFAULT_MEMCPY_SLICES>
 struct fused_globals;
 
 // Number of tile columns visited before the snake pattern steps to the next
@@ -53,12 +54,13 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES = DEFAULT_MEMCPY_SLICES>
 void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G);
 
 // for M < 512, this should be 128
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS, int _MEMCPY_SLICES>
 struct fused_globals {
     // config items
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
@@ -69,10 +71,12 @@ struct fused_globals {
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = 1;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
+    static constexpr int MEMCPY_SLICES = _MEMCPY_SLICES;
     // CTAs per cluster. 2-CTA MMA is preferred for shapes that divide cleanly;
     // NUM_CLUSTERS is the cluster dimension the kernel launches with.
     static constexpr int NUM_CTA = _NUM_CTA;
     static constexpr int NUM_CLUSTERS = NUM_CTA;
+    static_assert(MEMCPY_SLICES > 0, "MEMCPY_SLICES must be greater than zero");
     static_assert(NUM_CTA == 1 || NUM_CTA == 2, "tcgen05 only has 1- and 2-CTA MMA groups");
     static_assert(NUM_BLOCKS % NUM_CTA == 0, "NUM_BLOCKS must be a whole number of clusters");
     static_assert(_COL_BLOCK % NUM_CTA == 0, "COL_BLOCK must split evenly across the cluster");
@@ -187,8 +191,9 @@ template <typename DistributedTensor,
           int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
-__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
+          int _MEMCPY_SLICES = DEFAULT_MEMCPY_SLICES>
+__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>
 ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                                       const LocalTensor& B,
                                       LocalTensor& C,
@@ -197,7 +202,7 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                                       int N,
                                       int K,
                                       cudaStream_t stream) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
 
     // create the C tensor map
     // NOTE: requriement is that M % NUM_DEVICES == 0
