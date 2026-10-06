@@ -646,23 +646,22 @@ inline void launch_ag_gemm_warp_specialized(
 
     // Stage one complete shard per remote device in the same ring order used
     // by the persistent kernel. Batch width 1 preserves the original scalar
-    // cudaMemcpyAsync path; width 2 keeps n+1 scalar and pairs n+2 through n+7.
+    // cudaMemcpyAsync path. Batch width 4 uses progressively larger submissions:
+    // n+1 scalar, n+2..n+3 as a pair, and n+4..n+7 as a four-copy batch.
     // The local shard is read directly from G.A.
-    static_assert(fg::NUM_DEVICES >= 4 && fg::NUM_DEVICES % 2 == 0,
-                  "batched A-shard copies require an even device count of at least four");
-    static_assert(COPY_BATCH_SIZE == 1 || COPY_BATCH_SIZE == 2,
-                  "COPY_BATCH_SIZE must be one or two");
+    static_assert(COPY_BATCH_SIZE == 1 || COPY_BATCH_SIZE == 4,
+                  "COPY_BATCH_SIZE must be one or four");
     if constexpr (COPY_BATCH_SIZE == 1) {
 #pragma unroll
         for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
             stage_single_copy(distance);
         }
     } else {
+        static_assert(fg::NUM_DEVICES == 8,
+                      "the 1+2+4 batched A-shard schedule requires eight devices");
         stage_single_copy(1);
-#pragma unroll
-        for (int distance = 2; distance < fg::NUM_DEVICES; distance += 2) {
-            stage_copy_batch.template operator()<2>(distance);
-        }
+        stage_copy_batch.template operator()<2>(2);
+        stage_copy_batch.template operator()<4>(4);
     }
 
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;

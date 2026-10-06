@@ -118,7 +118,7 @@ class BlackwellBenchConfig:
     is_chief = local_rank == 0
     num_nodes = 1
 
-    # Focused original batch=1 vs memcpyBatchAsync batch=2 experiment.
+    # Focused original scalar-copy vs memcpyBatchAsync 1+2+4 experiment.
     # MLA qkvg proj, 576 + 1536 + 12288 / TP.
     projections = (("MLA", 576 + 1536 + 12288 // world_size),)
     shapes_to_test = [8192]
@@ -689,7 +689,7 @@ def report_blackwell_result(
     tk_ms = ms_by_name.get("TK")
     mkernel_results = (
         ("ag_gemm memcpy batch=1", ms_by_name.get("mkernel memcpy batch=1")),
-        ("ag_gemm memcpy batch=2", ms_by_name.get("mkernel memcpy batch=2")),
+        ("ag_gemm memcpy batches=1+2+4", ms_by_name.get("mkernel memcpy batches=1+2+4")),
     )
 
     def tflops_for(ms: float) -> float:
@@ -816,7 +816,7 @@ def ag_gemm_blackwell_prepare(
 
     mkernel_variants = (
         ("mkernel memcpy batch=1", mod.ag_gemm_warp_specialized),
-        ("mkernel memcpy batch=2", mod.ag_gemm_warp_specialized_batch_2),
+        ("mkernel memcpy batches=1+2+4", mod.ag_gemm_warp_specialized_batch_1_2_4),
     )
     mkernel_runs = []
     for name, entrypoint in mkernel_variants:

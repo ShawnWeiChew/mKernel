@@ -23,13 +23,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("logical_global_m"));
 
     m.def(
-        "ag_gemm_warp_specialized_batch_2",
+        "ag_gemm_warp_specialized_batch_1_2_4",
         [](dist::ParallelBuffer& A,
            const at::Tensor& A_local_buf,
            const at::Tensor& B,
            at::Tensor& C,
            int logical_global_m) {
-            ag_gemm_warp_specialized::entrypoint<2>(
+            ag_gemm_warp_specialized::entrypoint<4>(
                 A, A_local_buf, B, C, logical_global_m);
         },
         pybind11::arg("A"),
