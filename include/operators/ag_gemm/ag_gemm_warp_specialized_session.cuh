@@ -8,6 +8,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
+<<<<<<< HEAD
     m.def(
         "ag_gemm_warp_specialized",
         [](dist::ParallelBuffer& A, const at::Tensor& B, at::Tensor& C, int logical_global_m) {
@@ -18,4 +19,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("B"),
         pybind11::arg("C"),
         pybind11::arg("logical_global_m"));
+=======
+    m.def("ag_gemm_warp_specialized",
+          &ag_gemm_warp_specialized::entrypoint,
+          pybind11::arg("A"),
+          pybind11::arg("A_pull_buf"),
+          pybind11::arg("A_gathered"),
+          pybind11::arg("A_copy_ready"),
+          pybind11::arg("B"),
+          pybind11::arg("C"),
+          pybind11::arg("logical_global_m"));
+>>>>>>> 4373a99 (chore: unify interface)
 }

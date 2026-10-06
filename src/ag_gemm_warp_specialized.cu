@@ -1,5 +1,6 @@
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDABlas.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "dist/dbuf_buffer_bridge.cuh"
@@ -52,7 +53,6 @@ namespace {
 struct ACopyPipelineState {
     cudaStream_t stream = nullptr;
     cudaEvent_t main_pre_event = nullptr;
-    uint32_t* ready = nullptr;
     cudaEvent_t copy_completion = nullptr;
     bool initialized = false;
 };
@@ -63,16 +63,13 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     static ACopyPipelineState states[INTRA_NUM_DEVICES];
     ACopyPipelineState& state = states[dev_idx];
     if (!state.initialized) {
-        // The first call may happen inside a CUDA graph capture (no eager
-        // warmup). None of these calls enqueue stream work, so relax this
-        // thread's capture mode to keep cudaMalloc from invalidating the capture.
+        // The first call may happen inside a CUDA graph capture. None of these
+        // calls enqueue stream work, so relax capture mode during resource setup.
         cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeRelaxed;
         MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.copy_completion, cudaEventDisableTiming));
-        MKERNEL_CUDACHECK(
-            cudaMalloc(&state.ready, INTRA_NUM_DEVICES * MEMCPY_SLICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         state.initialized = true;
     }
@@ -101,7 +98,10 @@ __device__ inline void store_async_3d(
     uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
 
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+<<<<<<< HEAD
 
+=======
+>>>>>>> aa524f2 (fix: correctness)
     asm volatile(
         "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
         " [%0, {%2, %3, %4}], [%1];"
@@ -143,7 +143,7 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          int _MEMCPY_SLICES>
+          AgStrategy STRATEGY>
 __device__ __forceinline__ void ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
@@ -223,22 +223,20 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
         const bool is_local = actual_target_device == G.dev_idx;
 
-        // The stream memory write executes on this GPU after the peer-to-local
-        // D2D copy. Both the payload and flag reside in local HBM, so GPU-scope
-        // acquire is sufficient for the consumer.
+        // Multicast push polls the source rank's ordinary ready allocation via
+        // its imported peer pointer. Pull polls a locally committed flag after
+        // each copy engine transfer into this rank's gathered buffer.
         if (!is_local) {
-            // A producer iteration loads one row tile per consumer warp. Wait
-            // for the slice containing the final row touched by that group;
-            // copies for earlier slices are ordered before it on the same stream.
-            const int last_tile_row = tile_row_idx + (fg::CONSUMER_WARPS - 1) * fg::NUM_CLUSTERS;
-            const int last_required_row = min((last_tile_row + 1) * fg::ROW_BLOCK, local_m) - 1;
-            const int memcpy_slice =
-                min(last_required_row / rows_per_memcpy_slice, fg::MEMCPY_SLICES - 1);
-            const int ready_idx = actual_target_device * fg::MEMCPY_SLICES + memcpy_slice;
-
-            while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[ready_idx]) <
-                   fg::A_copy_epoch) {
-                __nanosleep(16);
+            if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+                while (comm::atomic_u32::acquire_load_sys(
+                           G.A_copy_ready_peers[actual_target_device]) < fg::A_copy_epoch) {
+                    __nanosleep(16);
+                }
+            } else {
+                while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
+                       fg::A_copy_epoch) {
+                    __nanosleep(16);
+                }
             }
         }
 
@@ -361,7 +359,6 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         int& epilogue_stage_id,
                         int& epilogue_transfer_stage_id,
                         bool is_last_tile) {
-        const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
 
@@ -411,10 +408,15 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
             if (warpgroup::laneid() == 0) {
                 const int chunk = tile_col_idx * fg::C_TILE_DIVISOR + i;
+<<<<<<< HEAD
 
                 const int column = chunk * C_CHUNK_COLS;
                 const int row = tile_row_idx * fg::ROW_BLOCK;
 
+=======
+                const int column = chunk * C_CHUNK_COLS;
+                const int row = tile_row_idx * fg::ROW_BLOCK;
+>>>>>>> aa524f2 (fix: correctness)
                 store_async_3d(
                     G.C.map, C_smem[epilogue_transfer_stage_id], column, row, target_device);
             }
@@ -567,7 +569,7 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          int _MEMCPY_SLICES>
+          AgStrategy STRATEGY>
 __global__ __cluster_dims__(
     fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>::
         NUM_CLUSTERS,
@@ -586,7 +588,7 @@ __global__ __cluster_dims__(
                              _NUM_CTA,
                              SUPERGROUP_WIDTH,
                              _NUM_CONSUMER_WARPS,
-                             _MEMCPY_SLICES>(G);
+                             STRATEGY>(G);
 }
 
 template <int _ROW_BLOCK,
@@ -594,9 +596,9 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          int _MEMCPY_SLICES>
+          AgStrategy STRATEGY>
 inline void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G) {
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -604,57 +606,57 @@ inline void launch_ag_gemm_warp_specialized(
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
 #endif
-
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
-    ACopyPipelineState& copy_state = get_A_copy_state<fg::MEMCPY_SLICES>(G.dev_idx);
+    ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
-    MKERNEL_CUDACHECK(cudaMemsetAsync(
-        copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t) * fg::MEMCPY_SLICES, stream));
+    // Reset before the fork event so graph replay orders every copy-stream
+    // completion publication after the reset.
+    if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+        MKERNEL_CUDACHECK(
+            cudaMemsetAsync(G.A_copy_ready_peers[G.dev_idx], 0, sizeof(uint32_t), stream));
+    } else {
+        MKERNEL_CUDACHECK(
+            cudaMemsetAsync(G.A_copy_ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
+    }
 
-    fg launch_G = G;
-    launch_G.A_copy_ready = copy_state.ready;
-
-    // Capture prior work on the caller's stream. On repeated invocations this
-    // prevents the copy stream from overwriting A's staged peer slots until the
-    // previous persistent kernel on the caller stream has finished consuming them.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
-    const size_t shard_rows = static_cast<size_t>(G.A.rows());
-    const size_t row_elements = static_cast<size_t>(G.K);
-    const size_t shard_elements = shard_rows * row_elements;
-    const size_t rows_per_slice = (shard_rows + fg::MEMCPY_SLICES - 1) / fg::MEMCPY_SLICES;
+    const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
+    const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+    fg launch_G = G;
 
+    if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+        auto* dst = G.A_multicast_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
+        const auto* src = G.A[G.dev_idx].raw_ptr;
+        MKERNEL_CUDACHECK(
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+        MKERNEL_CUCHECK(
+            cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+                                 reinterpret_cast<CUdeviceptr>(G.A_copy_ready_peers[G.dev_idx]),
+                                 fg::A_copy_epoch,
+                                 CU_STREAM_WRITE_VALUE_DEFAULT));
+    } else {
+        launch_G.A_copy_ready = G.A_copy_ready;
+
+        // Stage one complete shard per remote device in the same ring order
+        // used by the persistent kernel. The local shard is read directly.
 #pragma unroll
-    for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        const size_t peer_offset = static_cast<size_t>(peer) * shard_elements;
+        for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+            const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+            auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
+            const auto* src = G.A[peer].raw_ptr;
 
-#pragma unroll
-        for (int slice = 0; slice < fg::MEMCPY_SLICES; ++slice) {
-            const size_t row_begin =
-                std::min(static_cast<size_t>(slice) * rows_per_slice, shard_rows);
-            const size_t row_end = std::min(row_begin + rows_per_slice, shard_rows);
-            const size_t slice_elements = (row_end - row_begin) * row_elements;
-            const size_t slice_offset = row_begin * row_elements;
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(
+                dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
 
-            if (slice_elements > 0) {
-                auto* dst = G.A[G.dev_idx].raw_ptr + peer_offset + slice_offset;
-                const auto* src = G.A[peer].raw_ptr + peer_offset + slice_offset;
-
-                MKERNEL_CUDACHECK(
-                    cudaMemcpyAsync(dst,
-                                    src,
-                                    slice_elements * sizeof(typename fg::A_local_tensor::dtype),
-                                    cudaMemcpyDeviceToDevice,
-                                    copy_state.stream));
-            }
-
-            const int ready_idx = peer * fg::MEMCPY_SLICES + slice;
+            // Keep the default pre-write barrier: it publishes the copied shard
+            // before the completion epoch. The kernel-side load only needs GPU
+            // scope because it reads a flag and payload resident on this device.
             MKERNEL_CUCHECK(
                 cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                     reinterpret_cast<CUdeviceptr>(copy_state.ready + ready_idx),
+                                     reinterpret_cast<CUdeviceptr>(G.A_copy_ready + peer),
                                      fg::A_copy_epoch,
                                      CU_STREAM_WRITE_VALUE_DEFAULT));
         }
@@ -669,7 +671,7 @@ inline void launch_ag_gemm_warp_specialized(
                                          _NUM_CTA,
                                          SUPERGROUP_WIDTH,
                                          _NUM_CONSUMER_WARPS,
-                                         _MEMCPY_SLICES>;
+                                         STRATEGY>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -688,7 +690,7 @@ inline void launch_ag_gemm_warp_specialized(
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
 
-    // have the copy stream join the main stream again to ensure cudagraph compatibility
+    // Have the copy stream join the main stream again for graph capture.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
 

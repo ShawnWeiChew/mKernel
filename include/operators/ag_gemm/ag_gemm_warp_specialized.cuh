@@ -37,7 +37,11 @@ namespace ag_gemm_warp_specialized {
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 1;
-static constexpr int DEFAULT_MEMCPY_SLICES = 1;
+static constexpr int MIN_LARGE_GEMM_N = 6288;
+enum class AgStrategy {
+    PULL,
+    MULTICAST_PUSH,
+};
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
@@ -55,7 +59,7 @@ template <int _ROW_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
-          int _MEMCPY_SLICES = DEFAULT_MEMCPY_SLICES>
+          AgStrategy STRATEGY = AgStrategy::PULL>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>& G);
 
@@ -129,10 +133,16 @@ struct fused_globals {
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
 
+<<<<<<< HEAD
     // NOTE: TK rounds up the tensor map to the nearest multiple of the swizzle
     // we dont want that behavior as that would give us OOB writes
     // The solution is therefore to create our own tensormap, with the same
     // swizzle as C_tile, while maintaining correctness
+=======
+    // Keep C's real N stride. The generic local_tensor helper rounds the
+    // tensor-map width to the swizzle granularity, which can produce OOB or
+    // shifted stores when N is not a multiple of C_tile::cols.
+>>>>>>> aa524f2 (fix: correctness)
     struct C_local_tensor {
         comm::bf16* data;
         CUtensorMap map;
@@ -146,6 +156,8 @@ struct fused_globals {
 
     // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
+    uint32_t* A_copy_ready_peers[NUM_DEVICES];
+    comm::bf16* A_multicast_ptr;
     static constexpr uint32_t A_copy_epoch = 1;
 
     int dev_idx;
@@ -194,137 +206,122 @@ template <typename DistributedTensor,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
           int _MEMCPY_SLICES = DEFAULT_MEMCPY_SLICES>
 __host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>
-ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
-                                      const LocalTensor& B,
-                                      LocalTensor& C,
-                                      int dev_idx,
-                                      int M,
-                                      int N,
-                                      int K,
-                                      cudaStream_t stream) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS, _MEMCPY_SLICES>;
+ag_gemm_warp_specialized_make_globals(
+    DistributedTensor& A, const LocalTensor& B, LocalTensor& C, int dev_idx, int M, int N) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
-    // create the C tensor map
-    // NOTE: requriement is that M % NUM_DEVICES == 0
     const int local_m = M / fg::NUM_DEVICES;
     typename fg::C_local_tensor C_tensor;
+    C_tensor.data = reinterpret_cast<comm::bf16*>(C.data_ptr());
 
     uint64_t global_dim[3] = {
-        static_cast<uint64_t>(N),        // columns
-        static_cast<uint64_t>(local_m),  // rows per device
-        fg::NUM_DEVICES,                 // devices
+        static_cast<uint64_t>(N),
+        static_cast<uint64_t>(local_m),
+        static_cast<uint64_t>(fg::NUM_DEVICES),
     };
-
     uint64_t global_stride[2] = {
-        N * sizeof(comm::bf16),
-        local_m * N * sizeof(comm::bf16),
+        static_cast<uint64_t>(N) * sizeof(comm::bf16),
+        static_cast<uint64_t>(local_m) * N * sizeof(comm::bf16),
     };
-
     uint32_t box_dim[3] = {
         fg::C_tile::cols,
         fg::C_tile::rows,
         1,
     };
-
     uint32_t element_stride[3] = {1, 1, 1};
 
-    // Must match the swizzle TK chose for the smem C_tile (128B for 64 bf16
-    // columns, 64B for 32), else the TMA store decodes the staged tile wrongly.
     constexpr CUtensorMapSwizzle c_swizzle = fg::C_tile::swizzle_bytes == 128
         ? CU_TENSOR_MAP_SWIZZLE_128B
         : fg::C_tile::swizzle_bytes == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
                                           : CU_TENSOR_MAP_SWIZZLE_32B;
 
-    // currently, we want to accomodate both bf16* and at::Tensors
-    if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
-                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16>) {
-        C_tensor.data = C;
-        cuTensorMapEncodeTiled(&C_tensor.map,
-                               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                               3,
-                               C_tensor.data,
-                               global_dim,
-                               global_stride,
-                               box_dim,
-                               element_stride,
-                               CU_TENSOR_MAP_INTERLEAVE_NONE,
-                               c_swizzle,
-                               CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    MKERNEL_CUCHECK(cuTensorMapEncodeTiled(&C_tensor.map,
+                                           CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                                           3,
+                                           C_tensor.data,
+                                           global_dim,
+                                           global_stride,
+                                           box_dim,
+                                           element_stride,
+                                           CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                           c_swizzle,
+                                           CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-        return {
-            .A = ::dist::make_dbuf<typename fg::A_distributed_tensor>(
-                reinterpret_cast<uint64_t>(A.mc),
-                reinterpret_cast<uint64_t*>(A.uc_ptrs),
-                1,
-                fg::NUM_DEVICES,
-                M / fg::NUM_DEVICES,
-                K),
-            .B = ::dist::make_local_tensor<typename fg::B_local_tensor>(
-                reinterpret_cast<uint64_t>(B), 1, 1, N, K),
-            .C = C_tensor,
-            .A_copy_ready = nullptr,
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N,
-            .K = K,
-            .stream = stream,
-        };
-#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-    } else if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
-                         std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
-        C_tensor.data = reinterpret_cast<comm::bf16*>(C.data_ptr());
-        cuTensorMapEncodeTiled(&C_tensor.map,
-                               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                               3,
-                               C_tensor.data,
-                               global_dim,
-                               global_stride,
-                               box_dim,
-                               element_stride,
-                               CU_TENSOR_MAP_INTERLEAVE_NONE,
-                               c_swizzle,
-                               CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-        return {
-            .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .A_local_buf =
+                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = C_tensor,
             .A_copy_ready = nullptr,
+            .A_copy_ready_peers = {},
+            .A_gathered_peers = {},
+            .A_copy_epoch_ptr = nullptr,
+            .A_multicast_ptr = nullptr,
+            .multicast_barrier = nullptr,
+            .multicast_barrier_mc = nullptr,
             .dev_idx = dev_idx,
             .M = M,
-            .N = N,
-            .K = K,
-            .stream = stream,
-        };
-#endif
-    } else {
-        static_assert(
-            always_false_v<LocalTensor>,
-            "LocalTensor must be either __nv_bfloat16* or at::Tensor, while DistributedTensor must "
-            "either satisfy dist::RawDistributedMulticastTensorLike or ParallelBuffer");
-    }
+            .N = N};
 }
 
-template <typename DistributedTensor, typename LocalTensor>
-void entrypoint(DistributedTensor& A,
-                const LocalTensor& B,
-                LocalTensor& C,
-                int M = -1,
-                int N = -1,
-                int K = -1,
-                int dev_idx = -1,
-                cudaStream_t stream = nullptr) {
-#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-    dev_idx = dev_idx == -1 ? A.local_rank_ : dev_idx;
-    M = M == -1 ? C.size(0) * C.size(1) : M;
-    N = N == -1 ? B.size(0) : N;
-    K = K == -1 ? B.size(1) : K;
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_pull_buf,
+                dist::ParallelBuffer& A_gathered,
+                dist::ParallelBuffer& A_copy_ready,
+                const at::Tensor& B,
+                at::Tensor& C,
+                const int logical_global_m) {
+    const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
+
+    // C is now [NUM_DEVICES, local_m, N];
+    const int M = C.size(0) * C.size(1), N = B.size(0);
+
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
-#endif
+    TORCH_CHECK(A_copy_ready.multicast_ && A_copy_ready.multicast_ptr_ != nullptr,
+                "A_copy_ready must be a multicast DistBuffer");
+    TORCH_CHECK(A_copy_ready.dtype_ == at::kInt && A_copy_ready.data_.is_contiguous() &&
+                    A_copy_ready.data_.numel() >= INTRA_NUM_DEVICES,
+                "A_copy_ready must contain at least one int32 flag per device");
+
+    auto launch = [&]<int ROW_BLOCK,
+                      int COL_BLOCK,
+                      int NUM_CTA,
+                      int SUPERGROUP_WIDTH,
+                      int NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>() {
+        using fg = fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>;
+        const at::Tensor& A_staging =
+            STRATEGY == AgStrategy::MULTICAST_PUSH ? A_gathered.data_ : A_pull_buf;
+        fg globals = ag_gemm_warp_specialized_make_globals<ROW_BLOCK,
+                                                           COL_BLOCK,
+                                                           NUM_CTA,
+                                                           NUM_CONSUMER_WARPS>(
+            A, A_staging, B, C, dev_idx, M, N);
+        globals.A_copy_ready =
+            static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[dev_idx]);
+        if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+            for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
+                globals.A_copy_ready_peers[peer] =
+                    static_cast<uint32_t*>(A_copy_ready_peers->raw_ptrs_[peer]);
+            }
+
+            globals.A_multicast_ptr = static_cast<comm::bf16*>(A_gathered.multicast_ptr_);
+        }
+        globals.A_copy_epoch_ptr = A_copy_epoch_ptr;
+        globals.A_multicast_ptr = A_multicast_ptr;
+        globals.multicast_barrier = multicast_barrier;
+        globals.multicast_barrier_mc = multicast_barrier_mc;
+        launch_ag_gemm_warp_specialized<ROW_BLOCK,
+                                        COL_BLOCK,
+                                        NUM_CTA,
+                                        SUPERGROUP_WIDTH,
+                                        NUM_CONSUMER_WARPS,
+                                        USE_MULTICAST_MEMCPY,
+                                        USE_MULTICAST_PUSH,
+                                        USE_CE_PUSH>(globals);
+    };
 
     // TODO: this only works for TP == 8
     constexpr int MIN_LARGE_GEMM_N = 6288;
@@ -430,6 +427,18 @@ void entrypoint(DistributedTensor& A,
                     A, B, C, dev_idx, M, N, K, stream);
             launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
         }
+        default:
+            TORCH_CHECK(false, "ag_gemm_warp_specialized: no tile config for M=", M, " N=", N);
     }
 }
-};  // namespace ag_gemm_warp_specialized
+}
+
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_local_buf,
+                const at::Tensor& B,
+                at::Tensor& C,
+                const int logical_global_m) {
+    entrypoint_impl<false, false, false>(A, A_local_buf, B, C, logical_global_m);
+}
+}
+;  // namespace ag_gemm_warp_specialized
