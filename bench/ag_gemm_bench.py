@@ -162,6 +162,12 @@ class BlackwellBenchVars:
     mkernel_b_buf: torch.Tensor | None = None
     mkernel_c_buf: torch.Tensor | None = None
 
+    # multicast memcpy + cuBLAS comparison args
+    multicast_a_dist: DistBufferLike | None = None
+    multicast_a_local: torch.Tensor | None = None
+    multicast_barrier: DistBufferLike | None = None
+    multicast_c_buf: torch.Tensor | None = None
+
     # TK specific args
     tk_padded_m: int | None = None
     tk_padded_n: int | None = None
@@ -691,6 +697,7 @@ def report_blackwell_result(
     cutlass_ms = ms_by_name.get("cutlass")
     tk_ms = ms_by_name.get("TK")
     mkernel_ms = ms_by_name.get("mkernel")
+    multicast_ms = ms_by_name.get("multicast_cublas")
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -734,6 +741,17 @@ def report_blackwell_result(
         if tk_ms is not None:
             verdict = "BEATS" if mkernel_ms < tk_ms else "behind"
             line += f"  {tk_ms / mkernel_ms:6.3f}x vs ThunderKittens ({verdict})"
+        print(line, flush=True)
+    if multicast_ms is not None:
+        line = (
+            f"  {'multicast memcpy + cuBLAS':<26} {multicast_ms:8.3f} ms  "
+            f"{tflops_for(multicast_ms):8.2f} TFLOP/s"
+        )
+        if baseline_ms is not None:
+            line += f"  ({baseline_ms / multicast_ms:6.3f}x vs baseline)"
+        if mkernel_ms is not None:
+            verdict = "BEATS" if multicast_ms < mkernel_ms else "behind"
+            line += f"  {mkernel_ms / multicast_ms:6.3f}x vs fused ({verdict})"
         print(line, flush=True)
 
 def ag_gemm_blackwell_prepare(
@@ -802,10 +820,26 @@ def ag_gemm_blackwell_prepare(
     )
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
-    # The kernel's first act is to pull every peer's shard out of their
-    # DistBuffer, so no rank may launch until all of them have finished
-    # filling theirs -- and the fill is stream-ordered work that a bare
-    # dist.barrier() does not wait on.
+    # ---- multicast memcpy + cuBLAS comparison ----
+    # This variant gathers each local shard into a full-size multicast A
+    # allocation, synchronizes through one multicast counter, then runs cuBLAS.
+    run_config.multicast_a_local = A_mk_local
+    run_config.multicast_a_dist = mod.DistBuffer(
+        (mk_m, config.default_k), dtype=torch.bfloat16,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
+    )
+    run_config.multicast_barrier = mod.DistBuffer(
+        (1,), dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
+    )
+    run_config.multicast_barrier.data_.zero_()
+    run_config.multicast_c_buf = torch.zeros(
+        (config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16,
+    )
+
+    # The fused kernel reads peer shards, and the multicast path requires every
+    # rank's counter backing to be zero before its first replay. A bare host
+    # barrier does not wait for the preceding stream-ordered fills/resets.
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -818,22 +852,45 @@ def ag_gemm_blackwell_prepare(
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
         )
 
-    mkernel_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(mkernel_graph):
-        run_mkernel()
-    torch.cuda.synchronize()
-    dist.barrier()
+    def run_multicast_cublas():
+        mod.ag_gemm_warp_specialized_multicast(
+            run_config.multicast_a_dist, run_config.multicast_a_local,
+            run_config.multicast_barrier, run_config.mkernel_b_buf,
+            run_config.multicast_c_buf, global_m,
+        )
 
-    # Check correctness agains the cudagraph
+    # Build the logical reference before capture. Besides sharing one reference
+    # between both candidates, torch.mm initializes cuBLAS outside graph capture.
     A_ref = torch.empty(
         (global_m, config.default_k), device="cuda", dtype=torch.bfloat16
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Initialize the direct cuBLAS handle/workspace and the auxiliary copy
+    # stream before capture. The barrier resets its local counter before return.
+    run_multicast_cublas()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    mkernel_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph):
+        run_mkernel()
+
+    multicast_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(multicast_graph):
+        run_multicast_cublas()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Check both captured paths against the same logical reference.
     run_config.mkernel_c_buf.zero_()
     mkernel_graph.replay()
     torch.cuda.synchronize()
-    graph_ok = check_close(
+    mkernel_graph_ok = check_close(
         f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
         unpad_rows(
             run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
@@ -841,14 +898,28 @@ def ag_gemm_blackwell_prepare(
         ),
         C_ref,
     )
+
+    run_config.multicast_c_buf.zero_()
+    multicast_graph.replay()
+    torch.cuda.synchronize()
+    multicast_graph_ok = check_close(
+        f"multicast-memcpy-cublas cudagraph {projection} M={global_m} N={logical_n}",
+        unpad_rows(
+            run_config.multicast_c_buf, run_config.logical_m, mk_local_m,
+            config.world_size, logical_n,
+        ),
+        C_ref,
+    )
+
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
+    graph_ok = mkernel_graph_ok and multicast_graph_ok
     graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
     dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
     if not graph_vote.item():
         if config.is_chief:
             print(
-                f"ag-gemm-warp-specialized cudagraph {projection} M={global_m}: "
+                f"Blackwell AG-GEMM cudagraph checks {projection} M={global_m}: "
                 f"FAILED :( -- skipping benchmarks.",
                 flush=True,
             )
@@ -860,7 +931,11 @@ def ag_gemm_blackwell_prepare(
     def bench_mkernel():
         mkernel_graph.replay()
 
+    def bench_multicast_cublas():
+        multicast_graph.replay()
+
     fns.append((bench_mkernel, "mkernel", True))
+    fns.append((bench_multicast_cublas, "multicast_cublas", True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
@@ -1187,4 +1262,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-    

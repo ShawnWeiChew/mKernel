@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDABlas.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -71,6 +72,28 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
         state.initialized = true;
     }
     return state;
+}
+
+// Reusable cross-GPU barrier for the multicast-copy path. Every rank adds one
+// to the same multicast counter, waits for the fixed NUM_DEVICES target, then
+// resets only its own local backing before leaving the kernel.
+template <int NUM_DEVICES>
+__global__ void multicast_copy_barrier_kernel(int* local_barrier, int* multicast_barrier) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // The release multicast reduction publishes the preceding copy and adds
+    // this rank's arrival to every device's local counter.
+    __threadfence_system();
+    comm::multimem<int>::red<comm::reduce_op::ADD>(multicast_barrier, 1);
+
+    constexpr uint32_t BARRIER_EPOCH = NUM_DEVICES;
+    while (comm::atomic_u32::acquire_load_gpu(local_barrier) != BARRIER_EPOCH) {
+        __nanosleep(32);
+    }
+
+    comm::atomic_u32::release_store_gpu(local_barrier, 0U);
 }
 
 // tcgen05 MMA with the CTA group taken from the config. mm2_AB / mma2_AB are
@@ -568,7 +591,8 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS,
+          bool USE_MULTICAST_MEMCPY>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -577,88 +601,124 @@ inline void launch_ag_gemm_warp_specialized(
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
-    MKERNEL_CUDACHECK(
-        cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
-
-    fg launch_G = G;
-    launch_G.A_copy_ready = copy_state.ready;
-
-    // Capture prior work on the caller's stream. On repeated invocations this
-    // prevents the copy stream from overwriting A_local_buf until the previous
-    // persistent kernel on the caller stream has finished consuming it.
+    // Preserve this rank's caller-stream ordering and make the auxiliary copy
+    // stream part of the same CUDA graph capture.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
-    const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
-    const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+    if constexpr (USE_MULTICAST_MEMCPY) {
+        TORCH_CHECK(G.multicast_barrier != nullptr && G.multicast_barrier_mc != nullptr,
+                    "multicast barrier pointers must be provided");
+        TORCH_CHECK(G.M % fg::NUM_DEVICES == 0, "global M must divide evenly across devices");
 
-    // Stage one complete shard per remote device in the same ring order used
-    // by the persistent kernel. The local shard is read directly from G.A.
-#pragma unroll
-    for (int distance = 1; distance < 4; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
-
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
-    }
-
-    constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
-    constexpr int num_threads = fg::NUM_THREADS;
-    constexpr int grid = fg::NUM_BLOCKS;
-
-    auto this_kernel =
-        fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _NUM_CONSUMER_WARPS>;
-
-    MKERNEL_CUDACHECK(
-        cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    cudaLaunchAttribute pdl_attr = {};
-    pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    pdl_attr.val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t launch_config = {};
-    launch_config.gridDim = grid;
-    launch_config.blockDim = num_threads;
-    launch_config.dynamicSmemBytes = smem_size;
-    launch_config.stream = stream;
-    launch_config.attrs = &pdl_attr;
-    launch_config.numAttrs = 1;
-
-    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
-
-#pragma unroll
-    for (int distance = 4; distance < fg::NUM_DEVICES; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
+        const size_t local_m = static_cast<size_t>(G.M) / fg::NUM_DEVICES;
+        const size_t shard_elements = local_m * G.K;
+        const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+        auto* dst = G.A.mc_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
+        const auto* src = G.A_local_buf.raw_ptr;
 
         MKERNEL_CUDACHECK(
             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
 
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
+        // Publish the completed multicast copy and wait until all source ranks
+        // have populated their disjoint shards in every local A mapping.
+        multicast_copy_barrier_kernel<fg::NUM_DEVICES>
+            <<<1, 1, 0, copy_state.stream>>>(G.multicast_barrier, G.multicast_barrier_mc);
+
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
+        MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
+
+        // B is row-major [N, K]. cuBLAS is column-major, so compute the
+        // transpose C^T[N, M] = B[N, K] * A^T[K, M] in the same storage.
+        cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+        TORCH_CUDABLAS_CHECK(cublasSetStream(handle, stream));
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        TORCH_CUDABLAS_CHECK(cublasGemmEx(handle,
+                                          CUBLAS_OP_T,
+                                          CUBLAS_OP_N,
+                                          G.N,
+                                          G.M,
+                                          G.K,
+                                          &alpha,
+                                          G.B.raw_ptr,
+                                          CUDA_R_16BF,
+                                          G.K,
+                                          G.A[G.dev_idx].raw_ptr,
+                                          CUDA_R_16BF,
+                                          G.K,
+                                          &beta,
+                                          G.C.raw_ptr,
+                                          CUDA_R_16BF,
+                                          G.N,
+                                          CUBLAS_COMPUTE_32F,
+                                          CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+        MKERNEL_CUDACHECK(cudaGetLastError());
+    } else {
+        MKERNEL_CUDACHECK(
+            cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
+
+        fg launch_G = G;
+        launch_G.A_copy_ready = copy_state.ready;
+
+        const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
+        const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+
+        // Stage one complete shard per remote device in the same ring order
+        // used by the persistent kernel. The local shard is read directly.
+#pragma unroll
+        for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+            const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+            auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
+            const auto* src = G.A[peer].raw_ptr;
+
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(
+                dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+
+            // Keep the default pre-write barrier: it publishes the copied shard
+            // before the completion epoch. The kernel-side load only needs GPU
+            // scope because it reads a flag and payload resident on this device.
+            MKERNEL_CUCHECK(
+                cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+                                     reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
+                                     fg::A_copy_epoch,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT));
+        }
+
+        constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
+        constexpr int num_threads = fg::NUM_THREADS;
+        constexpr int grid = fg::NUM_BLOCKS;
+
+        auto this_kernel = fused_kernel_stub<_ROW_BLOCK,
+                                             _COL_BLOCK,
+                                             _NUM_CTA,
+                                             SUPERGROUP_WIDTH,
+                                             _NUM_CONSUMER_WARPS>;
+
+        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+            this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+        cudaLaunchAttribute pdl_attr = {};
+        pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        pdl_attr.val.programmaticStreamSerializationAllowed = 1;
+
+        cudaLaunchConfig_t launch_config = {};
+        launch_config.gridDim = grid;
+        launch_config.blockDim = num_threads;
+        launch_config.dynamicSmemBytes = smem_size;
+        launch_config.stream = stream;
+        launch_config.attrs = &pdl_attr;
+        launch_config.numAttrs = 1;
+
+        MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
+
+        // Have the copy stream join the main stream again for graph capture.
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
+        MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
+
+        MKERNEL_CUDACHECK(cudaGetLastError());
     }
-
-    // have the copy stream join the main stream again to ensure cudagraph compatibility
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
-    MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
-
-    MKERNEL_CUDACHECK(cudaGetLastError());
 }
 };  // namespace ag_gemm_warp_specialized
 

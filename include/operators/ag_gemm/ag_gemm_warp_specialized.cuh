@@ -46,7 +46,8 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
+          bool USE_MULTICAST_MEMCPY = false>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 
@@ -132,6 +133,12 @@ struct fused_globals {
     uint32_t* A_copy_ready;
     static constexpr uint32_t A_copy_epoch = 1;
 
+    // Used only by USE_MULTICAST_MEMCPY. The first pointer is this rank's
+    // ordinary mapping and the second is the multicast VA for the same int32
+    // counter.
+    int* multicast_barrier;
+    int* multicast_barrier_mc;
+
     int dev_idx;
     int M;
     int N;
@@ -183,27 +190,48 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .A_copy_ready = nullptr,
+            .multicast_barrier = nullptr,
+            .multicast_barrier_mc = nullptr,
             .dev_idx = dev_idx,
             .M = M,
             .N = N};
 }
 
-void entrypoint(dist::ParallelBuffer& A,
-                const at::Tensor& A_local_buf,
-                const at::Tensor& B,
-                at::Tensor& C,
-                const int logical_global_m  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
-) {
+template <bool USE_MULTICAST_MEMCPY>
+void entrypoint_impl(dist::ParallelBuffer& A,
+                     const at::Tensor& A_local_buf,
+                     const at::Tensor& B,
+                     at::Tensor& C,
+                     const int logical_global_m,
+                     int* multicast_barrier = nullptr,
+                     int* multicast_barrier_mc = nullptr) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
     // C is now [NUM_DEVICES, local_m, N];
     const int M = C.size(0) * C.size(1), N = B.size(0);
-    constexpr int K = fused_globals<128, 128>::K;
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
+
+    auto launch = [&]<int ROW_BLOCK,
+                      int COL_BLOCK,
+                      int NUM_CTA,
+                      int SUPERGROUP_WIDTH,
+                      int NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>() {
+        using fg = fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>;
+        fg globals = ag_gemm_warp_specialized_make_globals<
+            ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>(
+            A, A_local_buf, B, C, dev_idx, M, N);
+        globals.multicast_barrier = multicast_barrier;
+        globals.multicast_barrier_mc = multicast_barrier_mc;
+        launch_ag_gemm_warp_specialized<ROW_BLOCK,
+                                        COL_BLOCK,
+                                        NUM_CTA,
+                                        SUPERGROUP_WIDTH,
+                                        NUM_CONSUMER_WARPS,
+                                        USE_MULTICAST_MEMCPY>(globals);
+    };
 
     // TODO: this only works for TP == 8
     constexpr int MIN_LARGE_GEMM_N = 6288;
@@ -212,52 +240,31 @@ void entrypoint(dist::ParallelBuffer& A,
     if (N >= MIN_LARGE_GEMM_N) {
         switch (logical_global_m) {
             case 2048: {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
+                launch.template operator()<128, 128, 2, 15>();
                 break;
             }
             case 3072: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch.template operator()<128, 256, 2, 15>();
                 break;
             }
             case 3584: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+                launch.template operator()<128, 256, 2, 20>();
                 break;
             }
             case 4096: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+                launch.template operator()<128, 256, 2, 5>();
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch.template operator()<128, 256, 2, 5, 2>();
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch.template operator()<128, 256, 2, 5, 2>();
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch.template operator()<128, 256, 2, 5, 2>();
                 break;
             }
             default:
@@ -266,57 +273,104 @@ void entrypoint(dist::ParallelBuffer& A,
     } else {
         switch (logical_global_m) {
             case 2048: {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
+                launch.template operator()<128, 128, 2, 25>();
                 break;
             }
             case 3072: {
-                using fg = fused_globals<128, 128, 1>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 1>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
+                launch.template operator()<128, 128, 1, 20>();
                 break;
             }
             case 3584: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch.template operator()<128, 256, 2, 10>();
                 break;
             }
             case 4096: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch.template operator()<128, 256, 2, 10>();
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch.template operator()<128, 256, 2, 10>();
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch.template operator()<128, 256, 2, 15>();
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch.template operator()<128, 256, 2, 15>();
                 break;
             }
             default:
                 TORCH_CHECK(false, "ag_gemm_warp_specialized: no tile config for M=", M, " N=", N);
         }
     }
+}
+
+void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_local_buf,
+                const at::Tensor& B,
+                at::Tensor& C,
+                const int logical_global_m) {
+    entrypoint_impl<false>(A, A_local_buf, B, C, logical_global_m);
+}
+
+// Multicast-copy baseline. A is a multicast DistBuffer containing the full
+// [global_M, K] gather destination, while A_local is this rank's
+// [global_M / NUM_DEVICES, K] source shard. barrier is a zero-initialized,
+// multicast int32 DistBuffer with at least one element.
+void entrypoint_multicast(dist::ParallelBuffer& A,
+                          const at::Tensor& A_local,
+                          dist::ParallelBuffer& barrier,
+                          const at::Tensor& B,
+                          at::Tensor& C,
+                          const int logical_global_m) {
+    constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+    constexpr int K = fused_globals<128, 128>::K;
+
+    TORCH_CHECK(C.dim() == 3 && C.size(0) == NUM_DEVICES,
+                "C must have shape [NUM_DEVICES, local_M, N]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == K,
+                "B must have the pre-transposed shape [N, K]");
+    TORCH_CHECK(C.size(2) == B.size(0), "C's N dimension must match B.size(0)");
+    const int64_t M = C.size(0) * C.size(1);
+
+    TORCH_CHECK(A.multicast_ && A.multicast_ptr_ != nullptr,
+                "multicast mode requires A to be a multicast DistBuffer");
+    TORCH_CHECK(A.local_rank_ == barrier.local_rank_ &&
+                    A.local_world_size_ == barrier.local_world_size_,
+                "A and barrier must use the same local rank and world size");
+    TORCH_CHECK(A.dtype_ == at::kBFloat16 && A.data_.is_contiguous(),
+                "multicast A must be contiguous bfloat16");
+    TORCH_CHECK(A.data_.dim() == 2 && A.data_.size(0) == M && A.data_.size(1) == K,
+                "multicast A must have shape [global_M, K]");
+    TORCH_CHECK(M % NUM_DEVICES == 0, "global M must divide evenly across devices");
+    TORCH_CHECK(A_local.scalar_type() == at::kBFloat16 && A_local.is_contiguous(),
+                "A_local must be contiguous bfloat16");
+    TORCH_CHECK(A_local.dim() == 2 && A_local.size(0) == M / NUM_DEVICES &&
+                    A_local.size(1) == K,
+                "A_local must have shape [global_M / NUM_DEVICES, K]");
+    TORCH_CHECK(B.scalar_type() == at::kBFloat16 && B.is_contiguous(),
+                "B must be contiguous bfloat16");
+    TORCH_CHECK(C.scalar_type() == at::kBFloat16 && C.is_contiguous(),
+                "C must be contiguous bfloat16");
+    TORCH_CHECK(A_local.device() == A.data_.device() && B.device() == A.data_.device() &&
+                    C.device() == A.data_.device(),
+                "A, A_local, B, and C must be on the same CUDA device");
+    TORCH_CHECK(barrier.multicast_ && barrier.multicast_ptr_ != nullptr,
+                "multicast mode requires barrier to be a multicast DistBuffer");
+    TORCH_CHECK(barrier.dtype_ == at::kInt && barrier.data_.is_contiguous(),
+                "multicast barrier must be contiguous int32");
+    TORCH_CHECK(barrier.data_.numel() >= 1,
+                "multicast barrier needs at least one int32 element");
+    TORCH_CHECK(barrier.data_.device() == A.data_.device(),
+                "multicast barrier must be on the same CUDA device as A");
+
+    entrypoint_impl<true>(A,
+                          A_local,
+                          B,
+                          C,
+                          logical_global_m,
+                          barrier.data_.data_ptr<int>(),
+                          static_cast<int*>(barrier.multicast_ptr_));
 }
 };  // namespace ag_gemm_warp_specialized

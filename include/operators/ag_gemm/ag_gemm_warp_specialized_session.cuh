@@ -13,4 +13,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"),
           pybind11::arg("C"),
           pybind11::arg("logical_global_m"));
+    m.def("ag_gemm_warp_specialized_multicast",
+          &ag_gemm_warp_specialized::entrypoint_multicast,
+          pybind11::arg("A"),
+          pybind11::arg("A_local"),
+          pybind11::arg("barrier"),
+          pybind11::arg("B"),
+          pybind11::arg("C"),
+          pybind11::arg("logical_global_m"));
 }
