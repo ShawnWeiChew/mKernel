@@ -818,7 +818,7 @@ def ag_gemm_blackwell_prepare(
         ("mkernel memcpy batch=1", mod.ag_gemm_warp_specialized),
         ("mkernel memcpy batch=2", mod.ag_gemm_warp_specialized_batch_2),
     )
-    mkernel_graphs = []
+    mkernel_runs = []
     for name, entrypoint in mkernel_variants:
         def run_mkernel(entrypoint=entrypoint):
             entrypoint(
@@ -826,10 +826,7 @@ def ag_gemm_blackwell_prepare(
                 run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
             )
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run_mkernel()
-        mkernel_graphs.append((name, graph))
+        mkernel_runs.append((name, run_mkernel))
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -839,28 +836,28 @@ def ag_gemm_blackwell_prepare(
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
-    graph_ok = True
-    for name, graph in mkernel_graphs:
+    eager_ok = True
+    for name, run_mkernel in mkernel_runs:
         run_config.mkernel_c_buf.zero_()
-        graph.replay()
+        run_mkernel()
         torch.cuda.synchronize()
-        graph_ok = check_close(
-            f"ag-gemm-warp-specialized {name} cudagraph "
+        eager_ok = check_close(
+            f"ag-gemm-warp-specialized {name} eager "
             f"{projection} M={global_m} N={logical_n}",
             unpad_rows(
                 run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
                 config.world_size, logical_n,
             ),
             C_ref,
-        ) and graph_ok
+        ) and eager_ok
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
-    graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
-    dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
-    if not graph_vote.item():
+    eager_vote = torch.tensor([1 if eager_ok else 0], device="cuda")
+    dist.all_reduce(eager_vote, op=dist.ReduceOp.MIN)
+    if not eager_vote.item():
         if config.is_chief:
             print(
-                f"ag-gemm-warp-specialized cudagraph {projection} M={global_m}: "
+                f"ag-gemm-warp-specialized eager {projection} M={global_m}: "
                 f"FAILED :( -- skipping benchmarks.",
                 flush=True,
             )
@@ -869,8 +866,8 @@ def ag_gemm_blackwell_prepare(
     del A_ref, C_ref
     dist.barrier()
 
-    for name, graph in mkernel_graphs:
-        fns.append((lambda graph=graph: graph.replay(), name, True))
+    for name, run_mkernel in mkernel_runs:
+        fns.append((run_mkernel, name, True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
