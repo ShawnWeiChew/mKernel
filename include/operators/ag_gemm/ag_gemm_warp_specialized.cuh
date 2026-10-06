@@ -44,9 +44,10 @@ static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+          int _NUM_CTA,
+          int SUPERGROUP_WIDTH,
+          int _NUM_CONSUMER_WARPS,
+          int COPY_BATCH_SIZE>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 
@@ -188,13 +189,12 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .N = N};
 }
 
+template <int COPY_BATCH_SIZE>
 void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& A_local_buf,
                 const at::Tensor& B,
                 at::Tensor& C,
-                const int logical_global_m  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
-) {
+                const int logical_global_m) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -215,49 +215,49 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 128, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
+                launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 3072: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 3584: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 4096: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 8192: {
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 16384: {
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 32768: {
                 using fg = fused_globals<128, 256, 2, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, COPY_BATCH_SIZE>(globals);
                 break;
             }
             default:
@@ -269,49 +269,49 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 128, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
+                launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 3072: {
                 using fg = fused_globals<128, 128, 1>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 128, 1>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
+                launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 3584: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 4096: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 8192: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 16384: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             case 32768: {
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, COPY_BATCH_SIZE>(globals);
                 break;
             }
             default:

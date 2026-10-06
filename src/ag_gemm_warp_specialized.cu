@@ -568,7 +568,8 @@ template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS>
+          int _NUM_CONSUMER_WARPS,
+          int COPY_BATCH_SIZE>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -592,17 +593,7 @@ inline void launch_ag_gemm_warp_specialized(
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
 
-    // Stage one complete shard per remote device in the same ring order used
-    // by the persistent kernel. The local shard is read directly from G.A.
-#pragma unroll
-    for (int distance = 1; distance < 4; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
-
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
+    auto publish_copy_ready = [&](int peer) {
         // Keep the default pre-write barrier: it publishes the copied shard
         // before the completion epoch. The kernel-side load only needs GPU
         // scope because it reads a flag and payload resident on this device.
@@ -610,6 +601,68 @@ inline void launch_ag_gemm_warp_specialized(
                                              reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
                                              fg::A_copy_epoch,
                                              CU_STREAM_WRITE_VALUE_DEFAULT));
+    };
+
+    auto stage_single_copy = [&](int distance) {
+        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
+        const auto* src = G.A[peer].raw_ptr;
+
+        MKERNEL_CUDACHECK(
+            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+        publish_copy_ready(peer);
+    };
+
+    auto stage_copy_batch = [&]<size_t BATCH_SIZE>(int first_distance) {
+        int peers[BATCH_SIZE];
+        void* dsts[BATCH_SIZE];
+        const void* srcs[BATCH_SIZE];
+        size_t sizes[BATCH_SIZE];
+
+#pragma unroll
+        for (size_t i = 0; i < BATCH_SIZE; ++i) {
+            peers[i] = (G.dev_idx + first_distance + static_cast<int>(i)) % fg::NUM_DEVICES;
+            dsts[i] =
+                G.A_local_buf.raw_ptr + static_cast<size_t>(peers[i]) * shard_elements;
+            srcs[i] = G.A[peers[i]].raw_ptr;
+            // Every operation copies a peer's full local-M shard. Increasing
+            // the batch size only changes submission and readiness granularity.
+            sizes[i] = shard_bytes;
+        }
+
+        cudaMemcpyAttributes attrs = {};
+        attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attrs_idx = 0;
+        MKERNEL_CUDACHECK(cudaMemcpyBatchAsync(
+            dsts, srcs, sizes, BATCH_SIZE, &attrs, &attrs_idx, 1, copy_state.stream));
+
+        // A batch is stream-ordered as a whole, so all of its readiness flags
+        // are published only after every full-M copy in that batch completes.
+#pragma unroll
+        for (size_t i = 0; i < BATCH_SIZE; ++i) {
+            publish_copy_ready(peers[i]);
+        }
+    };
+
+    // Stage one complete shard per remote device in the same ring order used
+    // by the persistent kernel. Batch width 1 preserves the original scalar
+    // cudaMemcpyAsync path; width 2 keeps n+1 scalar and pairs n+2 through n+7.
+    // The local shard is read directly from G.A.
+    static_assert(fg::NUM_DEVICES >= 4 && fg::NUM_DEVICES % 2 == 0,
+                  "batched A-shard copies require an even device count of at least four");
+    static_assert(COPY_BATCH_SIZE == 1 || COPY_BATCH_SIZE == 2,
+                  "COPY_BATCH_SIZE must be one or two");
+    if constexpr (COPY_BATCH_SIZE == 1) {
+#pragma unroll
+        for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+            stage_single_copy(distance);
+        }
+    } else {
+        stage_single_copy(1);
+#pragma unroll
+        for (int distance = 2; distance < fg::NUM_DEVICES; distance += 2) {
+            stage_copy_batch.template operator()<2>(distance);
+        }
     }
 
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
@@ -635,24 +688,6 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.numAttrs = 1;
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
-
-#pragma unroll
-    for (int distance = 4; distance < fg::NUM_DEVICES; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A_local_buf.raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr;
-
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
-    }
 
     // have the copy stream join the main stream again to ensure cudagraph compatibility
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));

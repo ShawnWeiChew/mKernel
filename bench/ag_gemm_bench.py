@@ -118,13 +118,10 @@ class BlackwellBenchConfig:
     is_chief = local_rank == 0
     num_nodes = 1
 
-    projections = ( 
-        # KDA proj_qkvgfab, (4 * 12288 + 96) / TP + 128.
-        ("KDA", (4 * 12288 + 96) // world_size + 128),
-        # MLA qkvg proj, 576 + 1536 + 12288 / TP.
-        ("MLA", 576 + 1536 + 12288 // world_size),
-    )
-    shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
+    # Focused original batch=1 vs memcpyBatchAsync batch=2 experiment.
+    # MLA qkvg proj, 576 + 1536 + 12288 / TP.
+    projections = (("MLA", 576 + 1536 + 12288 // world_size),)
+    shapes_to_test = [8192]
     default_k = 7168
 
     # cutlass configs
@@ -690,7 +687,10 @@ def report_blackwell_result(
     baseline_ms = ms_by_name.get("baseline")
     cutlass_ms = ms_by_name.get("cutlass")
     tk_ms = ms_by_name.get("TK")
-    mkernel_ms = ms_by_name.get("mkernel")
+    mkernel_results = (
+        ("ag_gemm memcpy batch=1", ms_by_name.get("mkernel memcpy batch=1")),
+        ("ag_gemm memcpy batch=2", ms_by_name.get("mkernel memcpy batch=2")),
+    )
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -721,9 +721,11 @@ def report_blackwell_result(
             f"{tflops_for(tk_ms):8.2f} TFLOP/s{vs_baseline}",
             flush=True,
         )
-    if mkernel_ms is not None:
+    for mkernel_label, mkernel_ms in mkernel_results:
+        if mkernel_ms is None:
+            continue
         line = (
-            f"  {'ag_gemm_warp_specialized':<26} {mkernel_ms:8.3f} ms  "
+            f"  {mkernel_label:<26} {mkernel_ms:8.3f} ms  "
             f"{tflops_for(mkernel_ms):8.2f} TFLOP/s"
         )
         if baseline_ms is not None:
@@ -812,35 +814,45 @@ def ag_gemm_blackwell_prepare(
     tune_warmup = 2
     tune_iterations = 5
 
-    def run_mkernel():
-        mod.ag_gemm_warp_specialized(
-            run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
-            run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
-        )
+    mkernel_variants = (
+        ("mkernel memcpy batch=1", mod.ag_gemm_warp_specialized),
+        ("mkernel memcpy batch=2", mod.ag_gemm_warp_specialized_batch_2),
+    )
+    mkernel_graphs = []
+    for name, entrypoint in mkernel_variants:
+        def run_mkernel(entrypoint=entrypoint):
+            entrypoint(
+                run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
+                run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            )
 
-    mkernel_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(mkernel_graph):
-        run_mkernel()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_mkernel()
+        mkernel_graphs.append((name, graph))
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Check correctness agains the cudagraph
+    # Check both compile-time batch-width specializations against the same reference.
     A_ref = torch.empty(
         (global_m, config.default_k), device="cuda", dtype=torch.bfloat16
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
-    run_config.mkernel_c_buf.zero_()
-    mkernel_graph.replay()
-    torch.cuda.synchronize()
-    graph_ok = check_close(
-        f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
-        unpad_rows(
-            run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
-            config.world_size, logical_n,
-        ),
-        C_ref,
-    )
+    graph_ok = True
+    for name, graph in mkernel_graphs:
+        run_config.mkernel_c_buf.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_ok = check_close(
+            f"ag-gemm-warp-specialized {name} cudagraph "
+            f"{projection} M={global_m} N={logical_n}",
+            unpad_rows(
+                run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
+                config.world_size, logical_n,
+            ),
+            C_ref,
+        ) and graph_ok
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
     graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
@@ -857,10 +869,8 @@ def ag_gemm_blackwell_prepare(
     del A_ref, C_ref
     dist.barrier()
 
-    def bench_mkernel():
-        mkernel_graph.replay()
-
-    fns.append((bench_mkernel, "mkernel", True))
+    for name, graph in mkernel_graphs:
+        fns.append((lambda graph=graph: graph.replay(), name, True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
@@ -1161,7 +1171,7 @@ def main():
             # list (json has no tuple type) is unhashable as a dict key there.
             result_sizes.append(f"{projection} M={m} N={logical_n}")
             for name, res in results:
-                if name == "mkernel":
+                if name == "mkernel memcpy batch=1":
                     result_fused.append(res)
 
     if config.is_chief and args.save_json:
@@ -1187,4 +1197,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-    
