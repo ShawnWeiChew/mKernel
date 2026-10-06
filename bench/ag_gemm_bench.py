@@ -168,6 +168,11 @@ class BlackwellBenchVars:
     multicast_barrier: DistBufferLike | None = None
     multicast_c_buf: torch.Tensor | None = None
 
+    # fused multicast-push comparison args
+    multicast_push_a_dist: DistBufferLike | None = None
+    multicast_push_ready: DistBufferLike | None = None
+    multicast_push_c_buf: torch.Tensor | None = None
+
     # TK specific args
     tk_padded_m: int | None = None
     tk_padded_n: int | None = None
@@ -698,6 +703,7 @@ def report_blackwell_result(
     tk_ms = ms_by_name.get("TK")
     mkernel_ms = ms_by_name.get("mkernel")
     multicast_ms = ms_by_name.get("multicast_cublas")
+    multicast_push_ms = ms_by_name.get("multicast_push")
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -752,6 +758,17 @@ def report_blackwell_result(
         if mkernel_ms is not None:
             verdict = "BEATS" if multicast_ms < mkernel_ms else "behind"
             line += f"  {mkernel_ms / multicast_ms:6.3f}x vs fused ({verdict})"
+        print(line, flush=True)
+    if multicast_push_ms is not None:
+        line = (
+            f"  {'fused multicast push':<26} {multicast_push_ms:8.3f} ms  "
+            f"{tflops_for(multicast_push_ms):8.2f} TFLOP/s"
+        )
+        if baseline_ms is not None:
+            line += f"  ({baseline_ms / multicast_push_ms:6.3f}x vs baseline)"
+        if mkernel_ms is not None:
+            verdict = "BEATS" if multicast_push_ms < mkernel_ms else "behind"
+            line += f"  {mkernel_ms / multicast_push_ms:6.3f}x vs fused pull ({verdict})"
         print(line, flush=True)
 
 def ag_gemm_blackwell_prepare(
@@ -837,6 +854,22 @@ def ag_gemm_blackwell_prepare(
         (config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16,
     )
 
+    # ---- fused multicast push comparison ----
+    # Slot r in this full-size multicast allocation receives rank r's local
+    # shard. Each rank publishes completion into its ordinary peer-visible flag.
+    run_config.multicast_push_a_dist = mod.DistBuffer(
+        (config.world_size, mk_local_m, config.default_k), dtype=torch.bfloat16,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
+    )
+    run_config.multicast_push_ready = mod.DistBuffer(
+        (1,), dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+    )
+    run_config.multicast_push_ready.data_.zero_()
+    run_config.multicast_push_c_buf = torch.zeros(
+        (config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16,
+    )
+
     # The fused kernel reads peer shards, and the multicast path requires every
     # rank's counter backing to be zero before its first replay. A bare host
     # barrier does not wait for the preceding stream-ordered fills/resets.
@@ -859,6 +892,13 @@ def ag_gemm_blackwell_prepare(
             run_config.multicast_c_buf, global_m,
         )
 
+    def run_multicast_push():
+        mod.ag_gemm_warp_specialized_multicast_push(
+            run_config.mkernel_a_dist, run_config.multicast_push_a_dist,
+            run_config.multicast_push_ready, run_config.mkernel_b_buf,
+            run_config.multicast_push_c_buf, global_m,
+        )
+
     # Build the logical reference before capture. Besides sharing one reference
     # between both candidates, torch.mm initializes cuBLAS outside graph capture.
     A_ref = torch.empty(
@@ -875,6 +915,11 @@ def ag_gemm_blackwell_prepare(
     torch.cuda.synchronize()
     dist.barrier()
 
+    # Initialize the multicast-push auxiliary stream before graph capture.
+    run_multicast_push()
+    torch.cuda.synchronize()
+    dist.barrier()
+
     mkernel_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(mkernel_graph):
         run_mkernel()
@@ -882,6 +927,10 @@ def ag_gemm_blackwell_prepare(
     multicast_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(multicast_graph):
         run_multicast_cublas()
+
+    multicast_push_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(multicast_push_graph):
+        run_multicast_push()
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -911,9 +960,21 @@ def ag_gemm_blackwell_prepare(
         C_ref,
     )
 
+    run_config.multicast_push_c_buf.zero_()
+    multicast_push_graph.replay()
+    torch.cuda.synchronize()
+    multicast_push_graph_ok = check_close(
+        f"multicast-push fused cudagraph {projection} M={global_m} N={logical_n}",
+        unpad_rows(
+            run_config.multicast_push_c_buf, run_config.logical_m, mk_local_m,
+            config.world_size, logical_n,
+        ),
+        C_ref,
+    )
+
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
-    graph_ok = mkernel_graph_ok and multicast_graph_ok
+    graph_ok = mkernel_graph_ok and multicast_graph_ok and multicast_push_graph_ok
     graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
     dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
     if not graph_vote.item():
@@ -934,8 +995,12 @@ def ag_gemm_blackwell_prepare(
     def bench_multicast_cublas():
         multicast_graph.replay()
 
+    def bench_multicast_push():
+        multicast_push_graph.replay()
+
     fns.append((bench_mkernel, "mkernel", True))
     fns.append((bench_multicast_cublas, "multicast_cublas", True))
+    fns.append((bench_multicast_push, "multicast_push", True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"

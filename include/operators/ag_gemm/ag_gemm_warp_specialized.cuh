@@ -47,7 +47,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
-          bool USE_MULTICAST_MEMCPY = false>
+          bool USE_MULTICAST_MEMCPY = false,
+          bool USE_MULTICAST_PUSH = false>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 
@@ -131,6 +132,8 @@ struct fused_globals {
 
     // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
+    uint32_t* A_copy_ready_peers[NUM_DEVICES];
+    comm::bf16* A_multicast_ptr;
     static constexpr uint32_t A_copy_epoch = 1;
 
     // Used only by USE_MULTICAST_MEMCPY. The first pointer is this rank's
@@ -190,6 +193,8 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .A_copy_ready = nullptr,
+            .A_copy_ready_peers = {},
+            .A_multicast_ptr = nullptr,
             .multicast_barrier = nullptr,
             .multicast_barrier_mc = nullptr,
             .dev_idx = dev_idx,
@@ -197,14 +202,19 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .N = N};
 }
 
-template <bool USE_MULTICAST_MEMCPY>
+template <bool USE_MULTICAST_MEMCPY, bool USE_MULTICAST_PUSH = false>
 void entrypoint_impl(dist::ParallelBuffer& A,
                      const at::Tensor& A_local_buf,
                      const at::Tensor& B,
                      at::Tensor& C,
                      const int logical_global_m,
                      int* multicast_barrier = nullptr,
-                     int* multicast_barrier_mc = nullptr) {
+                     int* multicast_barrier_mc = nullptr,
+                     uint32_t* A_copy_ready = nullptr,
+                     dist::ParallelBuffer* A_copy_ready_peers = nullptr,
+                     comm::bf16* A_multicast_ptr = nullptr) {
+    static_assert(!(USE_MULTICAST_MEMCPY && USE_MULTICAST_PUSH),
+                  "multicast memcpy + cuBLAS and multicast-push fused modes are exclusive");
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -223,6 +233,16 @@ void entrypoint_impl(dist::ParallelBuffer& A,
         fg globals = ag_gemm_warp_specialized_make_globals<
             ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>(
             A, A_local_buf, B, C, dev_idx, M, N);
+        globals.A_copy_ready = A_copy_ready;
+        if constexpr (USE_MULTICAST_PUSH) {
+            TORCH_CHECK(A_copy_ready_peers != nullptr,
+                        "multicast-push ready buffer must be provided");
+            for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
+                globals.A_copy_ready_peers[peer] =
+                    static_cast<uint32_t*>(A_copy_ready_peers->raw_ptrs_[peer]);
+            }
+        }
+        globals.A_multicast_ptr = A_multicast_ptr;
         globals.multicast_barrier = multicast_barrier;
         globals.multicast_barrier_mc = multicast_barrier_mc;
         launch_ag_gemm_warp_specialized<ROW_BLOCK,
@@ -230,7 +250,8 @@ void entrypoint_impl(dist::ParallelBuffer& A,
                                         NUM_CTA,
                                         SUPERGROUP_WIDTH,
                                         NUM_CONSUMER_WARPS,
-                                        USE_MULTICAST_MEMCPY>(globals);
+                                        USE_MULTICAST_MEMCPY,
+                                        USE_MULTICAST_PUSH>(globals);
     };
 
     // TODO: this only works for TP == 8
@@ -311,7 +332,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 const at::Tensor& B,
                 at::Tensor& C,
                 const int logical_global_m) {
-    entrypoint_impl<false>(A, A_local_buf, B, C, logical_global_m);
+    entrypoint_impl<false, false>(A, A_local_buf, B, C, logical_global_m);
 }
 
 // Multicast-copy baseline. A is a multicast DistBuffer containing the full
@@ -365,12 +386,80 @@ void entrypoint_multicast(dist::ParallelBuffer& A,
     TORCH_CHECK(barrier.data_.device() == A.data_.device(),
                 "multicast barrier must be on the same CUDA device as A");
 
-    entrypoint_impl<true>(A,
-                          A_local,
-                          B,
-                          C,
-                          logical_global_m,
-                          barrier.data_.data_ptr<int>(),
-                          static_cast<int*>(barrier.multicast_ptr_));
+    entrypoint_impl<true, false>(A,
+                                 A_local,
+                                 B,
+                                 C,
+                                 logical_global_m,
+                                 barrier.data_.data_ptr<int>(),
+                                 static_cast<int*>(barrier.multicast_ptr_));
+}
+
+// Fused multicast-push variant. Each rank broadcasts its local A shard into
+// gathered_A[rank], publishes ready[rank], computes its local shard first, and
+// waits on ready[peer] before consuming each remote shard.
+void entrypoint_multicast_push(dist::ParallelBuffer& A,
+                               dist::ParallelBuffer& gathered_A,
+                               dist::ParallelBuffer& ready,
+                               const at::Tensor& B,
+                               at::Tensor& C,
+                               const int logical_global_m) {
+    constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+    constexpr int K = fused_globals<128, 128>::K;
+
+    TORCH_CHECK(C.dim() == 3 && C.size(0) == NUM_DEVICES,
+                "C must have shape [NUM_DEVICES, local_M, N]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == K,
+                "B must have the pre-transposed shape [N, K]");
+    TORCH_CHECK(C.size(2) == B.size(0), "C's N dimension must match B.size(0)");
+    const int64_t local_M = C.size(1);
+
+    TORCH_CHECK(A.multicast_ && A.multicast_ptr_ != nullptr,
+                "multicast-push mode requires A to be a multicast DistBuffer");
+    TORCH_CHECK(A.dtype_ == at::kBFloat16 && A.data_.is_contiguous(),
+                "A must be contiguous bfloat16");
+    TORCH_CHECK(A.data_.dim() == 2 && A.data_.size(0) == local_M &&
+                    A.data_.size(1) == K,
+                "A must have shape [local_M, K]");
+
+    TORCH_CHECK(gathered_A.multicast_ && gathered_A.multicast_ptr_ != nullptr,
+                "gathered_A must be a multicast DistBuffer");
+    TORCH_CHECK(gathered_A.dtype_ == at::kBFloat16 && gathered_A.data_.is_contiguous(),
+                "gathered_A must be contiguous bfloat16");
+    TORCH_CHECK(gathered_A.data_.dim() == 3 &&
+                    gathered_A.data_.size(0) == NUM_DEVICES &&
+                    gathered_A.data_.size(1) == local_M &&
+                    gathered_A.data_.size(2) == K,
+                "gathered_A must have shape [NUM_DEVICES, local_M, K]");
+
+    TORCH_CHECK(!ready.multicast_, "ready must use ordinary peer mappings, not multicast");
+    TORCH_CHECK(ready.dtype_ == at::kInt && ready.data_.is_contiguous() &&
+                    ready.data_.numel() >= 1,
+                "ready needs one local int32 completion flag");
+    TORCH_CHECK(A.local_rank_ == gathered_A.local_rank_ &&
+                    A.local_rank_ == ready.local_rank_ &&
+                    A.local_world_size_ == gathered_A.local_world_size_ &&
+                    A.local_world_size_ == ready.local_world_size_,
+                "all multicast-push buffers must use the same local rank and world size");
+    TORCH_CHECK(A.data_.device() == gathered_A.data_.device() &&
+                    A.data_.device() == ready.data_.device() &&
+                    A.data_.device() == B.device() && A.data_.device() == C.device(),
+                "all multicast-push inputs must be on the same CUDA device");
+    TORCH_CHECK(B.scalar_type() == at::kBFloat16 && B.is_contiguous(),
+                "B must be contiguous bfloat16");
+    TORCH_CHECK(C.scalar_type() == at::kBFloat16 && C.is_contiguous(),
+                "C must be contiguous bfloat16");
+
+    entrypoint_impl<false, true>(
+        A,
+        gathered_A.data_,
+        B,
+        C,
+        logical_global_m,
+        nullptr,
+        nullptr,
+        nullptr,
+        &ready,
+        static_cast<comm::bf16*>(gathered_A.multicast_ptr_));
 }
 };  // namespace ag_gemm_warp_specialized
