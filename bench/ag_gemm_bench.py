@@ -12,12 +12,15 @@ CUTLASS_PATH=<path to cutlass root folder>
 THUNDERKITTENS_PATH=<path to TK root folder>
 USE_QUACK=<1 / 0, default 0>
 
+QUACK requires quack-kernels, nvidia-cutlass-dsl>=4.7, and
+apache-tvm-ffi>=0.1.10,<0.2 in the torchrun environment.
+
 E.g. THUNDERKITTENS_PATH=/home/ThunderKittens CUTLASS_PATH=/home/cutlass python -m torch.distributed.run \
     --standalone --nproc-per-node=8 ag_gemm_bench.py --arch blackwell --intranode-only
 """
 from __future__ import annotations
 
-import argparse, json, os, sys, time
+import argparse, inspect, json, os, sys, time
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -147,7 +150,6 @@ class BlackwellBenchConfig:
     quack_large_tile_m = (256, 512)
     quack_supported_tile_m = (128, 256)
     quack_tile_n = 256
-    quack_graph_calls = 4
 
 @dataclass
 class BlackwellBenchVars:
@@ -1157,6 +1159,18 @@ def ag_gemm_blackwell_prepare(
         try:
             from quack.distributed import AllGatherRunner
             from quack.gemm import gemm as quack_gemm
+            from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+
+            # CUTLASS DSL passes this keyword while building QUACK's TVM-FFI
+            # launch wrapper. It was added in apache-tvm-ffi 0.1.10; older
+            # versions import successfully but fail only at the first JIT.
+            if "map_dataclass_to_tuple" not in inspect.signature(
+                make_kwargs_wrapper
+            ).parameters:
+                raise RuntimeError(
+                    "incompatible apache-tvm-ffi; install "
+                    "'apache-tvm-ffi>=0.1.10,<0.2'"
+                )
         except Exception as exc:
             quack_ok = False
             quack_why = f"{type(exc).__name__}: {exc}"
@@ -1244,8 +1258,9 @@ def ag_gemm_blackwell_prepare(
                             ag_args=ag_args,
                         )
 
-                # Compile the candidate, initialize its runner, then capture
-                # the same four-call graph used by the final benchmark.
+                # Compile the candidate and initialize its runner before graph
+                # capture. One replay is one logical AG+GEMM, matching the
+                # other candidates in this cross-implementation benchmark.
                 for _ in range(2):
                     run_quack()
                 torch.cuda.synchronize()
@@ -1253,8 +1268,7 @@ def ag_gemm_blackwell_prepare(
 
                 quack_graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(quack_graph):
-                    for _ in range(config.quack_graph_calls):
-                        run_quack()
+                    run_quack()
 
                 torch.cuda.synchronize()
                 dist.barrier()
@@ -1288,7 +1302,7 @@ def ag_gemm_blackwell_prepare(
                     quack_graph.replay,
                     tune_warmup,
                     tune_iterations,
-                ) / config.quack_graph_calls
+                )
                 quack_candidates.append(
                     {
                         "tile_m": quack_tile_m,
@@ -1323,8 +1337,7 @@ def ag_gemm_blackwell_prepare(
                 print(
                     f"  QUACK config {projection} M={global_m}: "
                     f"tile={best_quack['tile_m']}x{config.quack_tile_n} "
-                    f"cluster={best_quack['cluster_m']}x1 "
-                    f"graph_calls={config.quack_graph_calls} (autotuned)",
+                    f"cluster={best_quack['cluster_m']}x1 (autotuned)",
                     flush=True,
                 )
                 for candidate in sorted(
@@ -1347,13 +1360,11 @@ def ag_gemm_blackwell_prepare(
                     )
 
             def bench_quack():
-                # benchmark_cuda returns time per graph replay; each replay
-                # contains quack_graph_calls logical AG+GEMM iterations.
                 return benchmark_cuda(
                     run_config.quack_graph.replay,
                     warmup,
                     iters,
-                ) / config.quack_graph_calls
+                )
 
             fns.append((bench_quack, "quack", False))
 
