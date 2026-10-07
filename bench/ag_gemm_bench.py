@@ -180,6 +180,12 @@ class BlackwellBenchVars:
     multicast_push_ready: DistBufferLike | None = None
     multicast_push_c_buf: torch.Tensor | None = None
 
+    # QuACK-style unicast CE-push comparison args
+    ce_push_a_dist: DistBufferLike | None = None
+    ce_push_ready: DistBufferLike | None = None
+    ce_push_epoch: torch.Tensor | None = None
+    ce_push_c_buf: torch.Tensor | None = None
+
     # TK specific args
     tk_padded_m: int | None = None
     tk_padded_n: int | None = None
@@ -719,6 +725,7 @@ def report_blackwell_result(
     quack_ms = ms_by_name.get("quack")
     mkernel_ms = ms_by_name.get("mkernel")
     multicast_push_ms = ms_by_name.get("multicast_push")
+    ce_push_ms = ms_by_name.get("ce_push")
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -783,6 +790,20 @@ def report_blackwell_result(
         if mkernel_ms is not None:
             verdict = "BEATS" if multicast_push_ms < mkernel_ms else "behind"
             line += f"  {mkernel_ms / multicast_push_ms:6.3f}x vs fused pull ({verdict})"
+        print(line, flush=True)
+    if ce_push_ms is not None:
+        line = (
+            f"  {'QuACK-style CE push':<26} {ce_push_ms:8.3f} ms  "
+            f"{tflops_for(ce_push_ms):8.2f} TFLOP/s"
+        )
+        if baseline_ms is not None:
+            line += f"  ({baseline_ms / ce_push_ms:6.3f}x vs baseline)"
+        if mkernel_ms is not None:
+            verdict = "BEATS" if ce_push_ms < mkernel_ms else "behind"
+            line += f"  {mkernel_ms / ce_push_ms:6.3f}x vs fused pull ({verdict})"
+        if quack_ms is not None:
+            verdict = "BEATS" if ce_push_ms < quack_ms else "behind"
+            line += f"  {quack_ms / ce_push_ms:6.3f}x vs QUACK ({verdict})"
         print(line, flush=True)
 
 def ag_gemm_blackwell_prepare(
@@ -867,6 +888,24 @@ def ag_gemm_blackwell_prepare(
         (config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16,
     )
 
+    # ---- QuACK-style CE push comparison ----
+    # Each owner writes its shard into slot [owner] of every peer's ordinary
+    # gathered buffer, then D2D-copies its device epoch into that peer's
+    # ready[owner]. The kernel consumes local-first in the matching ring order.
+    run_config.ce_push_a_dist = mod.DistBuffer(
+        (config.world_size, mk_local_m, config.default_k), dtype=torch.bfloat16,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+    )
+    run_config.ce_push_ready = mod.DistBuffer(
+        (config.world_size,), dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+    )
+    run_config.ce_push_ready.data_.zero_()
+    run_config.ce_push_epoch = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    run_config.ce_push_c_buf = torch.zeros(
+        (config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16,
+    )
+
     # The fused kernel reads peer shards, and the multicast path requires every
     # rank's counter backing to be zero before its first replay. A bare host
     # barrier does not wait for the preceding stream-ordered fills/resets.
@@ -889,6 +928,13 @@ def ag_gemm_blackwell_prepare(
             run_config.multicast_push_c_buf, global_m,
         )
 
+    def run_ce_push():
+        mod.ag_gemm_warp_specialized_ce_push(
+            run_config.mkernel_a_dist, run_config.ce_push_a_dist,
+            run_config.ce_push_ready, run_config.ce_push_epoch,
+            run_config.mkernel_b_buf, run_config.ce_push_c_buf, global_m,
+        )
+
     # Build the logical reference before capture. Besides sharing one reference
     # between both candidates, torch.mm initializes cuBLAS outside graph capture.
     A_ref = torch.empty(
@@ -899,8 +945,9 @@ def ag_gemm_blackwell_prepare(
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Initialize the multicast-push auxiliary stream before graph capture.
+    # Initialize both push modes' auxiliary stream before graph capture.
     run_multicast_push()
+    run_ce_push()
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -911,6 +958,10 @@ def ag_gemm_blackwell_prepare(
     multicast_push_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(multicast_push_graph):
         run_multicast_push()
+
+    ce_push_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(ce_push_graph):
+        run_ce_push()
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -940,9 +991,21 @@ def ag_gemm_blackwell_prepare(
         C_ref,
     )
 
+    run_config.ce_push_c_buf.zero_()
+    ce_push_graph.replay()
+    torch.cuda.synchronize()
+    ce_push_graph_ok = check_close(
+        f"QuACK-style CE-push cudagraph {projection} M={global_m} N={logical_n}",
+        unpad_rows(
+            run_config.ce_push_c_buf, run_config.logical_m, mk_local_m,
+            config.world_size, logical_n,
+        ),
+        C_ref,
+    )
+
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
-    graph_ok = mkernel_graph_ok and multicast_push_graph_ok
+    graph_ok = mkernel_graph_ok and multicast_push_graph_ok and ce_push_graph_ok
     graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
     dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
     if not graph_vote.item():
@@ -963,8 +1026,12 @@ def ag_gemm_blackwell_prepare(
     def bench_multicast_push():
         multicast_push_graph.replay()
 
+    def bench_ce_push():
+        ce_push_graph.replay()
+
     fns.append((bench_mkernel, "mkernel", True))
     fns.append((bench_multicast_push, "multicast_push", True))
+    fns.append((bench_ce_push, "ce_push", True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"

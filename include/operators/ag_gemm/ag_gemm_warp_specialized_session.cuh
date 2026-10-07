@@ -29,4 +29,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"),
           pybind11::arg("C"),
           pybind11::arg("logical_global_m"));
+    m.def("ag_gemm_warp_specialized_ce_push",
+          &ag_gemm_warp_specialized::entrypoint_ce_push,
+          pybind11::arg("A"),
+          pybind11::arg("gathered_A"),
+          pybind11::arg("ready"),
+          pybind11::arg("epoch"),
+          pybind11::arg("B"),
+          pybind11::arg("C"),
+          pybind11::arg("logical_global_m"));
 }

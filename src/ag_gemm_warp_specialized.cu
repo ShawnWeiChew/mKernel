@@ -96,6 +96,12 @@ __global__ void multicast_copy_barrier_kernel(int* local_barrier, int* multicast
     comm::atomic_u32::release_store_gpu(local_barrier, 0U);
 }
 
+__global__ void bump_copy_epoch_kernel(uint32_t* epoch) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *epoch += 1U;
+    }
+}
+
 // tcgen05 MMA with the CTA group taken from the config. mm2_AB / mma2_AB are
 // hardwired to a 2-CTA group, so spell out the ncta template argument instead.
 // B_tile is stored [N, K] (see fused_globals::B_tile), so this is really an
@@ -142,7 +148,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          bool USE_MULTICAST_PUSH>
+          bool USE_MULTICAST_PUSH,
+          bool USE_CE_PUSH>
 __device__ __forceinline__ void ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
@@ -223,12 +230,21 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         const bool is_local = actual_target_device == G.dev_idx;
 
         // Multicast push polls the source rank's ordinary ready allocation via
-        // its imported peer pointer. The original peer-pull path polls a flag
-        // written into this GPU's local copy-state allocation.
+        // its imported peer pointer. CE push polls this receiver's local flag
+        // array, remotely committed by each source after its data copy. The
+        // original peer-pull path polls a locally committed flag too, but only
+        // needs GPU scope because both the data and flag originate here.
         if (!is_local) {
             if constexpr (USE_MULTICAST_PUSH) {
                 while (comm::atomic_u32::acquire_load_sys(
                            G.A_copy_ready_peers[actual_target_device]) < fg::A_copy_epoch) {
+                    __nanosleep(16);
+                }
+            } else if constexpr (USE_CE_PUSH) {
+                const uint32_t expected_epoch =
+                    comm::atomic_u32::acquire_load_gpu(G.A_copy_epoch_ptr);
+                while (comm::atomic_u32::acquire_load_gpu(
+                           &G.A_copy_ready[actual_target_device]) < expected_epoch) {
                     __nanosleep(16);
                 }
             } else {
@@ -580,7 +596,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          bool USE_MULTICAST_PUSH>
+          bool USE_MULTICAST_PUSH,
+          bool USE_CE_PUSH>
 __global__ __cluster_dims__(
     fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
@@ -594,7 +611,8 @@ __global__ __cluster_dims__(
                              _NUM_CTA,
                              SUPERGROUP_WIDTH,
                              _NUM_CONSUMER_WARPS,
-                             USE_MULTICAST_PUSH>(G);
+                             USE_MULTICAST_PUSH,
+                             USE_CE_PUSH>(G);
 }
 
 template <int _ROW_BLOCK,
@@ -603,15 +621,19 @@ template <int _ROW_BLOCK,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
           bool USE_MULTICAST_MEMCPY,
-          bool USE_MULTICAST_PUSH>
+          bool USE_MULTICAST_PUSH,
+          bool USE_CE_PUSH>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
-    static_assert(!(USE_MULTICAST_MEMCPY && USE_MULTICAST_PUSH),
-                  "multicast memcpy + cuBLAS and multicast-push fused modes are exclusive");
+    static_assert(static_cast<int>(USE_MULTICAST_MEMCPY) +
+                          static_cast<int>(USE_MULTICAST_PUSH) +
+                          static_cast<int>(USE_CE_PUSH) <=
+                      1,
+                  "AG transport modes are mutually exclusive");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
     if constexpr (USE_MULTICAST_PUSH) {
@@ -619,6 +641,14 @@ inline void launch_ag_gemm_warp_specialized(
                     "multicast-push pointers must be provided");
         MKERNEL_CUDACHECK(
             cudaMemsetAsync(G.A_copy_ready_peers[G.dev_idx], 0, sizeof(uint32_t), stream));
+    } else if constexpr (USE_CE_PUSH) {
+        TORCH_CHECK(G.A_copy_ready != nullptr && G.A_copy_epoch_ptr != nullptr,
+                    "CE-push local ready and epoch pointers must be provided");
+        TORCH_CHECK(G.A_copy_ready_peers[G.dev_idx] != nullptr &&
+                        G.A_gathered_peers[G.dev_idx] != nullptr,
+                    "CE-push peer pointers must be provided");
+        bump_copy_epoch_kernel<<<1, 1, 0, stream>>>(G.A_copy_epoch_ptr);
+        MKERNEL_CUDACHECK(cudaGetLastError());
     }
 
     // Preserve this rank's caller-stream ordering and make the auxiliary copy
@@ -640,6 +670,28 @@ inline void launch_ag_gemm_warp_specialized(
                                  reinterpret_cast<CUdeviceptr>(G.A_copy_ready_peers[G.dev_idx]),
                                  fg::A_copy_epoch,
                                  CU_STREAM_WRITE_VALUE_DEFAULT));
+    } else if constexpr (USE_CE_PUSH) {
+        const auto* src = G.A[G.dev_idx].raw_ptr;
+        const size_t my_offset = static_cast<size_t>(G.dev_idx) * shard_elements;
+
+        // QuACK's reverse ring: source r sends to r-1 first, so every receiver
+        // gets the next shard in its local-first rotated consumption order.
+#pragma unroll
+        for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+            const int peer = (G.dev_idx - distance + fg::NUM_DEVICES) % fg::NUM_DEVICES;
+            auto* dst = G.A_gathered_peers[peer] + my_offset;
+
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(
+                dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+
+            // Same CE stream, immediately after the payload: observing this
+            // remote flag implies that peer's local-HBM shard copy is complete.
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready_peers[peer] + G.dev_idx,
+                                              G.A_copy_epoch_ptr,
+                                              sizeof(uint32_t),
+                                              cudaMemcpyDeviceToDevice,
+                                              copy_state.stream));
+        }
     } else {
         MKERNEL_CUDACHECK(
             cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
@@ -676,7 +728,8 @@ inline void launch_ag_gemm_warp_specialized(
                                          _NUM_CTA,
                                          SUPERGROUP_WIDTH,
                                          _NUM_CONSUMER_WARPS,
-                                         USE_MULTICAST_PUSH>;
+                                         USE_MULTICAST_PUSH,
+                                         USE_CE_PUSH>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
