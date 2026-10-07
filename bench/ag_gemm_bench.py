@@ -1186,7 +1186,15 @@ def ag_gemm_blackwell_prepare(
                     flush=True,
                 )
         else:
-            run_config.quack_b_transposed = B_ref.T.contiguous()
+            # CuTe requires BF16 matrix leading dimensions to be 16-byte
+            # aligned. In particular KDA's logical N=6284 would give a
+            # row-major D stride of 6284, which is not divisible by 8 BF16
+            # elements. Pad B/D in N and slice back to logical_n for checking
+            # and useful-TFLOP/s reporting, just like the other candidates.
+            quack_n = round_up(run_config.logical_n, 16)
+            run_config.quack_b_transposed = pad_cols(
+                config, B_ref, quack_n
+            ).T.contiguous()
             requested_tile_ms = (
                 config.quack_small_tile_m
                 if global_m < 8192
@@ -1229,7 +1237,7 @@ def ag_gemm_blackwell_prepare(
                 quack_m = quack_local_m * config.world_size
                 quack_a_local = pad_rows(config, A_local, quack_local_m)
                 quack_c_buf = torch.zeros(
-                    (quack_m, run_config.logical_n),
+                    (quack_m, quack_n),
                     device="cuda",
                     dtype=torch.bfloat16,
                 )
@@ -1278,7 +1286,7 @@ def ag_gemm_blackwell_prepare(
                 torch.cuda.synchronize()
                 quack_graph_ok = check_close(
                     f"QUACK cudagraph {projection} M={global_m} N={logical_n} "
-                    f"tile_m={quack_tile_m} padded_m={quack_m} "
+                    f"tile_m={quack_tile_m} padded_m={quack_m} padded_n={quack_n} "
                     f"cluster_m={quack_cluster_m}",
                     unpad_rows(
                         quack_c_buf,
@@ -1309,6 +1317,7 @@ def ag_gemm_blackwell_prepare(
                         "cluster_m": quack_cluster_m,
                         "local_m": quack_local_m,
                         "padded_m": quack_m,
+                        "padded_n": quack_n,
                         "a_local": quack_a_local,
                         "c_buf": quack_c_buf,
                         "runner": quack_runner,
@@ -1353,7 +1362,8 @@ def ag_gemm_blackwell_prepare(
                     print(
                         f"    [autotune] tile={candidate['tile_m']}x"
                         f"{config.quack_tile_n} cluster={candidate['cluster_m']}x1 "
-                        f"padded_m={candidate['padded_m']}: "
+                        f"padded_m={candidate['padded_m']} "
+                        f"padded_n={candidate['padded_n']}: "
                         f"{candidate['ms']:8.3f} ms  "
                         f"{tune_tflops:8.2f} TFLOP/s{mark}",
                         flush=True,
