@@ -49,6 +49,7 @@ namespace {
 struct ACopyPipelineState {
     cudaStream_t stream = nullptr;
     cudaEvent_t main_pre_event = nullptr;
+    uint32_t* ready = nullptr;
     cudaEvent_t copy_completion = nullptr;
     bool initialized = false;
 };
@@ -60,12 +61,13 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     if (!state.initialized) {
         // The first call may happen inside a CUDA graph capture (no eager
         // warmup). None of these calls enqueue stream work, so relax this
-        // thread's capture mode while creating the process-lifetime resources.
+        // thread's capture mode to keep cudaMalloc from invalidating the capture.
         cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeRelaxed;
         MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.main_pre_event, cudaEventDisableTiming));
         MKERNEL_CUDACHECK(cudaEventCreateWithFlags(&state.copy_completion, cudaEventDisableTiming));
+        MKERNEL_CUDACHECK(cudaMalloc(&state.ready, INTRA_NUM_DEVICES * sizeof(uint32_t)));
         MKERNEL_CUDACHECK(cudaThreadExchangeStreamCaptureMode(&capture_mode));
         state.initialized = true;
     }
@@ -590,9 +592,6 @@ inline void launch_ag_gemm_warp_specialized(
     if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
         MKERNEL_CUDACHECK(
             cudaMemsetAsync(G.A_copy_ready_peers[G.dev_idx], 0, sizeof(uint32_t), stream));
-    } else {
-        MKERNEL_CUDACHECK(
-            cudaMemsetAsync(G.A_copy_ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
     }
 
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
@@ -600,6 +599,7 @@ inline void launch_ag_gemm_warp_specialized(
 
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+    fg launch_G = G;
 
     if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
         auto* dst = G.A_multicast_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
@@ -612,6 +612,10 @@ inline void launch_ag_gemm_warp_specialized(
                                  fg::A_copy_epoch,
                                  CU_STREAM_WRITE_VALUE_DEFAULT));
     } else {
+        MKERNEL_CUDACHECK(
+            cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
+        launch_G.A_copy_ready = copy_state.ready;
+
         // Stage one complete shard per remote device in the same ring order
         // used by the persistent kernel. The local shard is read directly.
 #pragma unroll
@@ -628,7 +632,7 @@ inline void launch_ag_gemm_warp_specialized(
             // scope because it reads a flag and payload resident on this device.
             MKERNEL_CUCHECK(
                 cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                     reinterpret_cast<CUdeviceptr>(G.A_copy_ready + peer),
+                                     reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
                                      fg::A_copy_epoch,
                                      CU_STREAM_WRITE_VALUE_DEFAULT));
         }
@@ -660,7 +664,7 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.attrs = &pdl_attr;
     launch_config.numAttrs = 1;
 
-    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
+    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
 
     // Have the copy stream join the main stream again for graph capture.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));

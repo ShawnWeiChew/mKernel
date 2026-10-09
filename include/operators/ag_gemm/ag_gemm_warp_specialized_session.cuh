@@ -9,6 +9,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ag_gemm_warp_specialized",
           &ag_gemm_warp_specialized::entrypoint,
           pybind11::arg("A"),
+          pybind11::arg("A_pull_buf"),
           pybind11::arg("A_gathered"),
           pybind11::arg("A_copy_ready"),
           pybind11::arg("B"),

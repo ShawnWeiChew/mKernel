@@ -199,6 +199,7 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
 }
 
 void entrypoint(dist::ParallelBuffer& A,
+                const at::Tensor& A_pull_buf,
                 dist::ParallelBuffer& A_gathered,
                 dist::ParallelBuffer& A_copy_ready,
                 const at::Tensor& B,
@@ -220,19 +221,19 @@ void entrypoint(dist::ParallelBuffer& A,
                       int NUM_CONSUMER_WARPS,
                       AgStrategy STRATEGY>() {
         using fg = fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>;
+        const at::Tensor& A_staging =
+            STRATEGY == AgStrategy::MULTICAST_PUSH ? A_gathered.data_ : A_pull_buf;
         fg globals = ag_gemm_warp_specialized_make_globals<ROW_BLOCK,
                                                            COL_BLOCK,
                                                            NUM_CTA,
                                                            NUM_CONSUMER_WARPS>(
-            A, A_gathered.data_, B, C, dev_idx, M, N);
+            A, A_staging, B, C, dev_idx, M, N);
         if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
             for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
                 globals.A_copy_ready_peers[peer] =
                     static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[peer]);
             }
             globals.A_multicast_ptr = static_cast<comm::bf16*>(A_gathered.multicast_ptr_);
-        } else {
-            globals.A_copy_ready = static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[dev_idx]);
         }
         launch_ag_gemm_warp_specialized<ROW_BLOCK,
                                         COL_BLOCK,

@@ -171,6 +171,7 @@ class BlackwellBenchVars:
     mkernel_padded_m: int | None = None
     mkernel_padded_n: int | None = None
     mkernel_a_dist: DistBufferLike | None = None
+    mkernel_a_pull_buf: torch.Tensor | None = None
     mkernel_a_gathered: DistBufferLike | None = None
     mkernel_a_copy_ready: DistBufferLike | None = None
     mkernel_b_buf: torch.Tensor | None = None
@@ -570,6 +571,10 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             multicast=True,
         )
         A_kernel.data_.copy_(pad_rows(config, A_ref_local, padded_local_m))
+        A_pull_buf = torch.empty(
+            (config.world_size, padded_local_m, config.default_k),
+            device="cuda", dtype=torch.bfloat16,
+        )
         A_gathered = mod.DistBuffer(
             (config.world_size, padded_local_m, config.default_k),
             dtype=torch.bfloat16,
@@ -578,11 +583,10 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             multicast=True,
         )
         A_copy_ready = mod.DistBuffer(
-            (config.world_size,), dtype=torch.int32,
+            (1,), dtype=torch.int32,
             local_rank=config.local_rank,
             local_world_size=config.world_size,
             multicast=False,
-            backing="cuda_malloc",
         )
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
@@ -600,7 +604,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
 
         C_kernel.zero_()
         mod.ag_gemm_warp_specialized(
-            A_kernel, A_gathered, A_copy_ready, B_kernel, C_kernel, m
+            A_kernel, A_pull_buf, A_gathered, A_copy_ready, B_kernel, C_kernel, m
         )
         torch.cuda.synchronize()
 
@@ -704,7 +708,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             del A_tk, B_tk_transposed, tk_barrier
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_gathered, A_copy_ready, B_kernel, C_kernel
+        del A_kernel, A_pull_buf, A_gathered, A_copy_ready, B_kernel, C_kernel
         dist.barrier()
 
     if not all_correct:
@@ -842,16 +846,18 @@ def ag_gemm_blackwell_prepare(
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
     run_config.mkernel_a_dist.data_.copy_(A_mk_local)
-    # One gathered allocation serves both dispatches: multicast push writes
-    # through its multicast VA, while pull stages peer shards in its local VA.
+    run_config.mkernel_a_pull_buf = torch.empty(
+        (config.world_size, mk_local_m, config.default_k),
+        device="cuda", dtype=torch.bfloat16,
+    )
     run_config.mkernel_a_gathered = mod.DistBuffer(
         (config.world_size, mk_local_m, config.default_k), dtype=torch.bfloat16,
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
     run_config.mkernel_a_copy_ready = mod.DistBuffer(
-        (config.world_size,), dtype=torch.int32,
+        (1,), dtype=torch.int32,
         local_rank=config.local_rank, local_world_size=config.world_size,
-        multicast=False, backing="cuda_malloc",
+        multicast=False,
     )
     run_config.mkernel_a_copy_ready.data_.zero_()
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
@@ -867,7 +873,8 @@ def ag_gemm_blackwell_prepare(
 
     def run_mkernel():
         mod.ag_gemm_warp_specialized(
-            run_config.mkernel_a_dist, run_config.mkernel_a_gathered,
+            run_config.mkernel_a_dist, run_config.mkernel_a_pull_buf,
+            run_config.mkernel_a_gathered,
             run_config.mkernel_a_copy_ready,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
         )
@@ -879,11 +886,6 @@ def ag_gemm_blackwell_prepare(
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Initialize the auxiliary copy stream before graph capture.
-    run_mkernel()
     torch.cuda.synchronize()
     dist.barrier()
 
