@@ -31,6 +31,11 @@ namespace ag_gemm_warp_specialized {
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 1;
+static constexpr int MIN_LARGE_GEMM_N = 6288;
+enum class AgStrategy {
+    PULL,
+    MULTICAST_PUSH,
+};
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
@@ -47,9 +52,7 @@ template <int _ROW_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
-          bool USE_MULTICAST_MEMCPY = false,
-          bool USE_MULTICAST_PUSH = false,
-          bool USE_CE_PUSH = false>
+          AgStrategy STRATEGY = AgStrategy::PULL>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 
@@ -134,16 +137,8 @@ struct fused_globals {
     // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
     uint32_t* A_copy_ready_peers[NUM_DEVICES];
-    comm::bf16* A_gathered_peers[NUM_DEVICES];
-    uint32_t* A_copy_epoch_ptr;
     comm::bf16* A_multicast_ptr;
     static constexpr uint32_t A_copy_epoch = 1;
-
-    // Used only by USE_MULTICAST_MEMCPY. The first pointer is this rank's
-    // ordinary mapping and the second is the multicast VA for the same int32
-    // counter.
-    int* multicast_barrier;
-    int* multicast_barrier_mc;
 
     int dev_idx;
     int M;
@@ -197,36 +192,18 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
             .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
             .A_copy_ready = nullptr,
             .A_copy_ready_peers = {},
-            .A_gathered_peers = {},
-            .A_copy_epoch_ptr = nullptr,
             .A_multicast_ptr = nullptr,
-            .multicast_barrier = nullptr,
-            .multicast_barrier_mc = nullptr,
             .dev_idx = dev_idx,
             .M = M,
             .N = N};
 }
 
-template <bool USE_MULTICAST_MEMCPY,
-          bool USE_MULTICAST_PUSH = false,
-          bool USE_CE_PUSH = false>
-void entrypoint_impl(dist::ParallelBuffer& A,
-                     const at::Tensor& A_local_buf,
-                     const at::Tensor& B,
-                     at::Tensor& C,
-                     const int logical_global_m,
-                     int* multicast_barrier = nullptr,
-                     int* multicast_barrier_mc = nullptr,
-                     uint32_t* A_copy_ready = nullptr,
-                     dist::ParallelBuffer* A_copy_ready_peers = nullptr,
-                     comm::bf16* A_multicast_ptr = nullptr,
-                     dist::ParallelBuffer* A_gathered_peers = nullptr,
-                     uint32_t* A_copy_epoch_ptr = nullptr) {
-    static_assert(static_cast<int>(USE_MULTICAST_MEMCPY) +
-                          static_cast<int>(USE_MULTICAST_PUSH) +
-                          static_cast<int>(USE_CE_PUSH) <=
-                      1,
-                  "AG transport modes are mutually exclusive");
+void entrypoint(dist::ParallelBuffer& A,
+                dist::ParallelBuffer& A_gathered,
+                dist::ParallelBuffer& A_copy_ready,
+                const at::Tensor& B,
+                at::Tensor& C,
+                const int logical_global_m) {
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
@@ -240,74 +217,61 @@ void entrypoint_impl(dist::ParallelBuffer& A,
                       int COL_BLOCK,
                       int NUM_CTA,
                       int SUPERGROUP_WIDTH,
-                      int NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>() {
+                      int NUM_CONSUMER_WARPS,
+                      AgStrategy STRATEGY>() {
         using fg = fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>;
-        fg globals = ag_gemm_warp_specialized_make_globals<
-            ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>(
-            A, A_local_buf, B, C, dev_idx, M, N);
-        globals.A_copy_ready = A_copy_ready;
-        if constexpr (USE_MULTICAST_PUSH || USE_CE_PUSH) {
-            TORCH_CHECK(A_copy_ready_peers != nullptr,
-                        "push ready buffer must be provided");
+        fg globals = ag_gemm_warp_specialized_make_globals<ROW_BLOCK,
+                                                           COL_BLOCK,
+                                                           NUM_CTA,
+                                                           NUM_CONSUMER_WARPS>(
+            A, A_gathered.data_, B, C, dev_idx, M, N);
+        if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
             for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
                 globals.A_copy_ready_peers[peer] =
-                    static_cast<uint32_t*>(A_copy_ready_peers->raw_ptrs_[peer]);
+                    static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[peer]);
             }
+            globals.A_multicast_ptr = static_cast<comm::bf16*>(A_gathered.multicast_ptr_);
+        } else {
+            globals.A_copy_ready = static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[dev_idx]);
         }
-        if constexpr (USE_CE_PUSH) {
-            TORCH_CHECK(A_gathered_peers != nullptr,
-                        "CE-push gathered buffer must be provided");
-            for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
-                globals.A_gathered_peers[peer] =
-                    static_cast<comm::bf16*>(A_gathered_peers->raw_ptrs_[peer]);
-            }
-        }
-        globals.A_copy_epoch_ptr = A_copy_epoch_ptr;
-        globals.A_multicast_ptr = A_multicast_ptr;
-        globals.multicast_barrier = multicast_barrier;
-        globals.multicast_barrier_mc = multicast_barrier_mc;
         launch_ag_gemm_warp_specialized<ROW_BLOCK,
                                         COL_BLOCK,
                                         NUM_CTA,
                                         SUPERGROUP_WIDTH,
                                         NUM_CONSUMER_WARPS,
-                                        USE_MULTICAST_MEMCPY,
-                                        USE_MULTICAST_PUSH,
-                                        USE_CE_PUSH>(globals);
+                                        STRATEGY>(globals);
     };
 
     // TODO: this only works for TP == 8
-    constexpr int MIN_LARGE_GEMM_N = 6288;
-
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
         switch (logical_global_m) {
             case 2048: {
-                launch.template operator()<128, 128, 2, 15>();
+                launch.template operator()<128, 128, 2, 15, 1, AgStrategy::PULL>();
                 break;
             }
             case 3072: {
-                launch.template operator()<128, 256, 2, 15>();
+                launch.template operator()<128, 256, 2, 15, 1, AgStrategy::PULL>();
                 break;
             }
             case 3584: {
-                launch.template operator()<128, 256, 2, 20>();
+                launch.template operator()<128, 256, 2, 20, 1, AgStrategy::PULL>();
                 break;
             }
             case 4096: {
-                launch.template operator()<128, 256, 2, 5>();
+                launch.template operator()<128, 256, 2, 5, 1, AgStrategy::PULL>();
                 break;
             }
             case 8192: {
-                launch.template operator()<128, 256, 2, 5, 2>();
+                launch.template operator()<128, 256, 2, 5, 2, AgStrategy::PULL>();
                 break;
             }
             case 16384: {
-                launch.template operator()<128, 256, 2, 5, 2>();
+                launch.template operator()<128, 256, 2, 5, 2, AgStrategy::PULL>();
                 break;
             }
             case 32768: {
-                launch.template operator()<128, 256, 2, 5, 2>();
+                launch.template operator()<128, 256, 2, 5, 2, AgStrategy::PULL>();
                 break;
             }
             default:
@@ -316,246 +280,36 @@ void entrypoint_impl(dist::ParallelBuffer& A,
     } else {
         switch (logical_global_m) {
             case 2048: {
-                launch.template operator()<128, 128, 2, 25>();
+                launch.template operator()<128, 128, 2, 25, 1, AgStrategy::MULTICAST_PUSH>();
                 break;
             }
             case 3072: {
-                launch.template operator()<128, 128, 1, 20>();
+                launch.template operator()<128, 128, 1, 20, 1, AgStrategy::MULTICAST_PUSH>();
                 break;
             }
             case 3584: {
-                launch.template operator()<128, 256, 2, 10>();
+                launch.template operator()<128, 256, 2, 10, 1, AgStrategy::MULTICAST_PUSH>();
                 break;
             }
             case 4096: {
-                launch.template operator()<128, 256, 2, 10>();
+                launch.template operator()<128, 256, 2, 10, 1, AgStrategy::MULTICAST_PUSH>();
                 break;
             }
             case 8192: {
-                launch.template operator()<128, 256, 2, 10>();
+                launch.template operator()<128, 256, 2, 10, 1, AgStrategy::PULL>();
                 break;
             }
             case 16384: {
-                launch.template operator()<128, 256, 2, 15>();
+                launch.template operator()<128, 256, 2, 15, 1, AgStrategy::PULL>();
                 break;
             }
             case 32768: {
-                launch.template operator()<128, 256, 2, 15>();
+                launch.template operator()<128, 256, 2, 15, 1, AgStrategy::PULL>();
                 break;
             }
             default:
                 TORCH_CHECK(false, "ag_gemm_warp_specialized: no tile config for M=", M, " N=", N);
         }
     }
-}
-
-void entrypoint(dist::ParallelBuffer& A,
-                const at::Tensor& A_local_buf,
-                const at::Tensor& B,
-                at::Tensor& C,
-                const int logical_global_m) {
-    entrypoint_impl<false, false, false>(A, A_local_buf, B, C, logical_global_m);
-}
-
-// Multicast-copy baseline. A is a multicast DistBuffer containing the full
-// [global_M, K] gather destination, while A_local is this rank's
-// [global_M / NUM_DEVICES, K] source shard. barrier is a zero-initialized,
-// multicast int32 DistBuffer with at least one element.
-void entrypoint_multicast(dist::ParallelBuffer& A,
-                          const at::Tensor& A_local,
-                          dist::ParallelBuffer& barrier,
-                          const at::Tensor& B,
-                          at::Tensor& C,
-                          const int logical_global_m) {
-    constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    constexpr int K = fused_globals<128, 128>::K;
-
-    TORCH_CHECK(C.dim() == 3 && C.size(0) == NUM_DEVICES,
-                "C must have shape [NUM_DEVICES, local_M, N]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == K,
-                "B must have the pre-transposed shape [N, K]");
-    TORCH_CHECK(C.size(2) == B.size(0), "C's N dimension must match B.size(0)");
-    const int64_t M = C.size(0) * C.size(1);
-
-    TORCH_CHECK(A.multicast_ && A.multicast_ptr_ != nullptr,
-                "multicast mode requires A to be a multicast DistBuffer");
-    TORCH_CHECK(A.local_rank_ == barrier.local_rank_ &&
-                    A.local_world_size_ == barrier.local_world_size_,
-                "A and barrier must use the same local rank and world size");
-    TORCH_CHECK(A.dtype_ == at::kBFloat16 && A.data_.is_contiguous(),
-                "multicast A must be contiguous bfloat16");
-    TORCH_CHECK(A.data_.dim() == 2 && A.data_.size(0) == M && A.data_.size(1) == K,
-                "multicast A must have shape [global_M, K]");
-    TORCH_CHECK(M % NUM_DEVICES == 0, "global M must divide evenly across devices");
-    TORCH_CHECK(A_local.scalar_type() == at::kBFloat16 && A_local.is_contiguous(),
-                "A_local must be contiguous bfloat16");
-    TORCH_CHECK(A_local.dim() == 2 && A_local.size(0) == M / NUM_DEVICES &&
-                    A_local.size(1) == K,
-                "A_local must have shape [global_M / NUM_DEVICES, K]");
-    TORCH_CHECK(B.scalar_type() == at::kBFloat16 && B.is_contiguous(),
-                "B must be contiguous bfloat16");
-    TORCH_CHECK(C.scalar_type() == at::kBFloat16 && C.is_contiguous(),
-                "C must be contiguous bfloat16");
-    TORCH_CHECK(A_local.device() == A.data_.device() && B.device() == A.data_.device() &&
-                    C.device() == A.data_.device(),
-                "A, A_local, B, and C must be on the same CUDA device");
-    TORCH_CHECK(barrier.multicast_ && barrier.multicast_ptr_ != nullptr,
-                "multicast mode requires barrier to be a multicast DistBuffer");
-    TORCH_CHECK(barrier.dtype_ == at::kInt && barrier.data_.is_contiguous(),
-                "multicast barrier must be contiguous int32");
-    TORCH_CHECK(barrier.data_.numel() >= 1,
-                "multicast barrier needs at least one int32 element");
-    TORCH_CHECK(barrier.data_.device() == A.data_.device(),
-                "multicast barrier must be on the same CUDA device as A");
-
-    entrypoint_impl<true, false, false>(A,
-                                 A_local,
-                                 B,
-                                 C,
-                                 logical_global_m,
-                                 barrier.data_.data_ptr<int>(),
-                                 static_cast<int*>(barrier.multicast_ptr_));
-}
-
-// Fused multicast-push variant. Each rank broadcasts its local A shard into
-// gathered_A[rank], publishes ready[rank], computes its local shard first, and
-// waits on ready[peer] before consuming each remote shard.
-void entrypoint_multicast_push(dist::ParallelBuffer& A,
-                               dist::ParallelBuffer& gathered_A,
-                               dist::ParallelBuffer& ready,
-                               const at::Tensor& B,
-                               at::Tensor& C,
-                               const int logical_global_m) {
-    constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    constexpr int K = fused_globals<128, 128>::K;
-
-    TORCH_CHECK(C.dim() == 3 && C.size(0) == NUM_DEVICES,
-                "C must have shape [NUM_DEVICES, local_M, N]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == K,
-                "B must have the pre-transposed shape [N, K]");
-    TORCH_CHECK(C.size(2) == B.size(0), "C's N dimension must match B.size(0)");
-    const int64_t local_M = C.size(1);
-
-    TORCH_CHECK(A.multicast_ && A.multicast_ptr_ != nullptr,
-                "multicast-push mode requires A to be a multicast DistBuffer");
-    TORCH_CHECK(A.dtype_ == at::kBFloat16 && A.data_.is_contiguous(),
-                "A must be contiguous bfloat16");
-    TORCH_CHECK(A.data_.dim() == 2 && A.data_.size(0) == local_M &&
-                    A.data_.size(1) == K,
-                "A must have shape [local_M, K]");
-
-    TORCH_CHECK(gathered_A.multicast_ && gathered_A.multicast_ptr_ != nullptr,
-                "gathered_A must be a multicast DistBuffer");
-    TORCH_CHECK(gathered_A.dtype_ == at::kBFloat16 && gathered_A.data_.is_contiguous(),
-                "gathered_A must be contiguous bfloat16");
-    TORCH_CHECK(gathered_A.data_.dim() == 3 &&
-                    gathered_A.data_.size(0) == NUM_DEVICES &&
-                    gathered_A.data_.size(1) == local_M &&
-                    gathered_A.data_.size(2) == K,
-                "gathered_A must have shape [NUM_DEVICES, local_M, K]");
-
-    TORCH_CHECK(!ready.multicast_, "ready must use ordinary peer mappings, not multicast");
-    TORCH_CHECK(ready.dtype_ == at::kInt && ready.data_.is_contiguous() &&
-                    ready.data_.numel() >= 1,
-                "ready needs one local int32 completion flag");
-    TORCH_CHECK(A.local_rank_ == gathered_A.local_rank_ &&
-                    A.local_rank_ == ready.local_rank_ &&
-                    A.local_world_size_ == gathered_A.local_world_size_ &&
-                    A.local_world_size_ == ready.local_world_size_,
-                "all multicast-push buffers must use the same local rank and world size");
-    TORCH_CHECK(A.data_.device() == gathered_A.data_.device() &&
-                    A.data_.device() == ready.data_.device() &&
-                    A.data_.device() == B.device() && A.data_.device() == C.device(),
-                "all multicast-push inputs must be on the same CUDA device");
-    TORCH_CHECK(B.scalar_type() == at::kBFloat16 && B.is_contiguous(),
-                "B must be contiguous bfloat16");
-    TORCH_CHECK(C.scalar_type() == at::kBFloat16 && C.is_contiguous(),
-                "C must be contiguous bfloat16");
-
-    entrypoint_impl<false, true, false>(
-        A,
-        gathered_A.data_,
-        B,
-        C,
-        logical_global_m,
-        nullptr,
-        nullptr,
-        nullptr,
-        &ready,
-        static_cast<comm::bf16*>(gathered_A.multicast_ptr_));
-}
-
-// QuACK-style CE push. Each owner unicast-copies its local shard into the
-// corresponding slot of every peer's ordinary gathered buffer, then performs
-// a 4-byte D2D copy of the device epoch into that peer's per-source flag.
-// Reverse-ring send order matches the kernel's local-first rotated consumption.
-void entrypoint_ce_push(dist::ParallelBuffer& A,
-                        dist::ParallelBuffer& gathered_A,
-                        dist::ParallelBuffer& ready,
-                        at::Tensor& epoch,
-                        const at::Tensor& B,
-                        at::Tensor& C,
-                        const int logical_global_m) {
-    constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    constexpr int K = fused_globals<128, 128>::K;
-
-    TORCH_CHECK(C.dim() == 3 && C.size(0) == NUM_DEVICES,
-                "C must have shape [NUM_DEVICES, local_M, N]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == K,
-                "B must have the pre-transposed shape [N, K]");
-    TORCH_CHECK(C.size(2) == B.size(0), "C's N dimension must match B.size(0)");
-    const int64_t local_M = C.size(1);
-
-    TORCH_CHECK(A.dtype_ == at::kBFloat16 && A.data_.is_contiguous(),
-                "A must be contiguous bfloat16");
-    TORCH_CHECK(A.data_.dim() == 2 && A.data_.size(0) == local_M &&
-                    A.data_.size(1) == K,
-                "A must have shape [local_M, K]");
-
-    TORCH_CHECK(!gathered_A.multicast_,
-                "CE-push gathered_A must use ordinary peer mappings");
-    TORCH_CHECK(gathered_A.dtype_ == at::kBFloat16 && gathered_A.data_.is_contiguous(),
-                "gathered_A must be contiguous bfloat16");
-    TORCH_CHECK(gathered_A.data_.dim() == 3 &&
-                    gathered_A.data_.size(0) == NUM_DEVICES &&
-                    gathered_A.data_.size(1) == local_M &&
-                    gathered_A.data_.size(2) == K,
-                "gathered_A must have shape [NUM_DEVICES, local_M, K]");
-
-    TORCH_CHECK(!ready.multicast_, "ready must use ordinary peer mappings");
-    TORCH_CHECK(ready.dtype_ == at::kInt && ready.data_.is_contiguous() &&
-                    ready.data_.numel() >= NUM_DEVICES,
-                "ready needs one int32 completion flag per source rank");
-    TORCH_CHECK(epoch.scalar_type() == at::kInt && epoch.is_contiguous() &&
-                    epoch.numel() >= 1,
-                "epoch needs one contiguous int32 device scalar");
-    TORCH_CHECK(A.local_rank_ == gathered_A.local_rank_ &&
-                    A.local_rank_ == ready.local_rank_ &&
-                    A.local_world_size_ == gathered_A.local_world_size_ &&
-                    A.local_world_size_ == ready.local_world_size_,
-                "all CE-push buffers must use the same local rank and world size");
-    TORCH_CHECK(A.data_.device() == gathered_A.data_.device() &&
-                    A.data_.device() == ready.data_.device() &&
-                    A.data_.device() == epoch.device() &&
-                    A.data_.device() == B.device() && A.data_.device() == C.device(),
-                "all CE-push inputs must be on the same CUDA device");
-    TORCH_CHECK(B.scalar_type() == at::kBFloat16 && B.is_contiguous(),
-                "B must be contiguous bfloat16");
-    TORCH_CHECK(C.scalar_type() == at::kBFloat16 && C.is_contiguous(),
-                "C must be contiguous bfloat16");
-
-    entrypoint_impl<false, false, true>(
-        A,
-        gathered_A.data_,
-        B,
-        C,
-        logical_global_m,
-        nullptr,
-        nullptr,
-        reinterpret_cast<uint32_t*>(ready.data_.data_ptr<int>()),
-        &ready,
-        nullptr,
-        &gathered_A,
-        reinterpret_cast<uint32_t*>(epoch.data_ptr<int>()));
 }
 };  // namespace ag_gemm_warp_specialized
