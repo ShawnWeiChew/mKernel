@@ -42,20 +42,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             TORCH_CHECK(logical_global_m > 0 && logical_global_m <= M &&
                             logical_global_m % INTRA_NUM_DEVICES == 0,
                         "logical_global_m must fit A and divide evenly across devices");
-            ag_gemm_warp_specialized::entrypoint<dist::ParallelBuffer,
-                                                 dist::ParallelBuffer,
-                                                 at::Tensor,
-                                                 ag_gemm_warp_specialized::AgStrategy::PULL>(
-                A,
-                A_copy_ready,
-                B,
-                C,
-                M,
-                B.size(0),
-                B.size(1),
-                dev_idx,
-                at::cuda::getCurrentCUDAStream().stream(),
-                logical_global_m);
+            ag_gemm_warp_specialized::
+                entrypoint<dist::ParallelBuffer, dist::ParallelBuffer, at::Tensor>(
+                    A,
+                    A_copy_ready,
+                    B,
+                    C,
+                    M,
+                    B.size(0),
+                    B.size(1),
+                    dev_idx,
+                    at::cuda::getCurrentCUDAStream().stream(),
+                    logical_global_m);
         },
         pybind11::arg("A"),
         pybind11::arg("A_copy_ready"),

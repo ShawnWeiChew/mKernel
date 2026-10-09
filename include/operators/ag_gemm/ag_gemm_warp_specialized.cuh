@@ -298,10 +298,7 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
 
 // A contains every rank's shard; callers initialize only A[rank] on each device.
 // Raw callers supply physical M/N/K, the device, stream, and logical dispatch M.
-template <typename DistributedTensor,
-          typename ReadyTensor,
-          typename LocalTensor,
-          AgStrategy STRATEGY>
+template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
 void entrypoint(DistributedTensor& A,
                 ReadyTensor& A_copy_ready,
                 const LocalTensor& B,
@@ -322,7 +319,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, AgStrategy::PULL>(globals);
         } else if (logical_global_m <= 3072) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -332,7 +329,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, AgStrategy::PULL>(globals);
         } else if (logical_global_m <= 3584) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -342,7 +339,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, AgStrategy::PULL>(globals);
         } else if (logical_global_m <= 4096) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -352,7 +349,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, AgStrategy::PULL>(globals);
         } else {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -362,7 +359,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  2>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, AgStrategy::PULL>(globals);
         }
     } else {
         if (logical_global_m <= 2048) {
@@ -374,7 +371,8 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
         } else if (logical_global_m <= 3072) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -384,7 +382,19 @@ void entrypoint(DistributedTensor& A,
                                                                  1,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
+        } else if (logical_global_m <= 4096) {
+            auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
+                                                                 ReadyTensor,
+                                                                 LocalTensor,
+                                                                 128,
+                                                                 128,
+                                                                 1,
+                                                                 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
         } else if (logical_global_m <= 8192) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -392,9 +402,9 @@ void entrypoint(DistributedTensor& A,
                                                                  128,
                                                                  256,
                                                                  2,
-                                                                 2>(
+                                                                 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 2, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, AgStrategy::PULL>(globals);
         } else {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
@@ -404,7 +414,7 @@ void entrypoint(DistributedTensor& A,
                                                                  2,
                                                                  2>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, AgStrategy::PULL>(globals);
         }
     }
 }
