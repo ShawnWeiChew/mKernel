@@ -260,6 +260,11 @@ void entrypoint(dist::ParallelBuffer& A,
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
+    TORCH_CHECK(A_copy_ready.multicast_ && A_copy_ready.multicast_ptr_ != nullptr,
+                "A_copy_ready must be a multicast DistBuffer");
+    TORCH_CHECK(A_copy_ready.dtype_ == at::kInt && A_copy_ready.data_.is_contiguous() &&
+                    A_copy_ready.data_.numel() >= INTRA_NUM_DEVICES,
+                "A_copy_ready must contain at least one int32 flag per device");
 
     auto launch = [&]<int ROW_BLOCK,
                       int COL_BLOCK,
@@ -275,6 +280,8 @@ void entrypoint(dist::ParallelBuffer& A,
                                                            NUM_CTA,
                                                            NUM_CONSUMER_WARPS>(
             A, A_staging, B, C, dev_idx, M, N);
+        globals.A_copy_ready =
+            static_cast<uint32_t*>(A_copy_ready.raw_ptrs_[dev_idx]);
         if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
             for (int peer = 0; peer < fg::NUM_DEVICES; ++peer) {
                 globals.A_copy_ready_peers[peer] =

@@ -583,10 +583,10 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             multicast=True,
         )
         A_copy_ready = mod.DistBuffer(
-            (1,), dtype=torch.int32,
+            (config.world_size,), dtype=torch.int32,
             local_rank=config.local_rank,
             local_world_size=config.world_size,
-            multicast=False,
+            multicast=True,
         )
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
@@ -855,9 +855,9 @@ def ag_gemm_blackwell_prepare(
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
     run_config.mkernel_a_copy_ready = mod.DistBuffer(
-        (1,), dtype=torch.int32,
+        (config.world_size,), dtype=torch.int32,
         local_rank=config.local_rank, local_world_size=config.world_size,
-        multicast=False,
+        multicast=True,
     )
     run_config.mkernel_a_copy_ready.data_.zero_()
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
