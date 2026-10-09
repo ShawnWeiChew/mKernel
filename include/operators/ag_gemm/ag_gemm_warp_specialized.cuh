@@ -312,10 +312,6 @@ void entrypoint(DistributedTensor& A,
                 int dev_idx,
                 cudaStream_t stream,
                 int logical_global_m) {
-    assert(M > 0 && M % INTRA_NUM_DEVICES == 0 && N > 0 && K > 0 && K % 64 == 0);
-    assert(dev_idx >= 0 && dev_idx < INTRA_NUM_DEVICES);
-    assert(logical_global_m > 0 && logical_global_m <= M);
-
     if (N >= MIN_LARGE_GEMM_N) {
         if (logical_global_m <= 2048) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
@@ -399,7 +395,7 @@ void entrypoint(DistributedTensor& A,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
             launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, STRATEGY>(globals);
-        } else {
+        } else if (logical_global_m <= 16384) {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
                                                                  LocalTensor,
@@ -409,6 +405,16 @@ void entrypoint(DistributedTensor& A,
                                                                  1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
             launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, STRATEGY>(globals);
+        } else {
+            auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
+                                                                 ReadyTensor,
+                                                                 LocalTensor,
+                                                                 128,
+                                                                 256,
+                                                                 2,
+                                                                 2>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, STRATEGY>(globals);
         }
     }
 }
