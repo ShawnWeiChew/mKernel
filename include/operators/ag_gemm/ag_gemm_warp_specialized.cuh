@@ -392,19 +392,9 @@ void entrypoint(DistributedTensor& A,
                                                                  128,
                                                                  256,
                                                                  2,
-                                                                 1>(
+                                                                 2>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, STRATEGY>(globals);
-        } else if (logical_global_m <= 16384) {
-            auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
-                                                                 ReadyTensor,
-                                                                 LocalTensor,
-                                                                 128,
-                                                                 256,
-                                                                 2,
-                                                                 1>(
-                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, STRATEGY>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 2, STRATEGY>(globals);
         } else {
             auto globals = ag_gemm_warp_specialized_make_globals<DistributedTensor,
                                                                  ReadyTensor,
