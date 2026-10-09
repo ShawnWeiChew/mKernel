@@ -100,7 +100,7 @@ struct fused_globals {
     static constexpr int COL_BLOCK = _COL_BLOCK;
     static constexpr int RED_BLOCK = 64;
 
-    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK, true, 32>;
+    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
     // B is stored [N, K] (not [K, N]) so the reduction dimension is contiguous
     // in HBM -- the tile shape here mirrors that: rows are the N-chunk, cols
     // are the K-chunk. The MMA call reads it back with transpose::T, and the
@@ -127,7 +127,16 @@ struct fused_globals {
     // TMA loads that go out of bounds will naturally zero themselves out
     using A_replicated_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
+
+    // Keep C's real N stride. The generic local_tensor helper rounds the
+    // tensor-map width to the swizzle granularity, which can produce OOB or
+    // shifted stores when N is not a multiple of C_tile::cols.
+    struct C_local_tensor {
+        comm::bf16* data;
+        CUtensorMap map;
+
+        __device__ inline void prefetch_tma() const { dist::tma::prefetch_tensormap(&map); }
+    };
 
     A_distributed_tensor A;
     A_replicated_tensor A_local_buf;
@@ -185,11 +194,49 @@ ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
                                       int N) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
+    const int local_m = M / fg::NUM_DEVICES;
+    typename fg::C_local_tensor C_tensor;
+    C_tensor.data = reinterpret_cast<comm::bf16*>(C.data_ptr());
+
+    uint64_t global_dim[3] = {
+        static_cast<uint64_t>(N),
+        static_cast<uint64_t>(local_m),
+        static_cast<uint64_t>(fg::NUM_DEVICES),
+    };
+    uint64_t global_stride[2] = {
+        static_cast<uint64_t>(N) * sizeof(comm::bf16),
+        static_cast<uint64_t>(local_m) * N * sizeof(comm::bf16),
+    };
+    uint32_t box_dim[3] = {
+        fg::C_tile::cols,
+        fg::C_tile::rows,
+        1,
+    };
+    uint32_t element_stride[3] = {1, 1, 1};
+
+    constexpr CUtensorMapSwizzle c_swizzle = fg::C_tile::swizzle_bytes == 128
+        ? CU_TENSOR_MAP_SWIZZLE_128B
+        : fg::C_tile::swizzle_bytes == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
+                                          : CU_TENSOR_MAP_SWIZZLE_32B;
+
+    MKERNEL_CUCHECK(cuTensorMapEncodeTiled(&C_tensor.map,
+                                           CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                                           3,
+                                           C_tensor.data,
+                                           global_dim,
+                                           global_stride,
+                                           box_dim,
+                                           element_stride,
+                                           CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                           c_swizzle,
+                                           CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
     return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
             .A_local_buf =
                 ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+            .C = C_tensor,
             .A_copy_ready = nullptr,
             .A_copy_ready_peers = {},
             .A_multicast_ptr = nullptr,
