@@ -100,7 +100,7 @@ struct fused_globals {
     static constexpr int COL_BLOCK = _COL_BLOCK;
     static constexpr int RED_BLOCK = 64;
 
-    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK>;
+    using A_tile = kittens::st_bf<ROW_BLOCK, RED_BLOCK, true, 32>;
     // B is stored [N, K] (not [K, N]) so the reduction dimension is contiguous
     // in HBM -- the tile shape here mirrors that: rows are the N-chunk, cols
     // are the K-chunk. The MMA call reads it back with transpose::T, and the

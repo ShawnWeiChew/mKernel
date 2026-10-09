@@ -787,7 +787,7 @@ def report_blackwell_result(
         print(line, flush=True)
 def ag_gemm_blackwell_prepare(
     config: BlackwellBenchConfig, mod, projection: str, global_m: int, logical_n: int,
-    warmup: int, iters: int,
+    warmup: int, iters: int, check_only: bool = False,
 ) -> list[tuple[Callable[[], float | None], str, bool]]:
     """
     To be called per (projection, shape). Tunes each kernel, returning a list of
@@ -924,6 +924,9 @@ def ag_gemm_blackwell_prepare(
         sys.exit(1)
     del A_ref, C_ref
     dist.barrier()
+
+    if check_only:
+        return []
 
     def bench_mkernel():
         mkernel_graph.replay()
@@ -1369,6 +1372,7 @@ def main():
     mod = load_module.load(config.kernel_name)
     result_sizes, result_fused = [], []
     correctness_ok = True
+    check_only = args.mode == "check"
 
     if args.arch == "hopper":
         # config modification
@@ -1440,7 +1444,19 @@ def main():
     else:
         check_correctness_ag_gemm_blackwell(config, mod)
         for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
-            fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
+            fns_to_run = ag_gemm_blackwell_prepare(
+                config,
+                mod,
+                projection,
+                m,
+                logical_n,
+                args.warmup,
+                args.iters,
+                check_only=check_only,
+            )
+
+            if check_only:
+                continue
 
             results = []
             for i, (fn, name, should_wrap) in enumerate(fns_to_run):
@@ -1460,7 +1476,7 @@ def main():
                 if name == "mkernel":
                     result_fused.append(res)
 
-    if config.is_chief and args.save_json:
+    if config.is_chief and args.save_json and not check_only:
         # MERGE with existing JSON so a single-shape bench doesn't erase the
         # other shapes the chart needs.
         from common import write_results_json
@@ -1469,7 +1485,7 @@ def main():
                            note=f"release ag_gemm bench (world={config.world_size*config.num_nodes})")
         print(f"[ag_gemm] wrote {args.save_json}", flush=True)
 
-    if config.is_chief and args.compare_to:
+    if config.is_chief and args.compare_to and not check_only:
         ok = compare_named_results("ag_gemm", result_sizes, result_fused, args.compare_to)
         ok = ok and correctness_ok
         dist.destroy_process_group()

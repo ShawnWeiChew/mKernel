@@ -589,9 +589,14 @@ inline void launch_ag_gemm_warp_specialized(
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
+    // Reset before the fork event so graph replay orders every copy-stream
+    // completion publication after the reset.
     if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
         MKERNEL_CUDACHECK(
             cudaMemsetAsync(G.A_copy_ready_peers[G.dev_idx], 0, sizeof(uint32_t), stream));
+    } else {
+        MKERNEL_CUDACHECK(
+            cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
     }
 
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
@@ -612,8 +617,6 @@ inline void launch_ag_gemm_warp_specialized(
                                  fg::A_copy_epoch,
                                  CU_STREAM_WRITE_VALUE_DEFAULT));
     } else {
-        MKERNEL_CUDACHECK(
-            cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
         launch_G.A_copy_ready = copy_state.ready;
 
         // Stage one complete shard per remote device in the same ring order
