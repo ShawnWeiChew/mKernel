@@ -582,6 +582,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             local_rank=config.local_rank,
             local_world_size=config.world_size,
             multicast=False,
+            backing="cuda_malloc",
         )
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
@@ -703,7 +704,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             del A_tk, B_tk_transposed, tk_barrier
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_local_buf, B_kernel, C_kernel
+        del A_kernel, A_gathered, A_copy_ready, B_kernel, C_kernel
         dist.barrier()
 
     if not all_correct:
@@ -849,7 +850,8 @@ def ag_gemm_blackwell_prepare(
     )
     run_config.mkernel_a_copy_ready = mod.DistBuffer(
         (config.world_size,), dtype=torch.int32,
-        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+        local_rank=config.local_rank, local_world_size=config.world_size,
+        multicast=False, backing="cuda_malloc",
     )
     run_config.mkernel_a_copy_ready.data_.zero_()
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
