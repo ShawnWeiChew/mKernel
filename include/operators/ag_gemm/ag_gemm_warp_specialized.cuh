@@ -253,7 +253,8 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                                            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
-                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16>) {
+                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16> &&
+                  dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
         return {
             .A = dist::make_distributed_tensor<typename fg::A_distributed_tensor>(
                 reinterpret_cast<uint64_t>(A.mc),
