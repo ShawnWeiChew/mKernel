@@ -575,6 +575,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             local_world_size=config.world_size,
             multicast=True,
         )
+        A_copy_ready.data_.zero_()
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
         B_kernel = pad_cols(config, B_ref, padded_n).T.contiguous()
@@ -591,7 +592,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
 
         C_kernel.zero_()
         mod.ag_gemm_warp_specialized(
-            A_kernel, A_copy_ready, B_kernel, C_kernel, m
+            A_kernel, A_copy_ready, B_kernel, C_kernel
         )
         torch.cuda.synchronize()
 
@@ -854,7 +855,7 @@ def ag_gemm_blackwell_prepare(
         mod.ag_gemm_warp_specialized(
             run_config.mkernel_a_dist,
             run_config.mkernel_a_copy_ready,
-            run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+            run_config.mkernel_b_buf, run_config.mkernel_c_buf,
         )
 
     # Build the logical reference before capture so torch.mm initializes cuBLAS

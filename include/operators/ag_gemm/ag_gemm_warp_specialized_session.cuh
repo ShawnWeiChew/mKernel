@@ -13,8 +13,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](dist::ParallelBuffer& A,
            dist::ParallelBuffer& A_copy_ready,
            const at::Tensor& B,
-           at::Tensor& C,
-           int logical_global_m) {
+           at::Tensor& C) {
             const int dev_idx = A.local_rank_;
             c10::cuda::CUDAGuard device_guard(dev_idx);
             TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES &&
@@ -22,6 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                             A_copy_ready.local_rank_ == dev_idx,
                         "A and A_copy_ready must match the compiled device group");
             TORCH_CHECK(A.data_.dim() == 3 && A.data_.size(0) == INTRA_NUM_DEVICES &&
+                            A.data_.size(1) > 0 &&
                             A.data_.scalar_type() == at::kBFloat16 && A.data_.is_contiguous(),
                         "A must be contiguous bf16 [devices, local_rows, K]");
             TORCH_CHECK(A_copy_ready.data_.scalar_type() == at::kInt &&
@@ -39,9 +39,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                             C.size(1) == A.data_.size(1) && C.size(2) == B.size(0),
                         "C must be [devices, local_rows, N]");
             const int M = C.size(0) * C.size(1);
-            TORCH_CHECK(logical_global_m > 0 && logical_global_m <= M &&
-                            logical_global_m % INTRA_NUM_DEVICES == 0,
-                        "logical_global_m must fit A and divide evenly across devices");
             ag_gemm_warp_specialized::
                 entrypoint<dist::ParallelBuffer, dist::ParallelBuffer, at::Tensor>(
                     A,
@@ -52,12 +49,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     B.size(0),
                     B.size(1),
                     dev_idx,
-                    at::cuda::getCurrentCUDAStream().stream(),
-                    logical_global_m);
+                    at::cuda::getCurrentCUDAStream().stream());
         },
         pybind11::arg("A"),
         pybind11::arg("A_copy_ready"),
         pybind11::arg("B"),
-        pybind11::arg("C"),
-        pybind11::arg("logical_global_m"));
+        pybind11::arg("C"));
 }
