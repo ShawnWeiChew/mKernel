@@ -21,7 +21,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REVISIONS = {
-    "before": "47dd7ea1e9a88692c2080bbaee72fbe200120b55",
+    "before": "55fda5ccd855b8478e3c1c0f68025459e8213f38",
     "after": "f21b22075e76c2036456de4425d2a2779de24de4",
 }
 M, N, K, WORLD = 8192, 3648, 7168, 8
