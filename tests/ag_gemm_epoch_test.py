@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 import load_module
 
 
-def check_shape(mod, rank, world, n, initial_epoch):
+def check_shape(mod, rank, world, n, initial_epoch, transport):
     local_m, k = 128, 64
     a = mod.DistBuffer(
         (world, local_m, k), dtype=torch.bfloat16,
@@ -42,9 +42,11 @@ def check_shape(mod, rank, world, n, initial_epoch):
     torch.cuda.synchronize()
     dist.barrier()
 
+    launch_transport = getattr(mod, f"ag_gemm_warp_specialized_launch_{transport}")
+
     def launch():
         mod.ag_gemm_warp_specialized_prepare(ready, world * local_m, n)
-        mod.ag_gemm_warp_specialized_launch(a, ready, b, c)
+        launch_transport(a, ready, b, c)
 
     def check(tensor, offset):
         expected = ((expected_rows + offset) * k).to(torch.bfloat16).expand_as(tensor)
@@ -112,9 +114,10 @@ def main():
     world = dist.get_world_size()
     mod = load_module.load("ag_gemm_warp_specialized")
     assert mod.ag_gemm_warp_specialized_ready_words == world + 1
-    for n in (256, 6400):  # multicast push, then pull
-        for initial_epoch in (0, -2, -6):
-            check_shape(mod, rank, world, n, initial_epoch)
+    for transport in ("pull", "multicast_push"):
+        for n in (256, 6400):  # Exercise both projection dispatch paths per transport.
+            for initial_epoch in (0, -2, -6):
+                check_shape(mod, rank, world, n, initial_epoch, transport)
     if rank == 0:
         print("AG-GEMM epoch regression passed", flush=True)
     dist.destroy_process_group()

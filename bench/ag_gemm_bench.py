@@ -6,6 +6,7 @@ SM split: --num-comm-sms 64 (50/50 split intra/inter inside the kernel).
 
 Blackwell Benchmarks (only intranode supported):
 Sweep Attention Projections: M∈{2048,3072,3584,4096,8192,16384,32768}, K=7168, N∈{6284,3648}
+Both compile-time transports (pull and multicast_push) run for every shape.
 To include cutlass and TK's distributed kernels, specify the following environment variables:
 
 CUTLASS_PATH=<path to cutlass root folder>
@@ -129,6 +130,7 @@ class BlackwellBenchConfig:
     )
     shapes_to_test = [2048, 3072, 3584, 4096, 8192, 16384, 32768]
     default_k = 7168
+    transports = ("pull", "multicast_push")
 
     # cutlass configs
     cutlass_autotune_configs = (
@@ -530,14 +532,15 @@ def unpad_rows(
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
-def run_prepared_ag_gemm(mod, A, ready, B, C):
+def run_prepared_ag_gemm(mod, A, ready, B, C, transport):
     """Advance the GPU epoch, synchronize ranks before transfer, then launch.
 
     Benchmark inputs stay unchanged across replays. The kernel joins its local
     copy stream; the next prepare supplies cross-rank buffer-reuse ordering.
     """
     mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
-    mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
+    launch = getattr(mod, f"ag_gemm_warp_specialized_launch_{transport}")
+    launch(A, ready, B, C)
 
 
 def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
@@ -592,38 +595,40 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             (config.world_size, padded_local_m, padded_n), device="cuda", dtype=torch.bfloat16
         )
 
-        # The kernel's first act is to pull every peer's shard out of their
-        # DistBuffer, so no rank may launch until all of them have finished
-        # filling theirs -- and the fill is stream-ordered work that a bare
-        # dist.barrier() does not wait on.
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        C_kernel.zero_()
-        run_prepared_ag_gemm(
-            mod, A_kernel, A_copy_ready, B_kernel, C_kernel
-        )
-        torch.cuda.synchronize()
-
-        # Drop the padded rows and columns and compare the logical
-        # M x logical_n result against the unpadded PyTorch reference.
-        is_correct = check_close(
-            f"ag-gemm-warp-specialized {projection} M={m} N={logical_n} "
-            f"padded_m={padded_m} padded_n={padded_n}",
-            unpad_rows(
-                C_kernel, local_m, padded_local_m, config.world_size, logical_n
-            ),
-            C_ref,
-        )
-        all_correct = all_correct and is_correct
-
-        if config.is_chief:
-            status = "passed :)" if is_correct else "FAILED :("
-            print(
-                f"ag-gemm-warp-specialized {projection} M={m} local_m={local_m} N={logical_n} "
-                f"padded_m={padded_m} padded_n={padded_n}: {status}",
-                flush=True,
+        for transport in config.transports:
+            # Clear gathered shards so a preceding transport cannot mask a bad copy.
+            # All peers must finish reading before any source buffer is rewritten.
+            torch.cuda.synchronize()
+            dist.barrier()
+            A_kernel.data_.zero_()
+            A_kernel.data_[config.local_rank].copy_(pad_rows(config, A_ref_local, padded_local_m))
+            torch.cuda.synchronize()
+            dist.barrier()
+            C_kernel.zero_()
+            run_prepared_ag_gemm(
+                mod, A_kernel, A_copy_ready, B_kernel, C_kernel, transport
             )
+            torch.cuda.synchronize()
+
+            # Drop the padded rows and columns and compare the logical
+            # M x logical_n result against the unpadded PyTorch reference.
+            is_correct = check_close(
+                f"ag-gemm-warp-specialized {transport} {projection} M={m} N={logical_n} "
+                f"padded_m={padded_m} padded_n={padded_n}",
+                unpad_rows(
+                    C_kernel, local_m, padded_local_m, config.world_size, logical_n
+                ),
+                C_ref,
+            )
+            all_correct = all_correct and is_correct
+
+            if config.is_chief:
+                status = "passed :)" if is_correct else "FAILED :("
+                print(
+                    f"ag-gemm-warp-specialized {transport} {projection} M={m} local_m={local_m} N={logical_n} "
+                    f"padded_m={padded_m} padded_n={padded_n}: {status}",
+                    flush=True,
+                )
 
         # ---- ThunderKittens: check every comm_sms candidate up front ----
         # Every value in config.tk_comm_sms gets autotuned later, so every
@@ -727,7 +732,6 @@ def report_blackwell_result(
     cutlass_ms = ms_by_name.get("cutlass")
     tk_ms = ms_by_name.get("TK")
     quack_ms = ms_by_name.get("quack")
-    mkernel_ms = ms_by_name.get("mkernel")
 
     def tflops_for(ms: float) -> float:
         return useful_tflops(global_m, logical_n, config.default_k, ms)
@@ -765,23 +769,26 @@ def report_blackwell_result(
             f"{tflops_for(quack_ms):8.2f} TFLOP/s{vs_baseline}",
             flush=True,
         )
-    if mkernel_ms is not None:
-        line = (
-            f"  {'ag_gemm_warp_specialized':<26} {mkernel_ms:8.3f} ms  "
-            f"{tflops_for(mkernel_ms):8.2f} TFLOP/s"
-        )
-        if baseline_ms is not None:
-            line += f"  ({baseline_ms / mkernel_ms:6.3f}x vs baseline)"
-        if cutlass_ms is not None:
-            verdict = "BEATS" if mkernel_ms < cutlass_ms else "behind"
-            line += f"  {cutlass_ms / mkernel_ms:6.3f}x vs CUTLASS ({verdict})"
-        if tk_ms is not None:
-            verdict = "BEATS" if mkernel_ms < tk_ms else "behind"
-            line += f"  {tk_ms / mkernel_ms:6.3f}x vs ThunderKittens ({verdict})"
-        if quack_ms is not None:
-            verdict = "BEATS" if mkernel_ms < quack_ms else "behind"
-            line += f"  {quack_ms / mkernel_ms:6.3f}x vs QUACK ({verdict})"
-        print(line, flush=True)
+    for transport in config.transports:
+        mkernel_ms = ms_by_name.get(f"mkernel_{transport}")
+        if mkernel_ms is not None:
+            line = (
+                f"  {f'mKernel {transport}':<26} {mkernel_ms:8.3f} ms  "
+                f"{tflops_for(mkernel_ms):8.2f} TFLOP/s"
+            )
+            if baseline_ms is not None:
+                line += f"  ({baseline_ms / mkernel_ms:6.3f}x vs baseline)"
+            if cutlass_ms is not None:
+                verdict = "BEATS" if mkernel_ms < cutlass_ms else "behind"
+                line += f"  {cutlass_ms / mkernel_ms:6.3f}x vs CUTLASS ({verdict})"
+            if tk_ms is not None:
+                verdict = "BEATS" if mkernel_ms < tk_ms else "behind"
+                line += f"  {tk_ms / mkernel_ms:6.3f}x vs ThunderKittens ({verdict})"
+            if quack_ms is not None:
+                verdict = "BEATS" if mkernel_ms < quack_ms else "behind"
+                line += f"  {quack_ms / mkernel_ms:6.3f}x vs QUACK ({verdict})"
+            print(line, flush=True)
+
 def ag_gemm_blackwell_prepare(
     config: BlackwellBenchConfig, mod, projection: str, global_m: int, logical_n: int,
     warmup: int, iters: int, check_only: bool = False,
@@ -860,14 +867,6 @@ def ag_gemm_blackwell_prepare(
     tune_warmup = 2
     tune_iterations = 5
 
-    def run_mkernel():
-        run_prepared_ag_gemm(
-            mod,
-            run_config.mkernel_a_dist,
-            run_config.mkernel_a_copy_ready,
-            run_config.mkernel_b_buf, run_config.mkernel_c_buf,
-        )
-
     # Build the logical reference before capture so torch.mm initializes cuBLAS
     # outside graph capture.
     A_ref = torch.empty(
@@ -878,54 +877,77 @@ def ag_gemm_blackwell_prepare(
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Initialize the copy stream before capture.
-    run_mkernel()
-    torch.cuda.synchronize()
-    dist.barrier()
+    for transport in config.transports:
+        # Both graphs retain the same buffers and use the shared monotonic epoch.
+        # Synchronize peers before clearing gathered data for the next check.
+        torch.cuda.synchronize()
+        dist.barrier()
+        run_config.mkernel_a_dist.data_.zero_()
+        run_config.mkernel_a_dist.data_[config.local_rank].copy_(A_mk_local)
+        torch.cuda.synchronize()
+        dist.barrier()
 
-    mkernel_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(mkernel_graph):
-        run_mkernel()
-
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Check the selected transport against the logical reference.
-    run_config.mkernel_c_buf.zero_()
-    mkernel_graph.replay()
-    torch.cuda.synchronize()
-    mkernel_graph_ok = check_close(
-        f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
-        unpad_rows(
-            run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
-            config.world_size, logical_n,
-        ),
-        C_ref,
-    )
-
-    # Vote so every rank bails together; a rank that kept going alone would
-    # hang in the next collective.
-    graph_vote = torch.tensor([1 if mkernel_graph_ok else 0], device="cuda")
-    dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
-    if not graph_vote.item():
-        if config.is_chief:
-            print(
-                f"Blackwell AG-GEMM cudagraph checks {projection} M={global_m}: "
-                f"FAILED :( -- skipping benchmarks.",
-                flush=True,
+        def run_mkernel():
+            run_prepared_ag_gemm(
+                mod, run_config.mkernel_a_dist, run_config.mkernel_a_copy_ready,
+                run_config.mkernel_b_buf, run_config.mkernel_c_buf, transport,
             )
-        dist.destroy_process_group()
-        sys.exit(1)
-    del A_ref, C_ref
-    dist.barrier()
 
+        # Initialize the copy stream before capture.
+        run_mkernel()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        mkernel_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(mkernel_graph):
+            run_mkernel()
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Clear warmup data too: graph replay must gather the remote shards itself.
+        run_config.mkernel_a_dist.data_.zero_()
+        run_config.mkernel_a_dist.data_[config.local_rank].copy_(A_mk_local)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Check the selected transport against the logical reference.
+        run_config.mkernel_c_buf.zero_()
+        mkernel_graph.replay()
+        torch.cuda.synchronize()
+        mkernel_graph_ok = check_close(
+            f"ag-gemm-warp-specialized {transport} cudagraph {projection} M={global_m} N={logical_n}",
+            unpad_rows(
+                run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
+                config.world_size, logical_n,
+            ),
+            C_ref,
+        )
+
+        # Vote so every rank bails together; a rank that kept going alone would
+        # hang in the next collective.
+        graph_vote = torch.tensor([1 if mkernel_graph_ok else 0], device="cuda")
+        dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
+        if not graph_vote.item():
+            if config.is_chief:
+                print(
+                    f"Blackwell AG-GEMM {transport} cudagraph checks {projection} M={global_m}: "
+                    f"FAILED :( -- skipping benchmarks.",
+                    flush=True,
+                )
+            dist.destroy_process_group()
+            sys.exit(1)
+
+        # Bind this graph now so both candidates replay their own specialization.
+        def bench_mkernel(graph=mkernel_graph):
+            graph.replay()
+
+        fns.append((bench_mkernel, f"mkernel_{transport}", True))
+        dist.barrier()
+
+    del A_ref, C_ref
     if check_only:
         return []
-
-    def bench_mkernel():
-        mkernel_graph.replay()
-
-    fns.append((bench_mkernel, "mkernel", True))
 
     # ---- CUTLASS: distributed_all_gather_gemm_blackwell.py ----
     cutlass_kernel_name = "distributed_all_gather_gemm_blackwell.py"
@@ -1436,6 +1458,7 @@ def main():
             result_fused.append(wall_ms)
 
     else:
+        config.shapes_to_test = [int(x) for x in args.shapes.split(",") if x.strip()]
         check_correctness_ag_gemm_blackwell(config, mod)
         if args.mode == "check":
             # check_correctness_ag_gemm_blackwell already exits nonzero on failure.
@@ -1469,9 +1492,9 @@ def main():
             # A plain string, not a tuple: write_results_json merges with a
             # prior run's JSON, and a size that round-trips through JSON as a
             # list (json has no tuple type) is unhashable as a dict key there.
-            result_sizes.append(f"{projection} M={m} N={logical_n}")
             for name, res in results:
-                if name == "mkernel":
+                if name in {f"mkernel_{transport}" for transport in config.transports}:
+                    result_sizes.append(f"{projection} M={m} N={logical_n} {name}")
                     result_fused.append(res)
 
     if config.is_chief and args.save_json and not check_only:

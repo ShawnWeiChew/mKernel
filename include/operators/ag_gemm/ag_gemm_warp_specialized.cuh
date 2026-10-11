@@ -42,6 +42,7 @@ static constexpr int MIN_LARGE_GEMM_N = 6288;
 enum class AgStrategy {
     PULL,
     MULTICAST_PUSH,
+    AUTO,
 };
 
 // Zero this allocation once, before any rank starts using it. Each rank owns
@@ -344,7 +345,11 @@ void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t 
 // finish: synchronize all ranks before rewriting/freeing them, or retain
 // separate source allocations. An entry barrier cannot protect earlier writes.
 // M/N/K are physical tensor dimensions, including padding.
-template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
+// Override only the transport at compile time; retain the shape-specific schedule.
+template <typename DistributedTensor,
+          typename ReadyTensor,
+          typename LocalTensor,
+          AgStrategy STRATEGY = AgStrategy::AUTO>
 void launch(DistributedTensor& A,
             ReadyTensor& A_copy_ready,
             const LocalTensor& B,
@@ -354,53 +359,53 @@ void launch(DistributedTensor& A,
             int K,
             int dev_idx,
             cudaStream_t stream) {
+    constexpr AgStrategy pull_strategy = STRATEGY == AgStrategy::AUTO ? AgStrategy::PULL : STRATEGY;
+    constexpr AgStrategy push_strategy =
+        STRATEGY == AgStrategy::AUTO ? AgStrategy::MULTICAST_PUSH : STRATEGY;
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
         if (M <= 2048) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, pull_strategy>(globals);
         } else if (M <= 3072) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, pull_strategy>(globals);
         } else if (M <= 3584) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, pull_strategy>(globals);
         } else if (M <= 4096) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, pull_strategy>(globals);
         } else {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, pull_strategy>(globals);
         }
     } else {
         if (M <= 2048) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, AgStrategy::MULTICAST_PUSH>(
-                globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, push_strategy>(globals);
         } else if (M <= 3072) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 1, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, AgStrategy::MULTICAST_PUSH>(
-                globals);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, push_strategy>(globals);
         } else if (M <= 4096) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, AgStrategy::MULTICAST_PUSH>(
-                globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, push_strategy>(globals);
         } else if (M <= 8192) {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, pull_strategy>(globals);
         } else {
             auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
                 A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, AgStrategy::PULL>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, pull_strategy>(globals);
         }
     }
 }
