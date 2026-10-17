@@ -162,6 +162,33 @@ def benchmark_shape(torch, kernels, args, m):
         kernels.call("gemm_bench_cublas", kernels.handle, *pointers, m, n, k, stream.cuda_stream)
 
     functions = {"device_Mlocal_N": ag, "Mglobal_N": global_gemm, "cuBLAS": cublas}
+    if args.profile_kernel:
+        # Keep initialization, correctness checks, and warmups outside NCU's
+        # cudaProfilerStart/Stop region. Profile one graph node, as in timing.
+        function = functions[args.profile_kernel]
+        kernels.call("gemm_bench_cublas", kernels.handle, a.data_ptr(), b.data_ptr(),
+                     reference.data_ptr(), m, n, k, stream.cuda_stream)
+        output.fill_(float("nan"))
+        function()
+        check_output(torch, output, reference, args.profile_kernel, args)
+        for _ in range(args.warmup):
+            function()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            function()
+        for _ in range(args.warmup):
+            graph.replay()
+        stream.synchronize()
+        print(f"Profiling {args.profile_kernel}: M={m} N={n} K={k}, "
+              f"supergroup={width}; correctness PASS", flush=True)
+        torch.cuda.profiler.start()
+        try:
+            graph.replay()
+            stream.synchronize()
+        finally:
+            torch.cuda.profiler.stop()
+        return []
     kernels.call("gemm_bench_cublas", kernels.handle, a.data_ptr(), b.data_ptr(),
                  reference.data_ptr(), m, n, k, stream.cuda_stream)
     checks = {}
@@ -206,7 +233,7 @@ def benchmark_shape(torch, kernels, args, m):
             end.synchronize()
             samples[name].append(start.elapsed_time(end) / args.inner_iters)
 
-        time.sleep(3)
+        time.sleep(0.5)
 
     times = {name: statistics.median(values) for name, values in samples.items()}
     # Report useful FLOPs; do not count the padded MMA work as useful throughput.
@@ -245,6 +272,8 @@ def main():
     parser.add_argument("--rtol", type=float, default=0.02)
     parser.add_argument("--atol", type=float, default=0.01)
     parser.add_argument("--json", type=Path, help="write metadata, correctness errors and timing samples")
+    parser.add_argument("--profile-kernel", choices=("device_Mlocal_N", "Mglobal_N", "cuBLAS"),
+                        help="profile one warmed graph replay using cudaProfilerStart/Stop; no timings")
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--validate-only", action="store_true", help="CPU traversal model; no torch or CUDA needed")

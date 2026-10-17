@@ -15,6 +15,83 @@ python3 bench/gemm_traversal_bench.py --build-only
 python3 bench/gemm_traversal_bench.py --validate-only
 ```
 
+## Running on Modal
+
+Install Modal locally and authenticate once, then run the launcher from the
+repository root:
+
+```bash
+pip install --upgrade modal
+modal setup
+modal run bench/gemm_traversal_modal.py
+```
+
+The launcher uploads the current benchmark sources and headers, builds the CUDA
+library remotely, and calls `bench/gemm_traversal_bench.py` on one GPU using
+Modal's `B200+` selection (B200 or B300). The image
+provides CUDA 13.2, make, g++, and CUDA-enabled PyTorch. Benchmark output streams
+to the terminal, and the JSON results are saved locally to
+`build/gemm_traversal_modal.json` when the run succeeds.
+
+Select a B200 or forward options to the benchmark with `--bench-args`:
+
+```bash
+modal run bench/gemm_traversal_modal.py --gpu B200 \
+  --bench-args "--shapes 2048 4096 --logical-devices 4 --samples 3" \
+  --output build/gemm_traversal_b200.json
+```
+
+`--gpu` accepts `B200`, `B300`, and `B200+` (the default). Explicit GPU types
+select `sm_100a` and `sm_103a`, respectively. With `B200+`, the launcher detects
+the allocated GPU's compute capability remotely and selects the matching
+architecture before building.
+The launcher manages `--arch`, `--cuda-home`, `--device`, and `--json`; use
+`--output` for the local JSON destination. Other benchmark options, including
+`--build-only` and `--validate-only`, can be passed through `--bench-args`; those
+two modes finish without producing JSON. Each invocation requests one physical
+GPU, regardless of `--logical-devices`, with a one-hour timeout.
+
+To request Nsight Compute reports for the 32768 square case on the same GPU
+type as the original run:
+
+```bash
+modal run bench/gemm_traversal_modal.py --gpu B200 --ncu \
+  --ncu-output build/gemm_traversal_ncu_32768
+```
+
+NCU mode defaults to `--shapes 32768` and the `detailed` metric set, which
+includes memory workload analysis. It captures separate `.ncu-rep` reports and
+raw metric CSV files for `device_Mlocal_N`, `Mglobal_N`, and `cuBLAS`. Open the
+reports with `ncu-ui`. Use `--ncu-set full` for additional counters or
+`--bench-args` to change the workload.
+
+Each capture validates the selected kernel, warms it up, captures a graph
+containing one GEMM, warms the graph, and profiles one replay inside
+`cudaProfilerStart/Stop`. Application replay repeats this setup for each
+counter pass; NCU cache flushing and clock control are disabled to preserve the
+application's warmup and default clock behavior. Profiling runs produce no
+benchmark timing samples. Continue using ordinary benchmark runs for timings.
+
+The launcher first probes hardware-counter access with a tiny kernel. If the
+Modal runtime cannot initialize NCU, it stops before building or running the
+large workload and downloads `probe.log` and `status.json` to the output
+directory. Installing NCU alone does not guarantee that a container runtime
+exposes the required GPU profiling interfaces.
+
+The profiling entry point also works on a machine with NCU counter access:
+
+```bash
+python bench/gemm_traversal_bench.py --build-only --arch sm_100a
+ncu --set detailed --profile-from-start off --replay-mode application \
+  --cache-control none --clock-control none --graph-profiling node \
+  -o build/device_Mlocal_N_32768 \
+  python bench/gemm_traversal_bench.py --arch sm_100a --shapes 32768 \
+    --profile-kernel device_Mlocal_N
+```
+
+Repeat with `--profile-kernel Mglobal_N` and a different output filename to
+compare the traversals. Adjust `--cuda-home` if needed, and use `sm_103a` on B300.
+
 The Python script allocates tensors with PyTorch, calls the compiled kernels
 through ctypes, checks results against `cublasGemmEx`, and measures CUDA graphs
 with CUDA events. The small C ABI library instantiates the kernel body in
