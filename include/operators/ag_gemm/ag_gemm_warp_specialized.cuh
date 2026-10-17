@@ -31,6 +31,7 @@
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
+#include "operators/ag_gemm/gemm_tile_traversal.h"
 
 namespace ag_gemm_warp_specialized {
 
@@ -42,6 +43,7 @@ static constexpr int MIN_LARGE_GEMM_N = 6288;
 enum class AgStrategy {
     PULL,
     MULTICAST_PUSH,
+    GEMM_ONLY,  // All shards already reside in local memory; no flags or copies.
 };
 
 // Zero this allocation once, before any rank starts using it. Each rank owns
@@ -96,7 +98,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          AgStrategy STRATEGY>
+          AgStrategy STRATEGY,
+          TileTraversal TRAVERSAL = TileTraversal::DEVICE_M_LOCAL_N>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 

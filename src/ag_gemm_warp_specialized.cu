@@ -133,42 +133,22 @@ void prepare_ready(const A_ready_distributed_tensor& ready, int dev_idx, cudaStr
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 
-// traverse the grid in a snake like pattern to raise L2 cache reuse
-// https://github.com/HazyResearch/ThunderKittens/blob/0230013a72b51338a137b50f69538ec69d4d4675/include/common/util.cuh#L367
-template <int SUPERGROUP_WIDTH = 5>
-__device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
-                                                                   int num_cols,
-                                                                   int tile_idx) {
-    static_assert(SUPERGROUP_WIDTH > 0, "SUPERGROUP_SIZE must be greater than 0");
-    const int supergroup_numel = num_rows * SUPERGROUP_WIDTH;
-    const int supergroup_idx = tile_idx / supergroup_numel;
-    const int supersection_cols = (num_cols / SUPERGROUP_WIDTH) * SUPERGROUP_WIDTH;
-    const int supersection_numel = num_rows * supersection_cols;
-    const int finalsection_cols = num_cols - supersection_cols;
-    int row_idx, col_idx;
-    if (tile_idx < supersection_numel) {
-        row_idx = (tile_idx % supergroup_numel) / SUPERGROUP_WIDTH;
-        col_idx = supergroup_idx * SUPERGROUP_WIDTH + tile_idx % SUPERGROUP_WIDTH;
-    } else {
-        const int remainder_task_id = tile_idx - supersection_numel;
-        row_idx = remainder_task_id / finalsection_cols;
-        col_idx = supersection_cols + remainder_task_id % finalsection_cols;
-    }
-    return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
-};
-
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          AgStrategy STRATEGY>
+          AgStrategy STRATEGY,
+          TileTraversal TRAVERSAL>
 __device__ __forceinline__ void ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
-    const uint32_t copy_epoch =
-        comm::atomic_u32::acquire_load_gpu(G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT);
+    uint32_t copy_epoch = 0;
+    if constexpr (STRATEGY != AgStrategy::GEMM_ONLY) {
+        copy_epoch =
+            comm::atomic_u32::acquire_load_gpu(G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT);
+    }
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
@@ -189,8 +169,11 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
     // round up to the nearest multiple of the COL_BLOCK
     const int num_col_tiles = (G.N + _COL_BLOCK - 1) / _COL_BLOCK;
-    const int cluster_tiles_per_device = cluster_rows_per_device * num_col_tiles;
-    const int total_num_tiles = cluster_tiles_per_device * fg::NUM_DEVICES;
+    const int total_num_tiles = cluster_rows_per_device * num_col_tiles * fg::NUM_DEVICES;
+    auto tile_coordinate = [&](int tile_id) {
+        return gemm_tile_coordinate<SUPERGROUP_WIDTH, TRAVERSAL>(
+            cluster_rows_per_device, num_col_tiles, tile_id, fg::NUM_DEVICES, G.dev_idx);
+    };
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
@@ -240,24 +223,21 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     everyone::tma::cluster::arrive_aligned();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
-        const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
-        const bool is_local = actual_target_device == G.dev_idx;
-
-        // Multicast push polls the source rank's ordinary ready allocation via
-        // its imported peer pointer. Pull polls a locally committed flag after
-        // each copy engine transfer into this rank's gathered buffer.
-        if (!is_local) {
-            if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
-                while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                                          G.A_copy_ready[actual_target_device].raw_ptr),
-                                      copy_epoch)) {
-                    __nanosleep(16);
-                }
-            } else {
-                while (!epoch_reached(comm::atomic_u32::acquire_load_gpu(
-                                          G.A_copy_ready[G.dev_idx].raw_ptr + actual_target_device),
-                                      copy_epoch)) {
-                    __nanosleep(16);
+        const int actual_target_device = target_device;
+        if constexpr (STRATEGY != AgStrategy::GEMM_ONLY) {
+            if (actual_target_device != G.dev_idx) {
+                if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+                    while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
+                                              G.A_copy_ready[actual_target_device].raw_ptr),
+                                          copy_epoch)) {
+                        __nanosleep(16);
+                    }
+                } else {
+                    while (!epoch_reached(comm::atomic_u32::acquire_load_gpu(
+                                              G.A_copy_ready[G.dev_idx].raw_ptr + actual_target_device),
+                                          copy_epoch)) {
+                        __nanosleep(16);
+                    }
                 }
             }
         }
@@ -455,15 +435,10 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                 int input_stage_id = 0;
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_comp_clusters) {
-                    // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-                    auto [local_row_id, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
-                        cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
-
-                    int target_device = tile_id / cluster_tiles_per_device;
-
-                    load(local_row_id * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank,
-                         tile_col_idx,
-                         target_device,
+                    const auto tile = tile_coordinate(tile_id);
+                    load(tile.row * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank,
+                         tile.column,
+                         tile.device,
                          input_stage_id);
                 }
             }
@@ -482,12 +457,16 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
             if (warp_id == 5) {
                 tm_alloc.provision(tmem_addr);
+                tensor_before_thread_sync();
+                __syncwarp();
                 if (elect_warp_leader()) {
                     arrive(tmem_allocated);
                 }
+                tensor_after_thread_sync();
                 tm_alloc.set_addr(tmem_addr);
             } else {
                 wait(tmem_allocated, 0);
+                tensor_after_thread_sync();
                 tm_alloc.set_addr(tmem_addr);
             }
 
@@ -521,6 +500,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // wait for PDL and tmem
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
+        tensor_after_thread_sync();
+        tm_alloc.set_addr(tmem_addr);
 
 #pragma unroll
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
@@ -530,21 +511,17 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         }
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_comp_clusters) {
-            // work should be partitioned based on the rank tile size. M = GLOBAL_M / TP
-            auto [local_row_id, tile_col_idx] = calculate_tile_idx<SUPERGROUP_WIDTH>(
-                cluster_rows_per_device, num_col_tiles, tile_id % cluster_tiles_per_device);
-            const int target_device =
-                (tile_id / cluster_tiles_per_device + G.dev_idx) % fg::NUM_DEVICES;
+            const auto tile = tile_coordinate(tile_id);
 
 #pragma unroll
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 // Matches the load()/consume() row offset: consumer c owns
                 // the row tile NUM_CLUSTERS further along than consumer 0.
                 const int local_cta_row =
-                    (local_row_id * fg::CONSUMER_WARPS + c) * fg::NUM_CLUSTERS + cta_rank;
-                epilogue(target_device,
+                    (tile.row * fg::CONSUMER_WARPS + c) * fg::NUM_CLUSTERS + cta_rank;
+                epilogue(tile.device,
                          local_cta_row,
-                         tile_col_idx,
+                         tile.column,
                          &tmem[c * fg::TMEM_PIPELINE_STAGES],
                          c,
                          epilogue_stage_id[c],
@@ -584,7 +561,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          AgStrategy STRATEGY>
+          AgStrategy STRATEGY,
+          TileTraversal TRAVERSAL>
 __global__ __cluster_dims__(
     fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
@@ -598,7 +576,8 @@ __global__ __cluster_dims__(
                              _NUM_CTA,
                              SUPERGROUP_WIDTH,
                              _NUM_CONSUMER_WARPS,
-                             STRATEGY>(G);
+                             STRATEGY,
+                             TRAVERSAL>(G);
 }
 
 template <int _ROW_BLOCK,
@@ -606,7 +585,8 @@ template <int _ROW_BLOCK,
           int _NUM_CTA,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS,
-          AgStrategy STRATEGY>
+          AgStrategy STRATEGY,
+          TileTraversal TRAVERSAL>
 inline void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
@@ -618,46 +598,33 @@ inline void launch_ag_gemm_warp_specialized(
 #endif
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
-    ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
-
-    // The GPU-side prepare handshake precedes this fork on the main stream.
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
-    MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
-
-    const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
-    const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
-
-    if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
-        auto* dst = G.A.mc_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
-        const auto* src = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-        // Copy the device epoch after the payload, so graph replay publishes
-        // a fresh value. Keep signaling on the copy engine: a signal kernel
-        // could starve behind the persistent GEMM's polling CTAs.
-        MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr,
-                                          G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
-                                          sizeof(uint32_t),
-                                          cudaMemcpyDeviceToDevice,
-                                          copy_state.stream));
-    } else {
-        // Stage one complete shard per remote device in the same ring order
-        // used by the persistent kernel. The local shard is read directly.
-#pragma unroll
-        for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
-            const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-            auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-            const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-
+    if constexpr (STRATEGY != AgStrategy::GEMM_ONLY) {
+        ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
+        MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
+        const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
+        const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
+        if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
+            auto* dst = G.A.mc_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
+            const auto* src = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(G.dev_idx) * shard_elements;
             MKERNEL_CUDACHECK(cudaMemcpyAsync(
                 dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
-            // Stream order publishes the payload before its dynamic epoch.
-            MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr + peer,
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr,
                                               G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
-                                              sizeof(uint32_t),
-                                              cudaMemcpyDeviceToDevice,
+                                              sizeof(uint32_t), cudaMemcpyDeviceToDevice,
                                               copy_state.stream));
+        } else {
+            for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
+                const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+                auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+                const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+                MKERNEL_CUDACHECK(cudaMemcpyAsync(
+                    dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+                MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr + peer,
+                                                  G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
+                                                  sizeof(uint32_t), cudaMemcpyDeviceToDevice,
+                                                  copy_state.stream));
+            }
         }
     }
 
@@ -670,7 +637,8 @@ inline void launch_ag_gemm_warp_specialized(
                                          _NUM_CTA,
                                          SUPERGROUP_WIDTH,
                                          _NUM_CONSUMER_WARPS,
-                                         STRATEGY>;
+                                         STRATEGY,
+                                         TRAVERSAL>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -685,12 +653,15 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.dynamicSmemBytes = smem_size;
     launch_config.stream = stream;
     launch_config.attrs = &pdl_attr;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = STRATEGY == AgStrategy::GEMM_ONLY ? 0 : 1;
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 
-    MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
-    MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
+    if constexpr (STRATEGY != AgStrategy::GEMM_ONLY) {
+        ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
+        MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
+        MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
+    }
 
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
