@@ -18,6 +18,7 @@ import math
 from pathlib import Path
 import statistics
 import subprocess
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SIZES = (2048, 4096, 8192, 16384, 32768)
@@ -204,6 +205,8 @@ def benchmark_shape(torch, kernels, args, m):
             end.record(stream)
             end.synchronize()
             samples[name].append(start.elapsed_time(end) / args.inner_iters)
+
+        time.sleep(3)
 
     times = {name: statistics.median(values) for name, values in samples.items()}
     # Report useful FLOPs; do not count the padded MMA work as useful throughput.
