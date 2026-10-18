@@ -1,7 +1,8 @@
-"""Single-node BF16 GEMM + reduce-scatter: cuBLAS/NCCL and CUTLASS.
+"""Single-node BF16 GEMM + reduce-scatter: cuBLAS/NCCL, CUTLASS, and TK.
 
 Run with torchrun --standalone --nproc-per-node=8 and set CUTLASS_PATH to
 the pinned checkout linked below. K is the per-rank shard of global K=12288.
+For TK, set THUNDERKITTENS_PATH to a checkout with gemm_rs's B200 _C built.
 """
 
 import argparse
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -16,7 +18,10 @@ import torch.distributed as dist
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
+
+from common import check_close
 import load_thirdparty
+
 
 class BlackwellBenchConfig:
     arch = "blackwell"
@@ -64,6 +69,11 @@ class BlackwellBenchConfig:
     ]
 
 
+class DistBufferLike(Protocol):
+    """Common tensor access for dynamically loaded distributed buffers."""
+    data_: torch.Tensor
+
+
 @dataclass
 class BlackwellBenchVars:
     baseline_a: torch.Tensor | None = None
@@ -71,6 +81,12 @@ class BlackwellBenchVars:
     baseline_c: torch.Tensor | None = None
     baseline_c_rs: torch.Tensor | None = None
     baseline_graph: torch.cuda.CUDAGraph | None = None
+
+    a_tk: torch.Tensor | None = None
+    b_tk: torch.Tensor | None = None
+    c_tk_dist: DistBufferLike | None = None
+    c_tk_barrier: DistBufferLike | None = None
+    tk_graph: torch.cuda.CUDAGraph | None = None
 
 
 def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
@@ -107,11 +123,33 @@ def cutlass_available(config: BlackwellBenchConfig) -> bool:
     return bool(vote.item())
 
 
-def make_baseline_buffers(config: BlackwellBenchConfig, M: int, N: int, K: int) -> BlackwellBenchVars:
+def tk_available(config: BlackwellBenchConfig, M: int, N: int, K: int) -> bool:
+    tk_ok, tk_why = load_thirdparty.tk_availability(config.world_size, "gemm_rs")
+    # B200 has 512x256 cluster tiles and distributes 128-row tiles over 8 GPUs.
+    if tk_ok and (M % 1024 or N % 256 or K % 64):
+        tk_ok = False
+        tk_why = f"M={M}, N={N}, K={K} must be divisible by 1024, 256, 64"
+    tk_vote = torch.tensor([1 if tk_ok else 0], device="cuda")
+    dist.all_reduce(tk_vote, op=dist.ReduceOp.MIN)
+    tk_ok = bool(tk_vote.item())
+    if not tk_ok:
+        if config.is_chief:
+            print(
+                f"[skip] ThunderKittens: "
+                f"{tk_why or 'unavailable on a peer'}",
+                flush=True,
+            )
+
+    return tk_ok
+
+
+def make_blackwell_buffers(
+    config: BlackwellBenchConfig, M: int, N: int, K: int, tk_module=None,
+) -> BlackwellBenchVars:
     if M % config.world_size:
         raise ValueError(f"M={M} must be divisible by world_size={config.world_size}")
     torch.manual_seed(42 + config.local_rank)
-    return BlackwellBenchVars(
+    buffers = BlackwellBenchVars(
         baseline_a=torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / K**0.25,
         baseline_b=torch.randn((N, K), device="cuda", dtype=torch.bfloat16) / K**0.25,
         baseline_c=torch.empty((M, N), device="cuda", dtype=torch.bfloat16),
@@ -119,11 +157,35 @@ def make_baseline_buffers(config: BlackwellBenchConfig, M: int, N: int, K: int) 
             (M // config.world_size, N), device="cuda", dtype=torch.bfloat16,
         ),
     )
+    if tk_module is not None:
+        buffers.a_tk = buffers.baseline_a.clone()
+        buffers.b_tk = buffers.baseline_b.clone()
+        buffers.c_tk_dist = tk_module.TKParallelTensor(
+            (M // config.world_size, N), dtype=torch.bfloat16,
+            local_rank=config.local_rank, local_world_size=config.world_size,
+            multicast=False,
+        )
+        buffers.c_tk_barrier = tk_module.TKParallelTensor(
+            (1, 1), dtype=torch.int,
+            local_rank=config.local_rank, local_world_size=config.world_size,
+            multicast=True,
+        )
+        buffers.c_tk_dist.data_.zero_()
+        buffers.c_tk_barrier.data_.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+    return buffers
 
 
 def run_baseline(buffers: BlackwellBenchVars):
     torch.mm(buffers.baseline_a, buffers.baseline_b.T, out=buffers.baseline_c)
     dist.reduce_scatter_tensor(buffers.baseline_c_rs, buffers.baseline_c)
+
+
+def run_tk(tk_module, buffers: BlackwellBenchVars):
+    tk_module.matmul_reduce_scatter(
+        buffers.a_tk, buffers.b_tk, buffers.c_tk_dist, buffers.c_tk_barrier,
+    )
 
 
 def capture_cuda_graph(run_once) -> torch.cuda.CUDAGraph:
@@ -142,25 +204,48 @@ def capture_cuda_graph(run_once) -> torch.cuda.CUDAGraph:
 
 
 def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig):
-    if not cutlass_available(config):
-        return True
-
+    all_correct = True
     for M in config.shapes_to_test:
         N, K = config.output_dim, config.split_inner_dim
-        candidates = (
-            config.cutlass_autotune_configs_2048 if M == 2048
-            else config.cutlass_autotune_configs
-        )
-        for candidate in candidates:
-            result = load_thirdparty.run_cutlass_reduce_scatter_once(
-                m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
-                warmup=0, iterations=1, check=True,
+
+        # Test TK
+        if tk_available(config, M, N, K):
+            tk_module = load_thirdparty.load_tk_extension("gemm_rs")
+            buffers = make_blackwell_buffers(config, M, N, K, tk_module)
+            run_baseline(buffers)
+            run_tk(tk_module, buffers)
+            torch.cuda.synchronize()
+
+            is_correct_tk = check_close(
+                f"gemm_rs TK M={M}", buffers.c_tk_dist.data_, buffers.baseline_c_rs,
             )
-            if result is not None and config.is_chief:
+            all_correct = is_correct_tk and all_correct
+            status = "passed :)" if is_correct_tk else "FAILED :("
+            if config.is_chief:
                 print(
-                    f"[correctness] CUTLASS M={M} {cutlass_config_label(candidate)}: PASS",
+                    f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
+            del buffers
+
+        # Test cutlass
+        if cutlass_available(config):
+            candidates = (
+                config.cutlass_autotune_configs_2048 if M == 2048
+                else config.cutlass_autotune_configs
+            )
+            for candidate in candidates:
+                result = load_thirdparty.run_cutlass_reduce_scatter_once(
+                    m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
+                    warmup=0, iterations=1, check=True,
+                )
+                if result is not None and config.is_chief:
+                    print(
+                        f"[correctness] CUTLASS M={M} {cutlass_config_label(candidate)}: PASS",
+                        flush=True,
+                    )
+    if not all_correct:
+        raise RuntimeError("TK correctness checks failed; skipping benchmarks.")
     return True
 
 
@@ -168,60 +253,72 @@ def gemm_rs_blackwell_prepare(
     config: BlackwellBenchConfig, M: int, N: int, K: int, warmup: int, iters: int,
 ):
     """Return (fn, name, should_wrap); CUTLASS returns its own timing in ms."""
-    buffers = make_baseline_buffers(config, M, N, K)
-    
+    tk_module = (
+        load_thirdparty.load_tk_extension("gemm_rs")
+        if tk_available(config, M, N, K) else None
+    )
+    buffers = make_blackwell_buffers(config, M, N, K, tk_module)
+
     def run_baseline_for_graph_capture():
         run_baseline(buffers)
 
-    baseline_graph = capture_cuda_graph(run_baseline_for_graph_capture)
+    buffers.baseline_graph = capture_cuda_graph(run_baseline_for_graph_capture)
 
     def bench_baseline():
-        baseline_graph.replay()
+        buffers.baseline_graph.replay()
 
     fns = [(bench_baseline, "baseline", True)]
-    if not cutlass_available(config):
-        return fns
-
-    candidates = (
-        config.cutlass_autotune_configs_2048 if M == 2048
-        else config.cutlass_autotune_configs
-    )
-    timings = []
-    for candidate in candidates:
-        ms = load_thirdparty.run_cutlass_reduce_scatter_once(
-            m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
-            warmup=warmup, iterations=iters,
+    if cutlass_available(config):
+        candidates = (
+            config.cutlass_autotune_configs_2048 if M == 2048
+            else config.cutlass_autotune_configs
         )
-        if ms is not None:
-            timings.append((candidate, ms))
-
-    if not timings:
-        if config.is_chief:
-            print(
-                f"[skip] CUTLASS GEMM reduce-scatter: no config ran at M={M} N={N}",
-                flush=True,
+        timings = []
+        for candidate in candidates:
+            ms = load_thirdparty.run_cutlass_reduce_scatter_once(
+                m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
+                warmup=warmup, iterations=iters,
             )
-        return fns
+            if ms is not None:
+                timings.append((candidate, ms))
 
-    # Each timing is already the maximum across ranks, so every rank selects
-    # the same candidate even when their local fastest configurations differ.
-    best_config, _ = min(timings, key=lambda item: item[1])
-    if config.is_chief:
-        for candidate, ms in sorted(timings, key=lambda item: item[1]):
-            mark = " <- best" if candidate == best_config else ""
-            print(
-                f"  [autotune] {cutlass_config_label(candidate)}: "
-                f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
-                flush=True,
-            )
+        if not timings:
+            if config.is_chief:
+                print(
+                    f"[skip] CUTLASS GEMM reduce-scatter: no config ran at M={M} N={N}",
+                    flush=True,
+                )
+        else:
+            # Max-rank timings ensure every rank selects the same candidate.
+            best_config, _ = min(timings, key=lambda item: item[1])
+            if config.is_chief:
+                for candidate, ms in sorted(timings, key=lambda item: item[1]):
+                    mark = " <- best" if candidate == best_config else ""
+                    print(
+                        f"  [autotune] {cutlass_config_label(candidate)}: "
+                        f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
+                        flush=True,
+                    )
 
-    def bench_cutlass():
-        return load_thirdparty.run_cutlass_reduce_scatter_once(
-            m=M, n=N, k=K, config=cutlass_config_kwargs(config, best_config),
-            warmup=warmup, iterations=iters,
-        )
+            def bench_cutlass():
+                return load_thirdparty.run_cutlass_reduce_scatter_once(
+                    m=M, n=N, k=K, config=cutlass_config_kwargs(config, best_config),
+                    warmup=warmup, iterations=iters,
+                )
 
-    fns.append((bench_cutlass, "cutlass", False))
+            fns.append((bench_cutlass, "cutlass", False))
+
+    if tk_module is not None:
+        def tk_graph_warmup():
+            run_tk(tk_module, buffers)
+
+        buffers.tk_graph = capture_cuda_graph(tk_graph_warmup)
+
+        def run_tk_once():
+            buffers.tk_graph.replay()
+
+        fns.append((run_tk_once, "ThunderKittens", True))
+
     return fns
 
 
@@ -294,6 +391,12 @@ def main():
                 print(
                     f"  CUTLASS speedup vs cuBLAS+NCCL: "
                     f"{results['baseline'] / results['cutlass']:.3f}x",
+                    flush=True,
+                )
+            if config.is_chief and "ThunderKittens" in results:
+                print(
+                    f"  ThunderKittens speedup vs cuBLAS+NCCL: "
+                    f"{results['baseline'] / results['ThunderKittens']:.3f}x",
                     flush=True,
                 )
     finally:

@@ -267,7 +267,11 @@ def _load_tk_extension(kernel_folder_path: str):
         raise ImportError(f"could not create an import spec for {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for symbol in ("TKParallelTensor", "all_gather_matmul"):
+    kernel_symbol = (
+        "matmul_reduce_scatter" if kernel_folder_path == "gemm_rs"
+        else "all_gather_matmul"
+    )
+    for symbol in ("TKParallelTensor", kernel_symbol):
         if not hasattr(module, symbol):
             raise AttributeError(f"{path} does not define {symbol}")
     _TK_MODULE = module
@@ -280,7 +284,7 @@ def load_tk_extension(kernel_folder_path: str):
 
 def tk_availability(world_size: int, kernel_folder_path: str) -> tuple[bool, str]:
     if world_size != 8:
-        return False, "upstream TK kernels only support intranode communication"
+        return False, "upstream TK kernels require 8 GPUs on one node"
     try:
         _load_tk_extension(kernel_folder_path)
     except Exception as exc:
