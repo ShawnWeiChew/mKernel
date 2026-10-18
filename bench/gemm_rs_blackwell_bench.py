@@ -386,6 +386,8 @@ def main():
                     flush=True,
                 )
     finally:
+        torch.cuda.synchronize()
+        dist.barrier()
         dist.destroy_process_group()
 
 
