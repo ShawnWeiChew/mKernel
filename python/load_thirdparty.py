@@ -146,6 +146,7 @@ def run_cutlass_reduce_scatter_once(
     In check mode the upstream GEMM, RS, and barrier assertions run instead.
     Call the distributed helpers directly: run() discards their timing result
     and destroys the process group, so it cannot be used for repeated tuning.
+    Set CUTLASS_VERBOSE=1 to show upstream benchmark stdout.
     """
     import cutlass
 
@@ -207,14 +208,20 @@ def run_cutlass_reduce_scatter_once(
         torch.cuda.synchronize()
         return 0.0
 
-    time_us = example.run_distributed_benchmark(
-        **kwargs,
-        warmup_iterations=warmup,
-        iterations=iterations,
-        use_cuda_graph=use_cuda_graph,
-        benchmark_all=False,
-        csv_report=csv_report,
+    # Upstream prints a timing from every rank, even for a single candidate.
+    stdout_context = (
+        contextlib.nullcontext() if os.environ.get("CUTLASS_VERBOSE", "0") == "1"
+        else contextlib.redirect_stdout(io.StringIO())
     )
+    with stdout_context:
+        time_us = example.run_distributed_benchmark(
+            **kwargs,
+            warmup_iterations=warmup,
+            iterations=iterations,
+            use_cuda_graph=use_cuda_graph,
+            benchmark_all=False,
+            csv_report=csv_report,
+        )
     torch.cuda.synchronize()
     elapsed = torch.tensor([float(time_us) / 1000.0], dtype=torch.float64, device="cuda")
     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
