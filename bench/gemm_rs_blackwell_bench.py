@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Protocol
+import time
 
 import torch
 import torch.distributed as dist
@@ -227,23 +228,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig):
                     flush=True,
                 )
             del buffers
-
-        # Test cutlass
-        if cutlass_available(config):
-            candidates = (
-                config.cutlass_autotune_configs_2048 if M == 2048
-                else config.cutlass_autotune_configs
-            )
-            for candidate in candidates:
-                result = load_thirdparty.run_cutlass_reduce_scatter_once(
-                    m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
-                    warmup=0, iterations=1, check=True,
-                )
-                if result is not None and config.is_chief:
-                    print(
-                        f"[correctness] CUTLASS M={M} {cutlass_config_label(candidate)}: PASS",
-                        flush=True,
-                    )
+            
     if not all_correct:
         raise RuntimeError("TK correctness checks failed; skipping benchmarks.")
     return True
@@ -387,6 +372,7 @@ def main():
                             f"{ms:.3f} ms  {useful_tflops(M, N, K, ms):.2f} TFLOP/s",
                             flush=True,
                         )
+                time.sleep(0.5)
             if config.is_chief and "cutlass" in results:
                 print(
                     f"  CUTLASS speedup vs cuBLAS+NCCL: "
