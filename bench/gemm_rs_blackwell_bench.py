@@ -351,6 +351,8 @@ def main():
     if torch.cuda.get_device_capability()[0] != 10:
         parser.error("This benchmark requires Blackwell GPUs")
     dist.init_process_group("nccl", device_id=torch.device("cuda", config.local_rank))
+    fns = []
+    fn = None
     try:
         check_correctness_gemm_rs_blackwell(config)
         if args.mode == "check":
@@ -385,7 +387,11 @@ def main():
                     f"{results['baseline'] / results['ThunderKittens']:.3f}x",
                     flush=True,
                 )
+
     finally:
+        # clear NCCL communicator instances to allow teardown
+        fn = None
+        fns.clear()
         torch.cuda.synchronize()
         dist.barrier()
         dist.destroy_process_group()
