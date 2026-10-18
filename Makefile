@@ -197,3 +197,6 @@ ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
 $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+run-gemm-rs-intranode : 
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_bench.py --warmup 20 --iters 50
