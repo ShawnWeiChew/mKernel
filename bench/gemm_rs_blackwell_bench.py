@@ -294,15 +294,16 @@ def gemm_rs_blackwell_prepare(
             fns.append((bench_cutlass, "cutlass", False))
 
     if tk_module is not None:
-        def tk_graph_warmup():
+        def bench_tk_eager():
             run_tk(tk_module, buffers)
 
-        buffers.tk_graph = capture_cuda_graph(tk_graph_warmup)
+        buffers.tk_graph = capture_cuda_graph(bench_tk_eager)
 
-        def run_tk_once():
+        def bench_tk_graph():
             buffers.tk_graph.replay()
 
-        fns.append((run_tk_once, "ThunderKittens", True))
+        fns.append((bench_tk_eager, "ThunderKittens eager", True))
+        fns.append((bench_tk_graph, "ThunderKittens graph", True))
 
     return fns
 
@@ -381,15 +382,24 @@ def main():
                     f"{results['baseline'] / results['cutlass']:.3f}x",
                     flush=True,
                 )
-            if config.is_chief and "ThunderKittens" in results:
-                print(
-                    f"  ThunderKittens speedup vs cuBLAS+NCCL: "
-                    f"{results['baseline'] / results['ThunderKittens']:.3f}x",
-                    flush=True,
-                )
+            if config.is_chief:
+                for tk_name in ("ThunderKittens eager", "ThunderKittens graph"):
+                    if tk_name in results:
+                        print(
+                            f"  {tk_name} speedup vs cuBLAS+NCCL: "
+                            f"{results['baseline'] / results[tk_name]:.3f}x",
+                            flush=True,
+                        )
+                if "ThunderKittens eager" in results and "ThunderKittens graph" in results:
+                    print(
+                        f"  TK graph speedup vs eager: "
+                        f"{results['ThunderKittens eager'] / results['ThunderKittens graph']:.3f}x",
+                        flush=True,
+                    )
 
     finally:
-        # clear NCCL communicator instances to allow teardown
+        # all cudagraphs referencing the NCCL communicator have to be released first,
+        # else there would be a teardown deadlock
         fn = None
         fns.clear()
         torch.cuda.synchronize()
