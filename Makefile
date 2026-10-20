@@ -178,7 +178,25 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized
+	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized \
+	gemm-rs-blackwell test-gemm-rs-epoch
+
+test-gemm-rs-epoch: $(BUILD)/test_gemm_rs_epoch
+	$<
+
+$(BUILD)/test_gemm_rs_epoch: tests/test_gemm_rs_epoch.cpp include/operators/gemm_rs/epoch.cuh | $(BUILD)
+	$(CXX) -std=c++17 -O2 -I include $< -o $@
+
+# Compile an explicitly instantiated kernel and report register/spill usage.
+# This does not require the unfinished GEMM+RS Python session/bindings.
+gemm-rs-blackwell: $(BUILD)/gemm_rs_blackwell.o
+
+$(BUILD)/gemm_rs_blackwell.o: $(SRC)/gemm_rs_blackwell.cu Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) $(COMMON_INC) \
+	    --compiler-options '-fPIC' --ptxas-options=-v -lineinfo -MMD -MP \
+	    -MF $(BUILD)/gemm_rs_blackwell.d -c $< -o $@
+
+-include $(BUILD)/gemm_rs_blackwell.d
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py

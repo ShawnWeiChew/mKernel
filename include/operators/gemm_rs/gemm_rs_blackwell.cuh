@@ -30,6 +30,7 @@
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
+#include "operators/gemm_rs/epoch.cuh"
 
 namespace gemm_rs_blackwell {
 static constexpr int DEFAULT_NUM_CTA = 2;
@@ -37,11 +38,24 @@ static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 2;
 static constexpr int DEFAULT_NUM_EPILOGUE_WARPS = 1;
 static constexpr int DEFAULT_C_TILE_DIVISOR = 4;
 
+// One persistent 32-bit word on each rank; no multicast allocation is needed.
+// Only the owning rank writes its completed epoch. Peers acquire-load it.
+using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
+using completion_epoch_dist_tensor =
+    dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
+
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 struct fused_globals;
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
+
+// Call once before capture/replay, with no work using these buffers in flight.
+// After every rank initializes its local state, synchronize all ranks before
+// the first launch. Keep the same tile layout and serialize launches on G.stream.
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+void initialize_gemm_rs_blackwell_state(
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 struct fused_globals {
@@ -62,6 +76,10 @@ struct fused_globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
+    // Keep 16 wide-store results live: 128 packed 32-bit registers per RS lane.
+    // Each batch issues 32 x 16-byte reductions before 16 x 32-byte stores.
+    static constexpr int RS_STORES_PER_BATCH = 16;
+
     static constexpr int TMEM_PIPELINE_STAGES =
         kittens::MAX_TENSOR_COLS / COL_BLOCK / CONSUMER_WARPS;
     static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
@@ -75,7 +93,7 @@ struct fused_globals {
     using A_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, RED_BLOCK>;  // [M, K]
     using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;    // [N, K]
 
-    using C_tt_tile = kittens::tt<comm::bf16, ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK>;  // [M, N]
+    using C_tt_tile = kittens::tt<float, ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK>;  // [M, N]
     using C_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK / C_TILE_DIVISOR>;
 
     static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
@@ -96,13 +114,12 @@ struct fused_globals {
     int N;
     int K;
 
-    static constexpr int epoch = 1;
-
     A_local_tensor A;
     B_local_tensor B;
     C_dist_tensor C;
 
     C_ready_barrier C_barrier;
+    completion_epoch_dist_tensor completion_epochs;
 
     cudaStream_t stream = nullptr;
 
@@ -136,25 +153,37 @@ __host__ inline fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> gemm_rs_blac
     LocalTensor& B,
     DistributedTensor& C,
     DistributedTensor& C_barrier,
+    DistributedTensor& completion_epochs,
     int dev_idx,
     int M,
     int N,
     int K,
     cudaStream_t stream) {
     using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
-        return {.A = dist::local_tensor_from_tensor(A),
-                .B = dist::local_tensor_from_tensor(B),
-                .C = dist::distributed_tensor_from_buffer(C),
-                .C_barrier = dist::distributed_tensor_from_buffer(C_barrier),
-                .dev_idx = dev_idx,
+        TORCH_CHECK(completion_epochs.data_.numel() == 1 &&
+                        completion_epochs.data_.element_size() == sizeof(uint32_t),
+                    "completion_epochs must contain one 32-bit word per rank");
+        return {.dev_idx = dev_idx,
                 .M = M,
                 .N = N,
                 .K = K,
+                .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
+                .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+                .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
+                .C_barrier = dist::distributed_tensor_from_buffer<typename fg::C_ready_barrier>(
+                    C_barrier),
+                .completion_epochs =
+                    dist::distributed_tensor_from_buffer<completion_epoch_dist_tensor>(
+                        completion_epochs),
                 .stream = stream};
     } else {
         static_assert(always_false_v<LocalTensor>, "Unsupported LocalTensorType");
     }
+#else
+    static_assert(always_false_v<LocalTensor>, "Construct fused_globals directly without Torch");
+#endif
 }
 };  // namespace gemm_rs_blackwell

@@ -43,8 +43,6 @@
 #include "memory/tk_ops_group_util_util.cuh"
 // clang-format on
 
-// TODO: reset barrier value at every epoch
-
 using namespace kittens;
 
 namespace gemm_rs_blackwell {
@@ -59,31 +57,68 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
-// __device__ __forceinline__ void multimem_ld_reduce(bf16_2* dst, const bf16_2* src) {
-//     asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16_2 {%0, %1, %2, %3}, [%4];",
-//                  dst[0],
-//                  dst[1],
-//                  dst[2],
-//                  dst[3],
-//                  src);
-// }
+__device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16* src) {
+    asm volatile(
+        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
+        "{%0, %1, %2, %3}, [%4];"
+        : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
+        : "l"(src)
+        : "memory");
+}
 
-// __device__ __forceinline__ void store_float8(float* ptr, const float* v) {
-//     asm volatile(
-//         "st.global.v8.f32 [%0], "
-//         "{%1, %2, %3, %4, %5, %6, %7, %8};"
-//         :
-//         : "l"(ptr),
-//           "f"(v[0]),
-//           "f"(v[1]),
-//           "f"(v[2]),
-//           "f"(v[3]),
-//           "f"(v[4]),
-//           "f"(v[5]),
-//           "f"(v[6]),
-//           "f"(v[7])
-//         : "memory");
-// }
+__device__ __forceinline__ void store_32B(comm::bf16* dst, const uint32_t* in) {
+    // Store the packed BF16 bits without converting them to float.
+    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                 :
+                 : "l"(dst),
+                   "r"(in[0]),
+                   "r"(in[1]),
+                   "r"(in[2]),
+                   "r"(in[3]),
+                   "r"(in[4]),
+                   "r"(in[5]),
+                   "r"(in[6]),
+                   "r"(in[7])
+                 : "memory");
+}
+
+template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH>
+__device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_tile,
+                                                    comm::bf16* local_tile,
+                                                    size_t row_stride,
+                                                    int lane) {
+    constexpr int ELEMENTS_PER_STORE = 16;
+    constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
+    static_assert(TILE_COLS == 256, "RS maps each half warp to one 256-element row");
+    constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
+    constexpr int ROWS_PER_BATCH = STORES_PER_BATCH * ROWS_PER_STORE;
+    static_assert(STORES_PER_BATCH > 0 && STORES_PER_BATCH <= 16);
+    static_assert(TILE_ROWS % ROWS_PER_BATCH == 0, "RS requires whole register batches");
+
+    const int lane_col = (lane % LANES_PER_ROW) * ELEMENTS_PER_STORE;
+    const int lane_row = lane / LANES_PER_ROW;
+
+    for (int batch_row = 0; batch_row < TILE_ROWS; batch_row += ROWS_PER_BATCH) {
+        // Scalarized by the unrolled loops: eight packed words per 32-byte store.
+        uint32_t reduced[STORES_PER_BATCH][8];
+
+#pragma unroll
+        for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
+            const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
+            const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
+            reduce_load_16B(&reduced[store_idx][0], src);
+            reduce_load_16B(&reduced[store_idx][4], src + 8);
+        }
+
+        // Recompute addresses instead of keeping a pointer array live with the payload.
+#pragma unroll
+        for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
+            const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
+            comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
+            store_32B(dst, reduced[store_idx]);
+        }
+    }
+}
 
 template <int SUPERGROUP_WIDTH = 8>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
@@ -108,6 +143,26 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
 }
 }  // namespace
 
+// A normal same-stream launch after fused_kernel_stub establishes completion of
+// every local CTA and its global writes before this rank publishes its epoch.
+// Do not enable PDL or signal early launch completion in this barrier kernel.
+__global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_idx) {
+    __shared__ uint32_t completed_epoch;
+    if (threadIdx.x == 0) {
+        auto* local_epoch = epochs[dev_idx].raw_ptr;
+        completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
+        comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
+    }
+    __syncthreads();
+
+    for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += blockDim.x) {
+        while (!epoch_reached(comm::atomic_u32::acquire_load_sys(epochs[peer].raw_ptr),
+                              completed_epoch)) {
+            __nanosleep(16);
+        }
+    }
+}
+
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 __device__ __forceinline__ void gemm_rs_blackwell(
     const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
@@ -120,7 +175,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     if (warp_id == 0 && elect_warp_leader()) {
         G.A.template prefetch_tma<typename fg::A_tile>();
         G.B.template prefetch_tma<typename fg::B_tile>();
-        G.C.template prefetch_tma<typename fg::C_tile>();
+        G.C[G.dev_idx].template prefetch_tma<typename fg::C_tile>();
     }
 
     const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
@@ -185,7 +240,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
-            tma::cluster::expect_bytes(tma_load[input_stage_id], ((phasebits >> 1) & 0b1));
+            tma::cluster::expect_bytes(
+                tma_load[input_stage_id], sizeof(fg::A_tile) * 2 + sizeof(fg::B_tile), 0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
@@ -220,7 +276,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            mm_ABt_ncta<fg::NUM_CTA>(
+            mm_ABt_ncta<fg::NUM_CLUSTERS>(
                 tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -233,7 +289,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            mma_ABt_ncta<fg::NUM_CTA>(
+            mma_ABt_ncta<fg::NUM_CLUSTERS>(
                 tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -282,7 +338,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 
 #pragma unroll
-        for (int i = 0; i < C_CHUNK_COLS; i++) {
+        for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
             // need to know that there is at least 1 slot of smem in C tile that is free
             dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
             warpgroup::sync(1);
@@ -343,64 +399,53 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     // TODO: check consume
-                    consume(tmem, input_stage_id, epilogue_stage_id, cta_rank);
+                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_id);
                 }
             }
 
             pdl::arrive();
         } else {
-            const int tiles_per_device = (G.M / fg::ROW_BLOCK) * num_tile_cols;
+            const int lane = laneid();
+            const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
+            const int tiles_per_device = tile_rows_per_device * num_tile_cols;
 
-            // 16 is the width of the LDMC load
-            constexpr int tiles_per_thread =
-                fg::ROW_BLOCK * fg::COL_BLOCK * sizeof(comm::bf16) / (WARP_THREADS * 16);
-            constexpr int total_inner_iter = 8;
+            const int device_row_start = G.dev_idx * rows_per_device;
 
             pdl::wait();
             everyone::tma::cluster::wait();
 
-            for (int tile_idx = laneid(); tile_idx < tiles_per_device; tile_idx += WARP_THREADS) {
-                // TODO: potential IMA here
+            // Read after the dependency wait: the previous exit barrier may
+            // have advanced this word on the previous graph replay.
+            const uint32_t epoch =
+                comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
+            const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
 
-                // wait for signal
-                const int row_idx = tile_idx / rows_per_device;
-                const int col_idx = tile_idx % rows_per_device;
-                if (elect_warp_leader()) {
-                    int val;
-                    do {
-                        val = comm::atomic_u32::relaxed_load_s32_gpu(
-                            &G.C_barrier[G.dev_idx][{row_idx, col_idx}]);
-                    } while (val < fg::NUM_DEVICES);
+            for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
+                 tile_idx += fg::NUM_BLOCKS) {
+                const int local_tile_row = tile_idx / num_tile_cols;
+                const int tile_col = tile_idx % num_tile_cols;
+
+                // These match the coordinates used by the epilogue's signal.
+                if (lane == 0) {
+                    while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
+                                              &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
+                                          ready_count)) {
+                        __nanosleep(16);
+                    }
                 }
                 __syncwarp();
 
-                // do RS
-                for (int iter_loop = 0; iter_loop < tiles_per_thread;
-                     iter_loop += total_inner_iter) {
-                    // TODO: could potentially raise inner_iter to 16?
-
-                    comm::bf16_2 tmp[total_inner_iter][4];
-#pragma unroll
-                    for (int inner_iter = 0; inner_iter < total_inner_iter; inner_iter++) {
-                        multimem_ld_reduce(
-                            tmp[inner_iter],
-                            G.C.mc_ptr_at({row_idx * fg::ROW_BLOCK,
-                                           col_idx * fg::COL_BLOCK + iter_loop * total_inner_iter +
-                                               inner_iter}));
-                    }
-
-#pragma unroll
-                    for (int inner_iter = 0; inner_iter < total_inner_iter / 2; inner_iter++) {
-                        store_float8(
-                            &G.C[G.dev_idx][{row_idx * fg::ROW_BLOCK,
-                                             col_idx * fg::COL_BLOCK +
-                                                 iter_loop * total_inner_iter + inner_iter * 2}],
-                            &tmp[inner_iter * 2]);
-                    }
-                }
+                const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
+                const int tile_col_start = tile_col * fg::COL_BLOCK;
+                reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
+                    G.C.mc_ptr_at({tile_row_start, tile_col_start}),
+                    &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
+                    G.C[G.dev_idx].cols(),
+                    lane);
             }
-            pdl::arrive();
         }
+
+        pdl::arrive();
     } else {
         // TODO: adjust indexing based on epilogue_stage_id input format
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
@@ -426,7 +471,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 const int warp_level_tile_id = cluster_level_tile_id + c;
                 epilogue(warp_level_tile_id,
                          tile_col_idx,
-                         tmem[c * fg::TMEM_PIPELINE_STAGES],
+                         &tmem[c * fg::TMEM_PIPELINE_STAGES],
                          c,
                          epilogue_stage_id[c],
                          epilogue_smem_idx,
@@ -457,7 +502,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         if (group<fg::EPILOGUE_WARPS>::warpid() == 0) {
             if (elect_warp_leader()) {
 #pragma unroll
-                for (int peer = 0; peer < fg::NUM_CTA; peer++) {
+                for (int peer = 0; peer < fg::NUM_CLUSTERS; peer++) {
                     tma::cluster::arrive(tmem_finished, peer);
                 }
             }
@@ -475,6 +520,22 @@ __global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>:
         1) void fused_kernel_stub(const __grid_constant__
                                       fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> G) {
     gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>(G);
+}
+
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+inline void initialize_gemm_rs_blackwell_state(
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
+    cudaStream_t stream = G.stream;
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    if (!stream) {
+        stream = at::cuda::getCurrentCUDAStream().stream();
+    }
+#endif
+    const auto& ready = G.C_barrier[G.dev_idx];
+    const size_t ready_bytes = size_t(ready.rows()) * ready.cols() * sizeof(uint32_t);
+    MKERNEL_CUDACHECK(cudaMemsetAsync(ready.raw_ptr, 0, ready_bytes, stream));
+    MKERNEL_CUDACHECK(
+        cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
 }
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
@@ -510,6 +571,11 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     launch_config.numAttrs = 1;
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
+    MKERNEL_CUDACHECK(cudaGetLastError());
+
+    // Full completion dependency, including in captured graphs. The next use
+    // of these buffers on this stream cannot pass until every rank is done.
+    exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 };  // namespace gemm_rs_blackwell
