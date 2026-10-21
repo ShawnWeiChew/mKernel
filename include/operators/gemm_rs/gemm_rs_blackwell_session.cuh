@@ -10,12 +10,19 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.attr("gemm_rs_blackwell_world_size") = INTRA_NUM_DEVICES;
+    using fg = gemm_rs_blackwell::fused_globals<
+        gemm_rs_blackwell::DEFAULT_NUM_EPILOGUE_WARPS,
+        gemm_rs_blackwell::DEFAULT_C_TILE_DIVISOR>;
+    m.attr("gemm_blackwell_num_consumer_warps") = fg::CONSUMER_WARPS;
+    m.attr("gemm_blackwell_cluster_rows") = fg::ROW_BLOCK * fg::NUM_CLUSTERS;
+    m.attr("gemm_blackwell_consumer_variants") = pybind11::make_tuple(1, 2);
     m.def(
         "gemm_blackwell_launch",
-        [](at::Tensor A, at::Tensor B, at::Tensor C) {
-            gemm_rs_blackwell::launch_gemm_only(A, B, C);
+        [](at::Tensor A, at::Tensor B, at::Tensor C, int num_consumer_warps) {
+            gemm_rs_blackwell::launch_gemm_only(A, B, C, num_consumer_warps);
         },
         pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
+        pybind11::arg("num_consumer_warps") = gemm_rs_blackwell::DEFAULT_NUM_CONSUMER_WARPS,
         "Single-GPU GEMM benchmark: C = A @ B.T. Requires RS disabled in the "
         "kernel source. Uses ordinary BF16 tensors, no exit barrier or PDL overlap.");
     m.def(

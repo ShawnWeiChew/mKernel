@@ -12,6 +12,10 @@ Requires the RS body/signals to remain disabled in src/gemm_rs_blackwell.cu.
 Reports warm-cache CUDA graph timings, excluding allocation and the exit barrier.
 Compare against a separate full GEMM+RS run at matching local dimensions to
 assess GEMM's contribution; overlap means the times are not additive.
+Both consumer counts are compiled into one extension and benchmarked by default.
+Use --consumer-warps 1 or --consumer-warps 2 to select just one. Each consumer
+handles 128 rows per CTA: cluster tiles are 256 or 512 rows, respectively.
+Both use one accumulator stage per consumer.
 """
 
 import argparse
@@ -62,39 +66,60 @@ def benchmark_shape(module, m, n, k, args):
     def cublas():
         torch.mm(a, b_transposed, out=reference)
 
-    def mkernel():
-        module.gemm_blackwell_launch(a, b, output)
+    launches = {"cuBLAS": cublas}
+    for consumers in args.consumer_warps:
+        def mkernel(consumers=consumers):
+            module.gemm_blackwell_launch(a, b, output, num_consumer_warps=consumers)
+        launches[f"mKernel[{consumers}]"] = mkernel
+
+    def check(name):
+        try:
+            torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+        except AssertionError as exc:
+            raise AssertionError(f"{name}: {exc}") from exc
 
     cublas()
-    mkernel()
-    torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+    for name, launch in launches.items():
+        if name != "cuBLAS":
+            output.fill_(float("nan"))
+            launch()
+            check(name)
     graphs = {}
     try:
-        graphs["cuBLAS"] = capture(cublas, args.graph_size)
-        graphs["mKernel"] = capture(mkernel, args.graph_size)
+        for name, launch in launches.items():
+            graphs[name] = capture(launch, args.graph_size)
         # Changed inputs and poisoned output catch stale or partially written C.
         for _ in range(2):
             a.neg_()
-            output.fill_(float("nan"))
             graphs["cuBLAS"].replay()
-            graphs["mKernel"].replay()
-            torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+            for name, graph in graphs.items():
+                if name != "cuBLAS":
+                    output.fill_(float("nan"))
+                    graph.replay()
+                    check(name)
 
         samples = {name: [] for name in graphs}
         for repeat in range(args.repeats):
-            order = ("cuBLAS", "mKernel") if repeat % 2 == 0 else ("mKernel", "cuBLAS")
+            names = list(graphs)
+            offset = repeat % len(names)
+            order = names[offset:] + names[:offset]
             for name in order:
                 samples[name].append(time_graph(graphs[name], args))
         cu = statistics.median(samples["cuBLAS"])
-        mk = statistics.median(samples["mKernel"])
         flops = 2 * m * n * k
         print(
             f"M={m:6d} N={n} K={k}  "
-            f"cuBLAS={cu * 1000:9.2f} us ({flops / (cu * 1e9):7.2f} TF/s)  "
-            f"mKernel={mk * 1000:9.2f} us ({flops / (mk * 1e9):7.2f} TF/s)  "
-            f"mKernel={100 * cu / mk:.1f}% of cuBLAS throughput",
+            f"cuBLAS={cu * 1000:9.2f} us ({flops / (cu * 1e9):7.2f} TF/s)",
             flush=True,
         )
+        for consumers in args.consumer_warps:
+            mk = statistics.median(samples[f"mKernel[{consumers}]"])
+            print(
+                f"  consumers={consumers} tile={256 * consumers}x256  "
+                f"mKernel={mk * 1000:9.2f} us ({flops / (mk * 1e9):7.2f} TF/s)  "
+                f"{100 * cu / mk:.1f}% of cuBLAS throughput",
+                flush=True,
+            )
     finally:
         torch.cuda.synchronize()
         graphs.clear()
@@ -107,12 +132,15 @@ def main():
     parser.add_argument("--k", type=int, help="Local GEMM K; default: 12288 / --emulated-world-size")
     parser.add_argument("--emulated-world-size", type=int, default=8,
                         help="Select default local K; does not launch multiple processes")
+    parser.add_argument("--consumer-warps", nargs="+", type=int, choices=(1, 2), default=[1, 2],
+                        help="Consumer counts to benchmark in this run (default: 1 2)")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5, help="Warmup graph replays per sample")
     parser.add_argument("--iters", type=int, default=20, help="Timed graph replays per sample")
     parser.add_argument("--graph-size", type=int, default=20, help="GEMMs per graph replay")
     parser.add_argument("--repeats", type=int, default=5, help="Number of samples for median timing")
     args = parser.parse_args()
+    args.consumer_warps = list(dict.fromkeys(args.consumer_warps))
     try:
         shapes = [int(value) for value in args.shapes.split(",")]
     except ValueError:
@@ -120,8 +148,9 @@ def main():
     if args.emulated_world_size <= 0 or 12288 % args.emulated_world_size:
         parser.error("--emulated-world-size must be a positive divisor of 12288")
     k = 12288 // args.emulated_world_size if args.k is None else args.k
-    if any(m <= 0 or m % 512 for m in shapes):
-        parser.error("M must be a positive multiple of 512")
+    cluster_rows = 256 * max(args.consumer_warps)
+    if any(m <= 0 or m % cluster_rows for m in shapes):
+        parser.error(f"Selected variants require M to be a positive multiple of {cluster_rows}")
     if args.n <= 0 or args.n % 256 or k <= 0 or k % 64:
         parser.error("N must be a positive multiple of 256; K must be a positive multiple of 64")
     if args.warmup < 0 or min(args.iters, args.graph_size, args.repeats) < 1:
@@ -134,7 +163,7 @@ def main():
     if torch.cuda.get_device_capability()[0] != 10:
         parser.error("This benchmark requires a Blackwell GPU")
     module = load_module.load("gemm_rs_blackwell")
-    if not hasattr(module, "gemm_blackwell_launch"):
+    if not hasattr(module, "gemm_blackwell_consumer_variants"):
         parser.error("Rebuild with: make GPU=blackwell INTRA_NUM_DEVICES=2 gemm-rs-blackwell")
     # https://docs.pytorch.org/docs/stable/backends.html#torch.backends.cuda.preferred_blas_library
     torch.backends.cuda.preferred_blas_library("cublas")
@@ -142,6 +171,7 @@ def main():
     torch.manual_seed(42)
     print(
         f"{torch.cuda.get_device_name()}; device {args.device}; BF16, FP32 accumulation\n"
+        f"Consumer variants: {args.consumer_warps}\n"
         f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples.\n"
         "mKernel throughput: 100% matches cuBLAS; higher is faster. Correctness checked before timing.",
         flush=True,

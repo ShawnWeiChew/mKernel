@@ -32,8 +32,13 @@
 #include "memory/tk_ops_thread_util_tma.cuh"
 
 namespace gemm_rs_blackwell {
+#ifndef MKERNEL_GEMM_RS_NUM_CONSUMER_WARPS
+#define MKERNEL_GEMM_RS_NUM_CONSUMER_WARPS 2
+#endif
 static constexpr int DEFAULT_NUM_CTA = 2;
-static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 2;
+static constexpr int DEFAULT_NUM_CONSUMER_WARPS = MKERNEL_GEMM_RS_NUM_CONSUMER_WARPS;
+static_assert(DEFAULT_NUM_CONSUMER_WARPS == 1 || DEFAULT_NUM_CONSUMER_WARPS == 2,
+              "NUM_CONSUMER_WARPS must be 1 or 2");
 static constexpr int DEFAULT_NUM_EPILOGUE_WARPS = 1;
 static constexpr int DEFAULT_C_TILE_DIVISOR = 4;
 
@@ -43,37 +48,41 @@ using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
 using completion_epoch_dist_tensor =
     dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
 struct fused_globals;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G,
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
                               bool with_exit_barrier = true);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
 // ranks before the first launch. Keep the same tile layout and serialize launches
 // on G.stream; both allocations must remain alive across all graph replays.
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
 void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G);
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
-    static constexpr int CONSUMER_WARPS = 2;
+    static constexpr int CONSUMER_WARPS = _NUM_CONSUMER_WARPS;
+    static_assert(CONSUMER_WARPS == 1 || CONSUMER_WARPS == 2);
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = _NUM_EPILOGUE_WARPS;
     static constexpr int REDUCE_SCATTER_WARPS = 1;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
+    static constexpr int PRODUCER_WARP = EPILOGUE_WARPS;
+    static constexpr int FIRST_CONSUMER_WARP = PRODUCER_WARP + PRODUCER_WARPS;
 
     static constexpr int NUM_THREADS =
         (CONSUMER_WARPS + PRODUCER_WARPS + REDUCE_SCATTER_WARPS + EPILOGUE_WARPS) *
         kittens::WARP_THREADS;
     static constexpr int NUM_CLUSTERS = DEFAULT_NUM_CTA;
 
-    static constexpr int ROW_BLOCK = 256;
+    // Preserve the 128-row MMA tile per consumer; fewer consumers shrink the CTA tile.
+    static constexpr int ROW_BLOCK = 128 * CONSUMER_WARPS;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
@@ -81,9 +90,11 @@ struct fused_globals {
     // Each batch issues 32 x 16-byte reductions before 16 x 32-byte stores.
     static constexpr int RS_STORES_PER_BATCH = 16;
 
-    static constexpr int TMEM_PIPELINE_STAGES =
-        kittens::MAX_TENSOR_COLS / COL_BLOCK / CONSUMER_WARPS;
+    // One semaphore pair per consumer protects one live accumulator tile.
+    // Adding stages requires separate per-slot semaphore phases.
+    static constexpr int TMEM_PIPELINE_STAGES = 1;
     static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
+    static_assert(NUM_TMEM_SLOTS * COL_BLOCK <= kittens::MAX_TENSOR_COLS);
 
     // used for SMEM allocation
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 4;

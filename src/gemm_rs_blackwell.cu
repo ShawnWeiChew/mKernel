@@ -170,10 +170,10 @@ __global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_
     }
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
 __device__ __forceinline__ void gemm_rs_blackwell(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G) {
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -248,7 +248,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
             tma::cluster::expect_bytes(
-                tma_load[input_stage_id], sizeof(fg::A_tile) * 2 + sizeof(fg::B_tile), 0);
+                tma_load[input_stage_id],
+                sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile), 0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
@@ -370,7 +371,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     };
 
     if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
-        if (warp_id == 4) {
+        if (warp_id == fg::PRODUCER_WARP) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -387,13 +388,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 
             pdl::arrive();
-        } else if (warp_id == 5 || warp_id == 6) {
+        } else if (warp_id >= fg::FIRST_CONSUMER_WARP &&
+                   warp_id < fg::FIRST_CONSUMER_WARP + fg::CONSUMER_WARPS) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
             // The two-CTA allocation requires a complete warp in each CTA,
             // before restricting MMA issue to the leader in CTA 0.
-            if (warp_id == 5) {
+            if (warp_id == fg::FIRST_CONSUMER_WARP) {
                 tm_alloc.provision(tmem_addr);
                 if (elect_warp_leader()) {
                     arrive(tmem_allocated);
@@ -406,7 +408,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             if (cta_rank == 0 && elect_warp_leader()) {
                 int input_stage_id = 0;
                 int epilogue_stage_id = 0;
-                const int consumer_id = warp_id - 5;
+                const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP;
 
                 typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
@@ -539,18 +541,18 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     }
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-__global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>::NUM_CLUSTERS, 1, 1)
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+__global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
-        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>::NUM_THREADS,
+        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__
-                                      fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> G) {
-    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>(G);
+                                      fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS> G) {
+    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>(G);
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
 inline void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
@@ -564,8 +566,8 @@ inline void initialize_gemm_rs_blackwell_state(
         cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G,
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
                                      bool with_exit_barrier) {
     cudaStream_t stream = G.stream;
 
@@ -575,12 +577,12 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     }
 #endif
 
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -610,9 +612,10 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
 }
 // Local storage in the existing argument layout. With RS disabled, only C[0]
 // is accessed; multicast addresses and communication counters are unused.
+template <int NUM_CONSUMER_WARPS>
 inline auto make_gemm_only_globals(uint64_t a, uint64_t b, uint64_t c,
                                    int M, int N, int K, cudaStream_t stream) {
-    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
+    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
     uint64_t outputs[INTRA_NUM_DEVICES];
     uint64_t unused[INTRA_NUM_DEVICES] = {};
     std::fill_n(outputs, INTRA_NUM_DEVICES, c);
@@ -632,7 +635,9 @@ inline auto make_gemm_only_globals(uint64_t a, uint64_t b, uint64_t c,
 }
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
+template <int NUM_CONSUMER_WARPS>
+inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
+    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
     TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda(), "A, B, C must be CUDA tensors");
     TORCH_CHECK(A.device() == B.device() && A.device() == C.device(),
                 "A, B, C must be on the same device");
@@ -644,14 +649,27 @@ inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
     TORCH_CHECK(A.size(1) == B.size(1) && C.size(0) == A.size(0) && C.size(1) == B.size(0),
                 "Expected A[M,K], B[N,K], C[M,N]");
     TORCH_CHECK(A.size(0) > 0 && B.size(0) > 0 && A.size(1) > 0 &&
-                    A.size(0) % 512 == 0 && B.size(0) % 256 == 0 && A.size(1) % 64 == 0,
-                "M, N, K must be positive multiples of 512, 256, 64");
+                    A.size(0) % (fg::ROW_BLOCK * fg::NUM_CLUSTERS) == 0 &&
+                    B.size(0) % fg::COL_BLOCK == 0 && A.size(1) % fg::RED_BLOCK == 0,
+                "M, N, K must be positive multiples of ",
+                fg::ROW_BLOCK * fg::NUM_CLUSTERS, ", ", fg::COL_BLOCK, ", ", fg::RED_BLOCK);
     c10::cuda::CUDAGuard device_guard(A.device());
-    auto globals = make_gemm_only_globals(
+    auto globals = make_gemm_only_globals<NUM_CONSUMER_WARPS>(
         reinterpret_cast<uint64_t>(A.data_ptr()), reinterpret_cast<uint64_t>(B.data_ptr()),
         reinterpret_cast<uint64_t>(C.data_ptr()), A.size(0), B.size(0), A.size(1),
         at::cuda::getCurrentCUDAStream().stream());
     launch_gemm_rs_blackwell(globals, false);
+}
+
+inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C,
+                            int num_consumer_warps) {
+    TORCH_CHECK(num_consumer_warps == 1 || num_consumer_warps == 2,
+                "num_consumer_warps must be 1 or 2");
+    if (num_consumer_warps == 1) {
+        launch_gemm_only_variant<1>(A, B, C);
+    } else {
+        launch_gemm_only_variant<2>(A, B, C);
+    }
 }
 
 inline void prepare(at::Tensor& A,

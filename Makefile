@@ -204,8 +204,24 @@ $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $
 
 gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
 
-$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu Makefile | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
+NUM_CONSUMER_WARPS ?= 2
+ifeq ($(filter $(NUM_CONSUMER_WARPS),1 2),)
+$(error NUM_CONSUMER_WARPS must be 1 or 2)
+endif
+
+# Rebuild when switching tuning settings, even when the source is unchanged.
+.PHONY: force-gemm-rs-config
+force-gemm-rs-config:
+
+$(BUILD)/gemm_rs_blackwell.config: force-gemm-rs-config | $(BUILD)
+	@printf '%s\n' '$(GPU) $(INTRA_NUM_DEVICES) $(NUM_CONSUMER_WARPS)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu Makefile \
+    include/operators/gemm_rs/gemm_rs_blackwell.cuh \
+    include/operators/gemm_rs/gemm_rs_blackwell_session.cuh $(BUILD)/gemm_rs_blackwell.config | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DMKERNEL_GEMM_RS_NUM_CONSUMER_WARPS=$(NUM_CONSUMER_WARPS) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 run-gemm-rs-blackwell: gemm-rs-blackwell
