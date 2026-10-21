@@ -1,5 +1,6 @@
-"""Single-node BF16 GEMM + reduce-scatter: cuBLAS/NCCL, CUTLASS, and TK.
+"""Single-node BF16 GEMM + reduce-scatter: mKernel, cuBLAS/NCCL, CUTLASS, and TK.
 
+Build with make GPU=blackwell INTRA_NUM_DEVICES=8 gemm-rs-blackwell.
 Run with torchrun --standalone --nproc-per-node=8 and set CUTLASS_PATH to
 the pinned checkout linked below. K is the per-rank shard of global K=12288.
 For TK, set THUNDERKITTENS_PATH to a checkout with gemm_rs's B200 _C built.
@@ -21,6 +22,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 
 from common import check_close
+import load_module
 import load_thirdparty
 
 
@@ -89,6 +91,11 @@ class BlackwellBenchVars:
     c_tk_barrier: DistBufferLike | None = None
     tk_graph: torch.cuda.CUDAGraph | None = None
 
+    c_mkernel: DistBufferLike | None = None
+    ready_mkernel: DistBufferLike | None = None
+    epochs_mkernel: DistBufferLike | None = None
+    mkernel_graph: torch.cuda.CUDAGraph | None = None
+
 
 def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
     """Per-rank GEMM throughput, with elapsed time including reduce-scatter."""
@@ -145,7 +152,7 @@ def tk_available(config: BlackwellBenchConfig, M: int, N: int, K: int) -> bool:
 
 
 def make_blackwell_buffers(
-    config: BlackwellBenchConfig, M: int, N: int, K: int, tk_module=None,
+    config: BlackwellBenchConfig, M: int, N: int, K: int, mkernel_module, tk_module=None,
 ) -> BlackwellBenchVars:
     if M % config.world_size:
         raise ValueError(f"M={M} must be divisible by world_size={config.world_size}")
@@ -158,6 +165,25 @@ def make_blackwell_buffers(
             (M // config.world_size, N), device="cuda", dtype=torch.bfloat16,
         ),
     )
+    buffers.c_mkernel = mkernel_module.DistBuffer(
+        (M, N), dtype=torch.bfloat16, local_rank=config.local_rank,
+        local_world_size=config.world_size, multicast=True,
+    )
+    buffers.ready_mkernel = mkernel_module.DistBuffer(
+        (M // config.world_size // 256, N // 256), dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
+    )
+    buffers.epochs_mkernel = mkernel_module.DistBuffer(
+        (1,), dtype=torch.int32, local_rank=config.local_rank,
+        local_world_size=config.world_size, multicast=False,
+    )
+    mkernel_module.gemm_rs_blackwell_prepare(
+        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
+        buffers.ready_mkernel, buffers.epochs_mkernel,
+    )
+    # Every rank must finish its local reset before any peer publishes a tile.
+    torch.cuda.synchronize()
+    dist.barrier()
     if tk_module is not None:
         buffers.a_tk = buffers.baseline_a.clone()
         buffers.b_tk = buffers.baseline_b.clone()
@@ -189,6 +215,18 @@ def run_tk(tk_module, buffers: BlackwellBenchVars):
     )
 
 
+def run_mkernel(mkernel_module, buffers: BlackwellBenchVars):
+    mkernel_module.gemm_rs_blackwell_launch(
+        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
+        buffers.ready_mkernel, buffers.epochs_mkernel,
+    )
+
+
+def mkernel_output(config: BlackwellBenchConfig, buffers: BlackwellBenchVars):
+    rows = buffers.baseline_c_rs.shape[0]
+    return buffers.c_mkernel.data_.narrow(0, config.local_rank * rows, rows)
+
+
 def capture_cuda_graph(run_once) -> torch.cuda.CUDAGraph:
     """Warm up and capture one launch; return the graph for replay or checking."""
     stream = torch.cuda.Stream()
@@ -204,16 +242,25 @@ def capture_cuda_graph(run_once) -> torch.cuda.CUDAGraph:
     return graph
 
 
-def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig):
+def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_module):
     all_correct = True
     for M in config.shapes_to_test:
         N, K = config.output_dim, config.split_inner_dim
 
-        # Test TK
-        if tk_available(config, M, N, K):
-            tk_module = load_thirdparty.load_tk_extension("gemm_rs")
-            buffers = make_blackwell_buffers(config, M, N, K, tk_module)
-            run_baseline(buffers)
+        tk_module = (
+            load_thirdparty.load_tk_extension("gemm_rs")
+            if tk_available(config, M, N, K) else None
+        )
+        buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
+        run_baseline(buffers)
+        run_mkernel(mkernel_module, buffers)
+        torch.cuda.synchronize()
+        all_correct = check_close(
+            f"gemm_rs mKernel eager M={M}",
+            mkernel_output(config, buffers), buffers.baseline_c_rs,
+        ) and all_correct
+
+        if tk_module is not None:
             run_tk(tk_module, buffers)
             torch.cuda.synchronize()
 
@@ -227,22 +274,40 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig):
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-            del buffers
-            
+        buffers.mkernel_graph = capture_cuda_graph(lambda: run_mkernel(mkernel_module, buffers))
+        # Change inputs on each replay to expose stale counters/output. Prepare
+        # is deliberately never repeated: the graph must advance its own epoch.
+        for replay in range(3):
+            buffers.baseline_a.neg_()
+            run_baseline(buffers)
+            buffers.mkernel_graph.replay()
+            torch.cuda.synchronize()
+            all_correct = check_close(
+                f"gemm_rs mKernel graph replay={replay + 1} M={M}",
+                mkernel_output(config, buffers), buffers.baseline_c_rs,
+            ) and all_correct
+        buffers.mkernel_graph = None
+        del buffers
+
+    # All ranks must make the same decision before entering the timed collectives.
+    vote = torch.tensor([int(all_correct)], device="cuda")
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+    all_correct = bool(vote.item())
     if not all_correct:
-        raise RuntimeError("TK correctness checks failed; skipping benchmarks.")
+        raise RuntimeError("GEMM+RS correctness checks failed; skipping benchmarks.")
     return True
 
 
 def gemm_rs_blackwell_prepare(
     config: BlackwellBenchConfig, M: int, N: int, K: int, warmup: int, iters: int,
+    mkernel_module,
 ):
     """Return (fn, name, should_wrap); CUTLASS returns its own timing in ms."""
     tk_module = (
         load_thirdparty.load_tk_extension("gemm_rs")
         if tk_available(config, M, N, K) else None
     )
-    buffers = make_blackwell_buffers(config, M, N, K, tk_module)
+    buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
 
     def run_baseline_for_graph_capture():
         run_baseline(buffers)
@@ -253,6 +318,17 @@ def gemm_rs_blackwell_prepare(
         buffers.baseline_graph.replay()
 
     fns = [(bench_baseline, "baseline", True)]
+
+    def bench_mkernel_eager():
+        run_mkernel(mkernel_module, buffers)
+
+    buffers.mkernel_graph = capture_cuda_graph(bench_mkernel_eager)
+
+    def bench_mkernel_graph():
+        buffers.mkernel_graph.replay()
+
+    fns.append((bench_mkernel_eager, "mKernel eager", True))
+    fns.append((bench_mkernel_graph, "mKernel graph", True))
     if cutlass_available(config):
         candidates = (
             config.cutlass_autotune_configs_2048 if M == 2048
@@ -347,6 +423,14 @@ def main():
         parser.error("Launch with torchrun using 2, 4, or 8 GPUs on one node")
     if int(os.environ.get("LOCAL_WORLD_SIZE", config.world_size)) != config.world_size:
         parser.error("This benchmark requires a single node")
+    if any(m % (config.world_size * 256) or m % 512 for m in config.shapes_to_test):
+        parser.error("mKernel requires M divisible by both WORLD_SIZE * 256 and 512")
+
+    mkernel_module = load_module.load("gemm_rs_blackwell")
+    if mkernel_module.gemm_rs_blackwell_world_size != config.world_size:
+        parser.error(
+            f"Rebuild mKernel with INTRA_NUM_DEVICES={config.world_size} to match WORLD_SIZE"
+        )
 
     torch.cuda.set_device(config.local_rank)
     if torch.cuda.get_device_capability()[0] != 10:
@@ -355,12 +439,17 @@ def main():
     fns = []
     fn = None
     try:
-        check_correctness_gemm_rs_blackwell(config)
+        check_correctness_gemm_rs_blackwell(config, mkernel_module)
         if args.mode == "check":
             return
         for M in config.shapes_to_test:
             N, K = config.output_dim, config.split_inner_dim
-            fns = gemm_rs_blackwell_prepare(config, M, N, K, args.warmup, args.iters)
+            # Release the previous shape's graphs before their backing buffers.
+            fn = None
+            fns.clear()
+            fns = gemm_rs_blackwell_prepare(
+                config, M, N, K, args.warmup, args.iters, mkernel_module,
+            )
             results = {}
             for fn, name, should_wrap in fns:
                 ms = (
@@ -383,11 +472,11 @@ def main():
                     flush=True,
                 )
             if config.is_chief:
-                for tk_name in ("ThunderKittens eager", "ThunderKittens graph"):
-                    if tk_name in results:
+                for name in ("mKernel eager", "mKernel graph", "ThunderKittens eager", "ThunderKittens graph"):
+                    if name in results:
                         print(
-                            f"  {tk_name} speedup vs cuBLAS+NCCL: "
-                            f"{results['baseline'] / results[tk_name]:.3f}x",
+                            f"  {name} speedup vs cuBLAS+NCCL: "
+                            f"{results['baseline'] / results[name]:.3f}x",
                             flush=True,
                         )
                 if "ThunderKittens eager" in results and "ThunderKittens graph" in results:

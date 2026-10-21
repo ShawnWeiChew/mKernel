@@ -30,7 +30,6 @@
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
-#include "operators/gemm_rs/epoch.cuh"
 
 namespace gemm_rs_blackwell {
 static constexpr int DEFAULT_NUM_CTA = 2;
@@ -51,8 +50,9 @@ template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
 
 // Call once before capture/replay, with no work using these buffers in flight.
-// After every rank initializes its local state, synchronize all ranks before
-// the first launch. Keep the same tile layout and serialize launches on G.stream.
+// Wait for this stream's initialization to finish locally, then synchronize all
+// ranks before the first launch. Keep the same tile layout and serialize launches
+// on G.stream; both allocations must remain alive across all graph replays.
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 void initialize_gemm_rs_blackwell_state(
     const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
@@ -166,19 +166,19 @@ __host__ inline fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> gemm_rs_blac
         TORCH_CHECK(completion_epochs.data_.numel() == 1 &&
                         completion_epochs.data_.element_size() == sizeof(uint32_t),
                     "completion_epochs must contain one 32-bit word per rank");
-        return {.dev_idx = dev_idx,
-                .M = M,
-                .N = N,
-                .K = K,
-                .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
-                .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-                .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
-                .C_barrier = dist::distributed_tensor_from_buffer<typename fg::C_ready_barrier>(
-                    C_barrier),
-                .completion_epochs =
-                    dist::distributed_tensor_from_buffer<completion_epoch_dist_tensor>(
-                        completion_epochs),
-                .stream = stream};
+        return {
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
+            .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
+            .C_barrier =
+                dist::distributed_tensor_from_buffer<typename fg::C_ready_barrier>(C_barrier),
+            .completion_epochs = dist::distributed_tensor_from_buffer<completion_epoch_dist_tensor>(
+                completion_epochs),
+            .stream = stream};
     } else {
         static_assert(always_false_v<LocalTensor>, "Unsupported LocalTensorType");
     }

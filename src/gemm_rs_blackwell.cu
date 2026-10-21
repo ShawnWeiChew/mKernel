@@ -63,6 +63,7 @@ __device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16*
         "{%0, %1, %2, %3}, [%4];"
         : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
         : "l"(src)
+        // TODO: maybe I can remove the clobber here?
         : "memory");
 }
 
@@ -90,6 +91,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
     constexpr int ELEMENTS_PER_STORE = 16;
     constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
     static_assert(TILE_COLS == 256, "RS maps each half warp to one 256-element row");
+    // TODO: What is ROWS_PER_STORE?
     constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
     constexpr int ROWS_PER_BATCH = STORES_PER_BATCH * ROWS_PER_STORE;
     static_assert(STORES_PER_BATCH > 0 && STORES_PER_BATCH <= 16);
@@ -141,6 +143,11 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     }
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 }
+
+__host__ __device__ __forceinline__ bool epoch_reached(uint32_t observed, uint32_t expected) {
+    return uint32_t(observed - expected) < 0x80000000u;
+}
+
 }  // namespace
 
 // A normal same-stream launch after fused_kernel_stub establishes completion of
@@ -381,15 +388,27 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             pdl::arrive();
         } else if (warp_id == 5 || warp_id == 6) {
+            pdl::wait();
+            everyone::tma::cluster::wait();
+
+            // The two-CTA allocation requires a complete warp in each CTA,
+            // before restricting MMA issue to the leader in CTA 0.
+            if (warp_id == 5) {
+                tm_alloc.provision(tmem_addr);
+                if (elect_warp_leader()) {
+                    arrive(tmem_allocated);
+                }
+            } else {
+                wait(tmem_allocated, 0);
+            }
+            tm_alloc.set_addr(tmem_addr);
+
             if (cta_rank == 0 && elect_warp_leader()) {
                 int input_stage_id = 0;
                 int epilogue_stage_id = 0;
                 const int consumer_id = warp_id - 5;
 
                 typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
-
-                pdl::wait();
-                everyone::tma::cluster::wait();
 
 #pragma unroll
                 for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
@@ -414,19 +433,21 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             pdl::wait();
             everyone::tma::cluster::wait();
 
-            // Read after the dependency wait: the previous exit barrier may
-            // have advanced this word on the previous graph replay.
+            // Should only read after PDL wait since the previous iteration may have modified the
+            // epoch
             const uint32_t epoch =
                 comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
             const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
 
             for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
                  tile_idx += fg::NUM_BLOCKS) {
+                // TODO: review indexing to make sure that all devices have active CTAs
                 const int local_tile_row = tile_idx / num_tile_cols;
                 const int tile_col = tile_idx % num_tile_cols;
 
                 // These match the coordinates used by the epilogue's signal.
                 if (lane == 0) {
+                    // Peers publish tile arrivals with system-scope atomics.
                     while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
                                               &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
                                           ready_count)) {
@@ -447,13 +468,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
         pdl::arrive();
     } else {
-        // TODO: adjust indexing based on epilogue_stage_id input format
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
         int epilogue_smem_idx = 0;
         typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];
 
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
+        // Tile views and the eventual deallocation use the published base.
+        tm_alloc.set_addr(tmem_addr);
 
 #pragma unroll
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
@@ -481,6 +503,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
             dist::tma::store_async_wait();
 
+            // TODO: maybe the only way to validate this is by plugging in actual numbers?
             const int row_start = cluster_level_tile_id * fg::A_tile::rows;
             const int device_to_signal = row_start / rows_per_device;
             const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
@@ -578,4 +601,15 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
+// Instantiate the default API so the compile target checks the fused kernel,
+// initialization, and the exit-barrier launch rather than just template syntax.
+template void
+initialize_gemm_rs_blackwell_state<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
+template void launch_gemm_rs_blackwell<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
 };  // namespace gemm_rs_blackwell
+
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+#include "operators/gemm_rs/gemm_rs_blackwell_session.cuh"
+#endif

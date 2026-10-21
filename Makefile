@@ -179,24 +179,7 @@ plots:
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
 	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized \
-	gemm-rs-blackwell test-gemm-rs-epoch
-
-test-gemm-rs-epoch: $(BUILD)/test_gemm_rs_epoch
-	$<
-
-$(BUILD)/test_gemm_rs_epoch: tests/test_gemm_rs_epoch.cpp include/operators/gemm_rs/epoch.cuh | $(BUILD)
-	$(CXX) -std=c++17 -O2 -I include $< -o $@
-
-# Compile an explicitly instantiated kernel and report register/spill usage.
-# This does not require the unfinished GEMM+RS Python session/bindings.
-gemm-rs-blackwell: $(BUILD)/gemm_rs_blackwell.o
-
-$(BUILD)/gemm_rs_blackwell.o: $(SRC)/gemm_rs_blackwell.cu Makefile | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) $(COMMON_INC) \
-	    --compiler-options '-fPIC' --ptxas-options=-v -lineinfo -MMD -MP \
-	    -MF $(BUILD)/gemm_rs_blackwell.d -c $< -o $@
-
--include $(BUILD)/gemm_rs_blackwell.d
+	gemm-rs-blackwell run-gemm-rs-blackwell
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -216,5 +199,12 @@ $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
-run-gemm-rs-intranode : 
-	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_bench.py --warmup 20 --iters 50
+gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
+
+$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
+	    --compiler-options '-fPIC' --ptxas-options=-v -lineinfo -MMD -MP \
+	    -MF $(BUILD)/libgemm_rs_blackwell.d $(INTRANODE_LDFLAGS) $< -o $@
+
+run-gemm-rs-blackwell: gemm-rs-blackwell
+	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_bench.py --warmup 20 --iters 50
