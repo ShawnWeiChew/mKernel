@@ -87,13 +87,13 @@ class BlackwellBenchVars:
 
     a_tk: torch.Tensor | None = None
     b_tk: torch.Tensor | None = None
-    c_tk_dist: DistBufferLike | None = None
-    c_tk_barrier: DistBufferLike | None = None
+    c_tk_dist: torch.Tensor | None = None
+    c_tk_barrier: torch.Tensor | None = None
     tk_graph: torch.cuda.CUDAGraph | None = None
 
-    c_mkernel: DistBufferLike | None = None
-    ready_mkernel: DistBufferLike | None = None
-    epochs_mkernel: DistBufferLike | None = None
+    c_mkernel: torch.Tensor | None = None
+    ready_mkernel: torch.Tensor | None = None
+    epochs_mkernel: torch.Tensor | None = None
     mkernel_graph: torch.cuda.CUDAGraph | None = None
 
 
@@ -165,17 +165,15 @@ def make_blackwell_buffers(
             (M // config.world_size, N), device="cuda", dtype=torch.bfloat16,
         ),
     )
-    buffers.c_mkernel = mkernel_module.DistBuffer(
-        (M, N), dtype=torch.bfloat16, local_rank=config.local_rank,
-        local_world_size=config.world_size, multicast=True,
+    buffers.c_mkernel = torch.randn(
+        (M, N), dtype=torch.bfloat16, device="cuda"
     )
-    buffers.ready_mkernel = mkernel_module.DistBuffer(
-        (M // config.world_size // 256, N // 256), dtype=torch.int32,
-        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
+    buffers.ready_mkernel = torch.randn(
+        (M // config.world_size // 256, N // 256), dtype=torch.int32, device="cuda"
+        
     )
-    buffers.epochs_mkernel = mkernel_module.DistBuffer(
-        (1,), dtype=torch.int32, local_rank=config.local_rank,
-        local_world_size=config.world_size, multicast=False,
+    buffers.epochs_mkernel = torch.randn(
+        (1,), dtype=torch.int32, device="cuda"
     )
     mkernel_module.gemm_rs_blackwell_prepare(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
