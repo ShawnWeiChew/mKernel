@@ -3,6 +3,7 @@
 #include <ATen/ATen.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include "ATen/core/TensorBody.h"
 #include "dist/parallel_buffer.cuh"
 #include "pybind11/cast.h"
 
@@ -13,9 +14,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gemm_rs_blackwell_prepare",
         [](at::Tensor A,
            at::Tensor B,
-           dist::ParallelBuffer& C,
-           dist::ParallelBuffer& ready,
-           dist::ParallelBuffer& completion_epochs) {
+           at::Tensor& C,
+           at::Tensor& ready,
+           at::Tensor& completion_epochs) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             gemm_rs_blackwell::prepare(A, B, C, ready, completion_epochs);
         },
@@ -29,9 +30,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gemm_rs_blackwell_launch",
         [](at::Tensor A,
            at::Tensor B,
-           dist::ParallelBuffer& C,
-           dist::ParallelBuffer& ready,
-           dist::ParallelBuffer& completion_epochs,
+           at::Tensor& C,
+           at::Tensor& ready,
+           at::Tensor& completion_epochs,
            bool with_exit_barrier) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             gemm_rs_blackwell::launch(A, B, C, ready, completion_epochs, with_exit_barrier);
