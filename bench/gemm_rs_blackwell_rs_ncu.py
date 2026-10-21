@@ -3,8 +3,8 @@
     make GPU=blackwell INTRA_NUM_DEVICES=8 gemm-rs-blackwell
     python bench/gemm_rs_blackwell_rs_ncu.py --nproc 8
 
-    # Other points of the RS tuning matrix, or the full NCU set for the GUI:
-    python bench/gemm_rs_blackwell_rs_ncu.py --tile-rows 128 256 --num-warps 1 8 --full
+    # Other points of the RS tuning matrix:
+    python bench/gemm_rs_blackwell_rs_ncu.py --tile-rows 128 256 --num-warps 1 8
 
 Same RS setup as gemm_rs_blackwell_rs_bench.py: a multicast BF16 [M,N] DistBuffer
 input on every rank and a separate compact [M/world_size,N] output. torchrun
@@ -14,9 +14,13 @@ with their inputs alive, so counters show one rank's traffic without peer
 contention (gpu__time is therefore optimistic versus the timed bench). After
 profiling, every variant runs on all ranks and is checked exactly against NCCL.
 
-The report is saved to --output (.ncu-rep, open with ncu-ui) and summarized:
+NCU cannot save/restore multicast (NVLS) memory, so kernel replay fails when a
+profile needs more than one pass. Metrics are therefore split into small
+single-unit groups; each group is profiled in its own torchrun run (one pass,
+no replay) to --output_g<i>.ncu-rep, and the reports are merged and summarized:
 load instructions/requests/sectors, L2 peer-aperture sectors, and NVLink bytes,
 normalized per output byte, with the 32B/16B ratio per (tile, warps) point.
+A group that still needs several passes fails alone; its metrics show n/a.
 
 Counter access needs admin rights or NVreg_RestrictProfilingToAdminUsers=0.
 """
@@ -34,30 +38,29 @@ ROOT = Path(__file__).resolve().parents[1]
 CHILD_ENV = "MKERNEL_RS_NCU_CHILD"
 KERNEL_REGEX = "regex:rs_only_kernel"
 
-# Verified with `ncu --query-metrics --chip gb100/gb110` (B200 / B300).
-METRICS = [
-    "gpu__time_duration.sum",
-    "smsp__sass_inst_executed_op_global_ld.sum",
-    "smsp__sass_inst_executed_op_global_red.sum",
-    "smsp__sass_inst_executed_op_global_st.sum",
-    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
-    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
-    "l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
-    "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum",
-    "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
-    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
-    "lts__t_requests_srcunit_tex_op_read.sum",
-    "lts__t_sectors_srcunit_tex_op_read.sum",
-    "lts__t_sectors_srcunit_tex_op_write.sum",
-    "syslts__t_requests_aperture_peer.sum",
-    "syslts__t_sectors_aperture_peer.sum",
-    "nvltx__bytes.sum",
-    "nvlrx__bytes.sum",
-    "nvltx__bytes_data_user.sum",
-    "nvlrx__bytes_data_user.sum",
-    "dram__bytes_read.sum",
-    "dram__bytes_write.sum",
+# Verified with `ncu --query-metrics --chip gb100/gb110` (B200 / B300). Each
+# group stays within one hardware unit so it should collect in a single pass.
+METRIC_GROUPS = [
+    ["gpu__time_duration.sum"],
+    ["smsp__sass_inst_executed_op_global_ld.sum",
+     "smsp__sass_inst_executed_op_global_red.sum",
+     "smsp__sass_inst_executed_op_global_st.sum"],
+    ["l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+     "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"],
+    ["l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
+     "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum"],
+    ["l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
+     "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"],
+    ["lts__t_requests_srcunit_tex_op_read.sum",
+     "lts__t_sectors_srcunit_tex_op_read.sum",
+     "lts__t_sectors_srcunit_tex_op_write.sum"],
+    ["syslts__t_requests_aperture_peer.sum",
+     "syslts__t_sectors_aperture_peer.sum"],
+    ["nvltx__bytes.sum", "nvlrx__bytes.sum"],
+    ["nvltx__bytes_data_user.sum", "nvlrx__bytes_data_user.sum"],
+    ["dram__bytes_read.sum", "dram__bytes_write.sum"],
 ]
+METRICS = [metric for group in METRIC_GROUPS for metric in group]
 
 # (label, metric, normalize per output byte?)
 SUMMARY = [
@@ -91,18 +94,18 @@ def variants(args):
     return [(t, w, b) for t in args.tile_rows for w in args.num_warps for b in args.lane_bytes]
 
 
+def group_report(args, group):
+    return args.output.with_name(f"{args.output.name}_g{group}")
+
+
 def ncu_command(args, ncu):
-    command = [
+    # Only explicit metrics (no sections): one pass means no memory save/restore.
+    return [
         ncu, "--target-processes", "all", "--kernel-name", KERNEL_REGEX,
         "--launch-count", str(len(variants(args))), "--replay-mode", "kernel",
-        "--metrics", ",".join(METRICS), "-o", str(args.output), "-f",
+        "--metrics", ",".join(METRIC_GROUPS[args.metric_group]),
+        "-o", str(group_report(args, args.metric_group)), "-f",
     ]
-    if args.full:
-        command += ["--set", "full"]
-    else:
-        for section in ("SpeedOfLight", "MemoryWorkloadAnalysis", "MemoryWorkloadAnalysis_Tables"):
-            command += ["--section", section]
-    return command
 
 
 # ----------------------------------------------------------------------------- worker
@@ -151,6 +154,8 @@ def worker(args):
                 module.rs_blackwell_launch(source, output, epochs, False, tile_rows, warps, lane_bytes)
             sync_ranks()
 
+        if args.metric_group != 0:
+            return
         # Correctness on all ranks (past --launch-count, so not profiled).
         expected = torch.empty_like(output, dtype=torch.float32)
         dist.reduce_scatter_tensor(expected, source.data_.float(), op=dist.ReduceOp.SUM)
@@ -175,10 +180,10 @@ def parse_kernel(name):
     return tuple(int(value.strip().rstrip("u")) for value in inner.split(","))
 
 
-def load_report(ncu, report):
+def load_report(ncu, report, metrics):
     text = subprocess.run(
         [ncu, "--import", str(report), "--csv", "--page", "raw", "--print-units", "base",
-         "--metrics", ",".join(METRICS)],
+         "--metrics", ",".join(metrics)],
         check=True, capture_output=True, text=True,
     ).stdout
     rows = list(csv.reader(io.StringIO(text)))
@@ -187,7 +192,7 @@ def load_report(ncu, report):
     for row in rows[2:]:  # rows[1] holds units
         record = dict(zip(header, row))
         values = {}
-        for metric in METRICS:
+        for metric in metrics:
             raw = record.get(metric, "").replace(",", "")
             try:
                 values[metric] = float(raw)
@@ -205,11 +210,24 @@ def fmt(value):
     return f"{value:.3f}"
 
 
+def merged_results(args, ncu):
+    nan = {metric: float("nan") for metric in METRICS}
+    results = {key: dict(nan) for key in variants(args)}
+    for group, metrics in enumerate(METRIC_GROUPS):
+        path = group_report(args, group).with_suffix(".ncu-rep")
+        if not path.exists():
+            print(f"[missing] group {group} report {path}: {', '.join(metrics)} -> n/a")
+            continue
+        for key, values in load_report(ncu, path, metrics).items():
+            results.setdefault(key, dict(nan)).update(values)
+    return results
+
+
 def report(args, ncu):
-    results = load_report(ncu, args.output.with_suffix(".ncu-rep"))
+    results = merged_results(args, ncu)
     out_bytes = args.m // args.nproc * args.n * 2
     print(f"\nNCU rank 0, M={args.m} N={args.n} world={args.nproc}; "
-          f"output/rank = {out_bytes / 2**20:.1f} MiB; report {args.output.with_suffix('.ncu-rep')}")
+          f"output/rank = {out_bytes / 2**20:.1f} MiB; reports {args.output}_g*.ncu-rep")
     for tile_rows in args.tile_rows:
         for warps in args.num_warps:
             lanes = [b for b in args.lane_bytes if (tile_rows, warps, b) in results]
@@ -239,6 +257,14 @@ def report(args, ncu):
 # ----------------------------------------------------------------------------- driver
 
 
+def worker_args(args):
+    return [
+        "--nproc", str(args.nproc), "--m", str(args.m), "--n", str(args.n),
+        "--tile-rows", *map(str, args.tile_rows), "--num-warps", *map(str, args.num_warps),
+        "--lane-bytes", *map(str, args.lane_bytes), "--output", str(args.output),
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--nproc", type=int, default=8, choices=(2, 4, 8), help="GPUs (torchrun ranks)")
@@ -247,10 +273,12 @@ def main():
     parser.add_argument("--tile-rows", nargs="+", type=int, choices=(128, 256, 512), default=[256])
     parser.add_argument("--num-warps", nargs="+", type=int, choices=(1, 4, 8), default=[1])
     parser.add_argument("--lane-bytes", nargs="+", type=int, choices=(16, 32), default=[32, 16])
-    parser.add_argument("--full", action="store_true", help="Also collect `--set full` for ncu-ui")
     parser.add_argument("--output", type=Path, default=ROOT / "results/rs-ncu/rs_lanes")
     parser.add_argument("--report-only", action="store_true", help="Summarize an existing --output report")
+    parser.add_argument("--groups", nargs="+", type=int,
+                        help=f"Metric groups to profile (default all 0..{len(METRIC_GROUPS) - 1})")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--metric-group", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("tile_rows", "num_warps", "lane_bytes"):
         setattr(args, name, list(dict.fromkeys(getattr(args, name))))
@@ -265,16 +293,23 @@ def main():
             parser.error(f"M must be a positive multiple of {args.nproc * max(args.tile_rows)}; "
                          "N a positive multiple of 256")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        forwarded = [arg for arg in sys.argv[1:] if arg != "--report-only"]
-        command = [
-            sys.executable, "-m", "torch.distributed.run", "--standalone",
-            f"--nproc-per-node={args.nproc}", "--max-restarts=0", "--",
-            str(Path(__file__).resolve()), "--worker", *forwarded, "--output", str(args.output),
-        ]
-        print("Running:", " ".join(command), flush=True)
+        forwarded = worker_args(args)
         env = dict(os.environ)
         env.pop(CHILD_ENV, None)
-        subprocess.run(command, check=True, cwd=ROOT, env=env)
+        failed = []
+        groups = args.groups if args.groups is not None else range(len(METRIC_GROUPS))
+        for group in groups:
+            group_report(args, group).with_suffix(".ncu-rep").unlink(missing_ok=True)
+            command = [
+                sys.executable, "-m", "torch.distributed.run", "--standalone",
+                f"--nproc-per-node={args.nproc}", "--max-restarts=0", "--",
+                str(Path(__file__).resolve()), "--worker", "--metric-group", str(group), *forwarded,
+            ]
+            print(f"\n[group {group}] {', '.join(METRIC_GROUPS[group])}", flush=True)
+            if subprocess.run(command, cwd=ROOT, env=env).returncode:
+                failed.append(group)
+        if failed:
+            print(f"\nGroups {failed} failed (still multi-pass or another error); see logs above.")
     report(args, ncu)
 
 
