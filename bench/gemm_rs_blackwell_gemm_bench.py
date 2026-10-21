@@ -92,7 +92,7 @@ def benchmark_shape(module, m, n, k, args):
             f"M={m:6d} N={n} K={k}  "
             f"cuBLAS={cu * 1000:9.2f} us ({flops / (cu * 1e9):7.2f} TF/s)  "
             f"mKernel={mk * 1000:9.2f} us ({flops / (mk * 1e9):7.2f} TF/s)  "
-            f"mKernel/cuBLAS={mk / cu:.3f}x time",
+            f"mKernel={100 * cu / mk:.1f}% of cuBLAS throughput",
             flush=True,
         )
     finally:
@@ -143,7 +143,7 @@ def main():
     print(
         f"{torch.cuda.get_device_name()}; device {args.device}; BF16, FP32 accumulation\n"
         f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples.\n"
-        "mKernel/cuBLAS > 1 means mKernel is slower. Correctness checked before timing.",
+        "mKernel throughput: 100% matches cuBLAS; higher is faster. Correctness checked before timing.",
         flush=True,
     )
     for m in shapes:
