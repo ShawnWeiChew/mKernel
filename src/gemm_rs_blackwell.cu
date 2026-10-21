@@ -601,6 +601,24 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+inline void prepare(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
+                    dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
+    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
+        at::cuda::getCurrentCUDAStream().stream());
+    initialize_gemm_rs_blackwell_state(globals);
+}
+
+inline void launch(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
+                   dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
+    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
+        at::cuda::getCurrentCUDAStream().stream());
+    launch_gemm_rs_blackwell(globals);
+}
+#endif
+
 // Instantiate the default API so the compile target checks the fused kernel,
 // initialization, and the exit-barrier launch rather than just template syntax.
 template void
