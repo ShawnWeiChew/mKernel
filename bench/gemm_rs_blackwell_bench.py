@@ -464,7 +464,7 @@ def main():
                             f"{ms:.3f} ms  {useful_tflops(M, N, K, ms):.2f} TFLOP/s",
                             flush=True,
                         )
-                time.sleep(0.5)
+                time.sleep(5)
             if config.is_chief and "cutlass" in results:
                 print(
                     f"  CUTLASS speedup vs cuBLAS+NCCL: "
