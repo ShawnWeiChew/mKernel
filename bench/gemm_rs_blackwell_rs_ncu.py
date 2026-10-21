@@ -49,8 +49,9 @@ METRIC_GROUPS = [
      "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"],
     ["l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
      "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum"],
-    ["l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
-     "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"],
+    # Together these need two passes (-> memory save, which fails on multicast).
+    ["l1tex__t_requests_pipe_lsu_mem_global_op_st.sum"],
+    ["l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"],
     ["lts__t_requests_srcunit_tex_op_read.sum",
      "lts__t_sectors_srcunit_tex_op_read.sum",
      "lts__t_sectors_srcunit_tex_op_write.sum"],
