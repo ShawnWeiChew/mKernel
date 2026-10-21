@@ -247,9 +247,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
-            tma::cluster::expect_bytes(
-                tma_load[input_stage_id],
-                sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile), 0);
+            tma::cluster::expect_bytes(tma_load[input_stage_id],
+                                       sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile),
+                                       0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
@@ -541,12 +541,43 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     }
 }
 
+// Standalone version of the RS warp's tile loop. Keep the exact reduction
+// helper, but write a compact, separate output shard so repeated benchmark
+// launches do not reduce previously reduced input. With NUM_WARPS > 1, each
+// warp reduces its own contiguous TILE_ROWS / NUM_WARPS row slice of the tile.
+template <int TILE_ROWS, int NUM_WARPS>
+__global__ __launch_bounds__(NUM_WARPS * 32) void rs_only_kernel(
+    const comm::bf16* multicast_input, comm::bf16* output, int rows_per_rank, int N, int rank) {
+    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
+    static_assert(TILE_ROWS % NUM_WARPS == 0, "Tile rows must split evenly across warps");
+    constexpr int WARP_ROWS = TILE_ROWS / NUM_WARPS;
+    // Each 32-byte store covers 32 / (COL_BLOCK / 16) rows per warp. Shrink the
+    // batch when a warp's slice is smaller than the default register batch.
+    constexpr int ROWS_PER_STORE = 32 / (fg::COL_BLOCK / 16);
+    constexpr int STORES_PER_BATCH = std::min(fg::RS_STORES_PER_BATCH, WARP_ROWS / ROWS_PER_STORE);
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tile_cols = N / fg::COL_BLOCK;
+    const int tiles = (rows_per_rank / TILE_ROWS) * tile_cols;
+    for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        const int row = (tile / tile_cols) * TILE_ROWS + warp * WARP_ROWS;
+        const int col = (tile % tile_cols) * fg::COL_BLOCK;
+        reduce_scatter_tile<WARP_ROWS, fg::COL_BLOCK, STORES_PER_BATCH>(
+            multicast_input + (size_t(rank) * rows_per_rank + row) * N + col,
+            output + size_t(row) * N + col,
+            N,
+            lane);
+    }
+}
+
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
-__global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
+__global__ __cluster_dims__(
+    fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
         fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_THREADS,
-        1) void fused_kernel_stub(const __grid_constant__
-                                      fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS> G) {
+        1) void fused_kernel_stub(const __grid_constant__ fused_globals<_NUM_EPILOGUE_WARPS,
+                                                                        _C_TILE_DIVISOR,
+                                                                        _NUM_CONSUMER_WARPS> G) {
     gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>(G);
 }
 
@@ -567,8 +598,9 @@ inline void initialize_gemm_rs_blackwell_state(
 }
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
-inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
-                                     bool with_exit_barrier) {
+inline void launch_gemm_rs_blackwell(
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
+    bool with_exit_barrier) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -613,9 +645,10 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
 // Local storage in the existing argument layout. With RS disabled, only C[0]
 // is accessed; multicast addresses and communication counters are unused.
 template <int NUM_CONSUMER_WARPS>
-inline auto make_gemm_only_globals(uint64_t a, uint64_t b, uint64_t c,
-                                   int M, int N, int K, cudaStream_t stream) {
-    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
+inline auto make_gemm_only_globals(
+    uint64_t a, uint64_t b, uint64_t c, int M, int N, int K, cudaStream_t stream) {
+    using fg =
+        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
     uint64_t outputs[INTRA_NUM_DEVICES];
     uint64_t unused[INTRA_NUM_DEVICES] = {};
     std::fill_n(outputs, INTRA_NUM_DEVICES, c);
@@ -627,24 +660,93 @@ inline auto make_gemm_only_globals(uint64_t a, uint64_t b, uint64_t c,
         .A = dist::make_local_tensor<typename fg::A_local_tensor>(a, 1, 1, M, K),
         .B = dist::make_local_tensor<typename fg::B_local_tensor>(b, 1, 1, N, K),
         .C = dist::make_distributed_tensor<typename fg::C_dist_tensor>(0, outputs, 1, 1, M, N),
-        .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
-            0, unused, 1, 1, 1, 1),
-        .completion_epochs = dist::make_distributed_tensor<completion_epoch_dist_tensor>(
-            unused, 1, 1, 1, 1),
+        .C_barrier =
+            dist::make_distributed_tensor<typename fg::C_ready_barrier>(0, unused, 1, 1, 1, 1),
+        .completion_epochs =
+            dist::make_distributed_tensor<completion_epoch_dist_tensor>(unused, 1, 1, 1, 1),
         .stream = stream};
 }
 
+template <int TILE_ROWS>
+inline auto select_rs_only_kernel(int num_warps) {
+    switch (num_warps) {
+        case 1: return rs_only_kernel<TILE_ROWS, 1>;
+        case 2: return rs_only_kernel<TILE_ROWS, 2>;
+        case 4: return rs_only_kernel<TILE_ROWS, 4>;
+        default: return rs_only_kernel<TILE_ROWS, 8>;
+    }
+}
+
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+inline void launch_rs_only(dist::ParallelBuffer& input,
+                           at::Tensor& output,
+                           dist::ParallelBuffer& epochs,
+                           int tile_rows,
+                           int num_warps,
+                           bool with_exit_barrier) {
+    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
+    TORCH_CHECK(input.local_world_size_ == INTRA_NUM_DEVICES &&
+                    epochs.local_world_size_ == INTRA_NUM_DEVICES &&
+                    input.local_rank_ == epochs.local_rank_,
+                "Input and epochs must match the compiled world size and local rank");
+    TORCH_CHECK(input.multicast_ && input.multicast_ptr_, "Input requires multicast storage");
+    TORCH_CHECK(input.data_.dim() == 2 && input.data_.scalar_type() == at::kBFloat16 &&
+                    input.data_.is_contiguous(),
+                "Input must be a contiguous BF16 matrix");
+    TORCH_CHECK(output.is_cuda() && output.device() == input.data_.device() &&
+                    output.scalar_type() == at::kBFloat16 && output.dim() == 2 &&
+                    output.is_contiguous(),
+                "Output must be contiguous BF16 on the input device");
+    TORCH_CHECK(tile_rows == 128 || tile_rows == 256 || tile_rows == 512 || tile_rows == 1024,
+                "tile_rows must be 128, 256, 512, or 1024");
+    TORCH_CHECK(num_warps == 1 || num_warps == 2 || num_warps == 4 || num_warps == 8,
+                "num_warps must be 1, 2, 4, or 8");
+    const int64_t M = input.data_.size(0), N = input.data_.size(1);
+    TORCH_CHECK(
+        M > 0 && M % (INTRA_NUM_DEVICES * tile_rows) == 0 && N > 0 && N % fg::COL_BLOCK == 0,
+        "M must be divisible by world_size * tile_rows; N by 256");
+    TORCH_CHECK(output.size(0) == M / INTRA_NUM_DEVICES && output.size(1) == N,
+                "Expected output shape [M/world_size, N]");
+    TORCH_CHECK(epochs.data_.numel() == 1 && epochs.data_.scalar_type() == at::kInt,
+                "Epochs must contain one int32 per rank, initialized to zero before use");
+    const auto input_begin = reinterpret_cast<uintptr_t>(input.data_.data_ptr());
+    const auto output_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
+    TORCH_CHECK(output_begin + output.nbytes() <= input_begin ||
+                    input_begin + input.data_.nbytes() <= output_begin,
+                "Standalone RS output must not overlap input");
+    c10::cuda::CUDAGuard device_guard(input.local_rank_);
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto kernel = tile_rows == 128   ? select_rs_only_kernel<128>(num_warps)
+                  : tile_rows == 256 ? select_rs_only_kernel<256>(num_warps)
+                  : tile_rows == 512 ? select_rs_only_kernel<512>(num_warps)
+                                     : select_rs_only_kernel<1024>(num_warps);
+    kernel<<<fg::NUM_BLOCKS, num_warps * 32, 0, stream>>>(
+        reinterpret_cast<const comm::bf16*>(input.multicast_ptr_),
+        reinterpret_cast<comm::bf16*>(output.data_ptr()),
+        M / INTRA_NUM_DEVICES,
+        N,
+        input.local_rank_);
+    MKERNEL_CUDACHECK(cudaGetLastError());
+    if (with_exit_barrier) {
+        auto epoch_tensor =
+            dist::distributed_tensor_from_buffer<completion_epoch_dist_tensor>(epochs);
+        exit_epoch_barrier<<<1, 32, 0, stream>>>(epoch_tensor, input.local_rank_);
+        MKERNEL_CUDACHECK(cudaGetLastError());
+    }
+}
+
 template <int NUM_CONSUMER_WARPS>
 inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
-    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
+    using fg =
+        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
     TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda(), "A, B, C must be CUDA tensors");
     TORCH_CHECK(A.device() == B.device() && A.device() == C.device(),
                 "A, B, C must be on the same device");
     TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 &&
-                    C.scalar_type() == at::kBFloat16, "A, B, C must be BF16");
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2 &&
-                    A.is_contiguous() && B.is_contiguous() && C.is_contiguous(),
+                    C.scalar_type() == at::kBFloat16,
+                "A, B, C must be BF16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2 && A.is_contiguous() &&
+                    B.is_contiguous() && C.is_contiguous(),
                 "A, B, C must be contiguous matrices");
     TORCH_CHECK(A.size(1) == B.size(1) && C.size(0) == A.size(0) && C.size(1) == B.size(0),
                 "Expected A[M,K], B[N,K], C[M,N]");
@@ -652,17 +754,24 @@ inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C
                     A.size(0) % (fg::ROW_BLOCK * fg::NUM_CLUSTERS) == 0 &&
                     B.size(0) % fg::COL_BLOCK == 0 && A.size(1) % fg::RED_BLOCK == 0,
                 "M, N, K must be positive multiples of ",
-                fg::ROW_BLOCK * fg::NUM_CLUSTERS, ", ", fg::COL_BLOCK, ", ", fg::RED_BLOCK);
+                fg::ROW_BLOCK * fg::NUM_CLUSTERS,
+                ", ",
+                fg::COL_BLOCK,
+                ", ",
+                fg::RED_BLOCK);
     c10::cuda::CUDAGuard device_guard(A.device());
-    auto globals = make_gemm_only_globals<NUM_CONSUMER_WARPS>(
-        reinterpret_cast<uint64_t>(A.data_ptr()), reinterpret_cast<uint64_t>(B.data_ptr()),
-        reinterpret_cast<uint64_t>(C.data_ptr()), A.size(0), B.size(0), A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
+    auto globals =
+        make_gemm_only_globals<NUM_CONSUMER_WARPS>(reinterpret_cast<uint64_t>(A.data_ptr()),
+                                                   reinterpret_cast<uint64_t>(B.data_ptr()),
+                                                   reinterpret_cast<uint64_t>(C.data_ptr()),
+                                                   A.size(0),
+                                                   B.size(0),
+                                                   A.size(1),
+                                                   at::cuda::getCurrentCUDAStream().stream());
     launch_gemm_rs_blackwell(globals, false);
 }
 
-inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C,
-                            int num_consumer_warps) {
+inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C, int num_consumer_warps) {
     TORCH_CHECK(num_consumer_warps == 1 || num_consumer_warps == 2,
                 "num_consumer_warps must be 1 or 2");
     if (num_consumer_warps == 1) {

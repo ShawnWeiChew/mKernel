@@ -1,0 +1,105 @@
+{
+  "returncode": 1,
+  "results": [],
+  "metadata": {
+    "gpu_request": "B200+:8",
+    "gpu": "B200:8",
+    "arch": "100a",
+    "device_names": [
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200",
+      "NVIDIA B200"
+    ],
+    "capabilities": [
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        10,
+        0
+      ]
+    ],
+    "cuda_image": "nvidia/cuda:13.2.0-devel-ubuntu24.04",
+    "torch": "2.13.0+cu132",
+    "torch_cuda": "13.2",
+    "nccl": [
+      2,
+      29,
+      7
+    ],
+    "build_command": [
+      "make",
+      "-B",
+      "GPU=blackwell",
+      "INTRA_NUM_DEVICES=8",
+      "CUDA_HOME=/usr/local/cuda",
+      "PYTHON=/usr/local/bin/python",
+      "ARCH=-gencode arch=compute_100a,code=sm_100a",
+      "gemm-rs-blackwell"
+    ],
+    "command": [
+      "/usr/local/bin/python",
+      "-m",
+      "torch.distributed.run",
+      "--standalone",
+      "--nnodes=1",
+      "--nproc-per-node=8",
+      "--max-restarts=0",
+      "--",
+      "bench/gemm_rs_blackwell_rs_bench.py",
+      "--shapes",
+      "2048,4096,8192,16384,32768",
+      "--n",
+      "7168",
+      "--warmup",
+      "5",
+      "--iters",
+      "20",
+      "--graph-size",
+      "20",
+      "--repeats",
+      "5",
+      "--save-json",
+      "/tmp/rs-results.json"
+    ],
+    "source_sha256": {
+      "src/gemm_rs_blackwell.cu": "1b91da02c69129e4a2c100e1a52d13d62c8e3bc9709467fb276dff08fd886d2c",
+      "include/operators/gemm_rs/gemm_rs_blackwell.cuh": "73d1cb4ad730ed256eb1b60b7c2539eef16ea6940913c3dee7c0079bd4ababb7",
+      "include/operators/gemm_rs/gemm_rs_blackwell_session.cuh": "bc760cb7f915a46ff693ae4c0cec7ff99e1d11b8e8ab6967734ca23be5b8233a",
+      "bench/gemm_rs_blackwell_rs_bench.py": "5301a25fc4370868d41de0d08e4851199e9e2f0ca345197ca7580c85476f00d5"
+    },
+    "nccl_env": {
+      "NCCL_DEBUG": "WARN"
+    }
+  }
+}

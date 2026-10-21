@@ -35,7 +35,7 @@ def load(name: str):
     so = max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else plain_so
     if not so.exists():
         raise RuntimeError(
-            f"{so} does not exist. Run `make build/lib{name}.so` (or `make all`) "
+            f"{so} does not exist. Run `make build/lib{name}.so_sw` (or `make all`) "
             f"from {ROOT} first."
         )
     load_so = so

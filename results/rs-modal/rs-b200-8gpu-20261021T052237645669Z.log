@@ -1,0 +1,247 @@
+Wed Oct 21 05:20:04 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.57.04              KMD Version: 610.57.04     CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA B200                    On  |   00000000:03:00.0 Off |                    0 |
+| N/A   32C    P0            193W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA B200                    On  |   00000000:13:00.0 Off |                    0 |
+| N/A   34C    P0            198W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA B200                    On  |   00000000:63:00.0 Off |                    0 |
+| N/A   32C    P0            191W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA B200                    On  |   00000000:73:00.0 Off |                    0 |
+| N/A   34C    P0            197W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA B200                    On  |   00000000:83:00.0 Off |                    0 |
+| N/A   32C    P0            198W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA B200                    On  |   00000000:93:00.0 Off |                    0 |
+| N/A   34C    P0            197W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA B200                    On  |   00000000:E3:00.0 Off |                    0 |
+| N/A   32C    P0            190W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA B200                    On  |   00000000:F3:00.0 Off |                    0 |
+| N/A   34C    P0            199W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+[diagnostic unavailable] nvidia-smi topo -m exited 255
+	[4mGPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+Failed to run topology matrix
+
+
+mkdir -p build
+/usr/local/cuda/bin/nvcc -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr -gencode arch=compute_100a,code=sm_100a -ccbin /usr/bin/g++ -lineinfo --ptxas-options=-v -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05 -DINTRA_NUM_DEVICES=8  -DMKERNEL_GEMM_RS_NUM_CONSUMER_WARPS=2 -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell -I/opt/mkernel/include -I/opt/amazon/efa/include -I/usr/local/lib/python3.12/site-packages/torch/include -I/usr/local/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -I/usr/local/include/python3.12 \
+    --compiler-options '-fPIC' -shared -lcuda  -L/usr/local/lib/python3.12/site-packages/torch/lib -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python -Xlinker -rpath -Xlinker /usr/local/lib/python3.12/site-packages/torch/lib -L/usr/local/cuda/lib src/gemm_rs_blackwell.cu -o build/libgemm_rs_blackwell.so
+ptxas info    : 46 bytes gmem
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi2EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi2EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 224 registers, used 2 barriers, 128 bytes smem
+ptxas info    : Compile time = 49.778 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi1EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi1EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 197 registers, used 2 barriers, 112 bytes smem
+ptxas info    : Compile time = 32.989 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi8EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi8EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 216 registers, used 0 barriers
+ptxas info    : Compile time = 10.120 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi4EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi4EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 210 registers, used 0 barriers
+ptxas info    : Compile time = 11.380 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi2EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi2EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 0 barriers
+ptxas info    : Compile time = 6.093 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi1EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi256ELi1EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 222 registers, used 0 barriers
+ptxas info    : Compile time = 11.518 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi8EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi8EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 92 registers, used 0 barriers
+ptxas info    : Compile time = 5.800 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi4EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi4EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 216 registers, used 0 barriers
+ptxas info    : Compile time = 10.188 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi2EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi2EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 210 registers, used 0 barriers
+ptxas info    : Compile time = 11.629 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi1EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi128ELi1EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 222 registers, used 0 barriers
+ptxas info    : Compile time = 11.574 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell18exit_epoch_barrierEN4dist18distributed_tensorINS0_12local_tensorIjLi1ELi1ELi1ELi1EJEEELi8ELb0ELi0ELi1EJEEEi' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell18exit_epoch_barrierEN4dist18distributed_tensorINS0_12local_tensorIjLi1ELi1ELi1ELi1EJEEELi8ELb0ELi0ELi1EJEEEi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 9 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 1.590 ms
+ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_10006detail11EmptyKernelIvEEvv' for 'sm_100a'
+ptxas info    : Function properties for _ZN3cub17_V_300200_SM_10006detail11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers, used 0 barriers
+ptxas info    : Compile time = 0.292 ms
+
+NCCL version 2.29.7+cuda13.2
+NVIDIA B200; 8 GPUs; NCCL (2, 29, 7)
+BF16 SUM; 148 CTAs, [1, 2, 4, 8] warps/CTA, 16 stores/batch; 16B loads / 32B stores
+Raw = data path only; + exit barrier = cross-rank completion included.
+Immutable inputs; no GEMM/readiness waits; median of max-rank graph timings.
+NCCL_ALGO=auto NCCL_PROTO=auto NCCL_NVLS_ENABLE=auto
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+M=  2048 N=7168 input/rank=28.0 MiB output/rank=3.5 MiB
+  NCCL                                           75.98 us    100.0% of NCCL throughput  1.000x NCCL time
+  multimem tile=128 warps=1 raw                  81.31 us     93.5% of NCCL throughput  1.070x NCCL time
+  multimem tile=128 warps=1 + exit barrier       90.29 us     84.2% of NCCL throughput  1.188x NCCL time
+  multimem tile=128 warps=2 raw                  81.38 us     93.4% of NCCL throughput  1.071x NCCL time
+  multimem tile=128 warps=2 + exit barrier       89.61 us     84.8% of NCCL throughput  1.179x NCCL time
+  multimem tile=128 warps=4 raw                  81.28 us     93.5% of NCCL throughput  1.070x NCCL time
+  multimem tile=128 warps=4 + exit barrier       89.45 us     84.9% of NCCL throughput  1.177x NCCL time
+  multimem tile=128 warps=8 raw                  81.43 us     93.3% of NCCL throughput  1.072x NCCL time
+  multimem tile=128 warps=8 + exit barrier       90.18 us     84.3% of NCCL throughput  1.187x NCCL time
+  multimem tile=256 warps=1 raw                  80.99 us     93.8% of NCCL throughput  1.066x NCCL time
+  multimem tile=256 warps=1 + exit barrier       90.11 us     84.3% of NCCL throughput  1.186x NCCL time
+  multimem tile=256 warps=2 raw                  81.17 us     93.6% of NCCL throughput  1.068x NCCL time
+  multimem tile=256 warps=2 + exit barrier       90.64 us     83.8% of NCCL throughput  1.193x NCCL time
+  multimem tile=256 warps=4 raw                  81.22 us     93.6% of NCCL throughput  1.069x NCCL time
+  multimem tile=256 warps=4 + exit barrier       90.21 us     84.2% of NCCL throughput  1.187x NCCL time
+  multimem tile=256 warps=8 raw                  81.42 us     93.3% of NCCL throughput  1.072x NCCL time
+  multimem tile=256 warps=8 + exit barrier       90.23 us     84.2% of NCCL throughput  1.188x NCCL time
+M=  4096 N=7168 input/rank=56.0 MiB output/rank=7.0 MiB
+  NCCL                                          136.26 us    100.0% of NCCL throughput  1.000x NCCL time
+  multimem tile=128 warps=1 raw                 163.40 us     83.4% of NCCL throughput  1.199x NCCL time
+  multimem tile=128 warps=1 + exit barrier      172.76 us     78.9% of NCCL throughput  1.268x NCCL time
+  multimem tile=128 warps=2 raw                 163.37 us     83.4% of NCCL throughput  1.199x NCCL time
+  multimem tile=128 warps=2 + exit barrier      171.78 us     79.3% of NCCL throughput  1.261x NCCL time
+  multimem tile=128 warps=4 raw                 163.33 us     83.4% of NCCL throughput  1.199x NCCL time
+  multimem tile=128 warps=4 + exit barrier      171.10 us     79.6% of NCCL throughput  1.256x NCCL time
+  multimem tile=128 warps=8 raw                 163.17 us     83.5% of NCCL throughput  1.198x NCCL time
+  multimem tile=128 warps=8 + exit barrier      170.47 us     79.9% of NCCL throughput  1.251x NCCL time
+  multimem tile=256 warps=1 raw                 163.06 us     83.6% of NCCL throughput  1.197x NCCL time
+  multimem tile=256 warps=1 + exit barrier      171.98 us     79.2% of NCCL throughput  1.262x NCCL time
+  multimem tile=256 warps=2 raw                 163.40 us     83.4% of NCCL throughput  1.199x NCCL time
+  multimem tile=256 warps=2 + exit barrier      171.60 us     79.4% of NCCL throughput  1.259x NCCL time
+  multimem tile=256 warps=4 raw                 163.31 us     83.4% of NCCL throughput  1.199x NCCL time
+  multimem tile=256 warps=4 + exit barrier      171.29 us     79.5% of NCCL throughput  1.257x NCCL time
+  multimem tile=256 warps=8 raw                 163.48 us     83.3% of NCCL throughput  1.200x NCCL time
+  multimem tile=256 warps=8 + exit barrier      174.40 us     78.1% of NCCL throughput  1.280x NCCL time
+M=  8192 N=7168 input/rank=112.0 MiB output/rank=14.0 MiB
+  NCCL                                          194.10 us    100.0% of NCCL throughput  1.000x NCCL time
+  multimem tile=128 warps=1 raw                 325.69 us     59.6% of NCCL throughput  1.678x NCCL time
+  multimem tile=128 warps=1 + exit barrier      336.68 us     57.6% of NCCL throughput  1.735x NCCL time
+  multimem tile=128 warps=2 raw                 325.76 us     59.6% of NCCL throughput  1.678x NCCL time
+  multimem tile=128 warps=2 + exit barrier      336.09 us     57.8% of NCCL throughput  1.732x NCCL time
+  multimem tile=128 warps=4 raw                 325.87 us     59.6% of NCCL throughput  1.679x NCCL time
+  multimem tile=128 warps=4 + exit barrier      334.70 us     58.0% of NCCL throughput  1.724x NCCL time
+  multimem tile=128 warps=8 raw                 325.67 us     59.6% of NCCL throughput  1.678x NCCL time
+  multimem tile=128 warps=8 + exit barrier      334.05 us     58.1% of NCCL throughput  1.721x NCCL time
+  multimem tile=256 warps=1 raw                 325.61 us     59.6% of NCCL throughput  1.678x NCCL time
+  multimem tile=256 warps=1 + exit barrier      335.21 us     57.9% of NCCL throughput  1.727x NCCL time
+  multimem tile=256 warps=2 raw                 325.53 us     59.6% of NCCL throughput  1.677x NCCL time
+  multimem tile=256 warps=2 + exit barrier      335.50 us     57.9% of NCCL throughput  1.729x NCCL time
+  multimem tile=256 warps=4 raw                 325.98 us     59.5% of NCCL throughput  1.679x NCCL time
+  multimem tile=256 warps=4 + exit barrier      335.04 us     57.9% of NCCL throughput  1.726x NCCL time
+  multimem tile=256 warps=8 raw                 326.32 us     59.5% of NCCL throughput  1.681x NCCL time
+  multimem tile=256 warps=8 + exit barrier      334.86 us     58.0% of NCCL throughput  1.725x NCCL time
+M= 16384 N=7168 input/rank=224.0 MiB output/rank=28.0 MiB
+  NCCL                                          379.24 us    100.0% of NCCL throughput  1.000x NCCL time
+  multimem tile=128 warps=1 raw                 647.15 us     58.6% of NCCL throughput  1.706x NCCL time
+  multimem tile=128 warps=1 + exit barrier      666.77 us     56.9% of NCCL throughput  1.758x NCCL time
+  multimem tile=128 warps=2 raw                 646.43 us     58.7% of NCCL throughput  1.705x NCCL time
+  multimem tile=128 warps=2 + exit barrier      660.31 us     57.4% of NCCL throughput  1.741x NCCL time
+  multimem tile=128 warps=4 raw                 646.28 us     58.7% of NCCL throughput  1.704x NCCL time
+  multimem tile=128 warps=4 + exit barrier      658.29 us     57.6% of NCCL throughput  1.736x NCCL time
+  multimem tile=128 warps=8 raw                 646.78 us     58.6% of NCCL throughput  1.705x NCCL time
+  multimem tile=128 warps=8 + exit barrier      656.24 us     57.8% of NCCL throughput  1.730x NCCL time
+  multimem tile=256 warps=1 raw                 646.42 us     58.7% of NCCL throughput  1.705x NCCL time
+  multimem tile=256 warps=1 + exit barrier      658.37 us     57.6% of NCCL throughput  1.736x NCCL time
+  multimem tile=256 warps=2 raw                 646.29 us     58.7% of NCCL throughput  1.704x NCCL time
+  multimem tile=256 warps=2 + exit barrier      658.70 us     57.6% of NCCL throughput  1.737x NCCL time
+  multimem tile=256 warps=4 raw                 646.58 us     58.7% of NCCL throughput  1.705x NCCL time
+  multimem tile=256 warps=4 + exit barrier      658.47 us     57.6% of NCCL throughput  1.736x NCCL time
+  multimem tile=256 warps=8 raw                 646.71 us     58.6% of NCCL throughput  1.705x NCCL time
+  multimem tile=256 warps=8 + exit barrier      657.89 us     57.6% of NCCL throughput  1.735x NCCL time
+M= 32768 N=7168 input/rank=448.0 MiB output/rank=56.0 MiB
+  NCCL                                          738.76 us    100.0% of NCCL throughput  1.000x NCCL time
+  multimem tile=128 warps=1 raw                1293.57 us     57.1% of NCCL throughput  1.751x NCCL time
+  multimem tile=128 warps=1 + exit barrier     1312.50 us     56.3% of NCCL throughput  1.777x NCCL time
+  multimem tile=128 warps=2 raw                1293.11 us     57.1% of NCCL throughput  1.750x NCCL time
+  multimem tile=128 warps=2 + exit barrier     1307.89 us     56.5% of NCCL throughput  1.770x NCCL time
+  multimem tile=128 warps=4 raw                1293.58 us     57.1% of NCCL throughput  1.751x NCCL time
+  multimem tile=128 warps=4 + exit barrier     1306.54 us     56.5% of NCCL throughput  1.769x NCCL time
+  multimem tile=128 warps=8 raw                1293.38 us     57.1% of NCCL throughput  1.751x NCCL time
+  multimem tile=128 warps=8 + exit barrier     1307.28 us     56.5% of NCCL throughput  1.770x NCCL time
+  multimem tile=256 warps=1 raw                1295.00 us     57.0% of NCCL throughput  1.753x NCCL time
+  multimem tile=256 warps=1 + exit barrier     1322.03 us     55.9% of NCCL throughput  1.790x NCCL time
+  multimem tile=256 warps=2 raw                1293.22 us     57.1% of NCCL throughput  1.751x NCCL time
+  multimem tile=256 warps=2 + exit barrier     1314.18 us     56.2% of NCCL throughput  1.779x NCCL time
+  multimem tile=256 warps=4 raw                1293.99 us     57.1% of NCCL throughput  1.752x NCCL time
+  multimem tile=256 warps=4 + exit barrier     1308.70 us     56.4% of NCCL throughput  1.771x NCCL time
+  multimem tile=256 warps=8 raw                1293.72 us     57.1% of NCCL throughput  1.751x NCCL time
+  multimem tile=256 warps=8 + exit barrier     1309.10 us     56.4% of NCCL throughput  1.772x NCCL time

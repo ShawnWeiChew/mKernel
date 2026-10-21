@@ -1,0 +1,208 @@
+Wed Oct 21 04:59:06 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.57.04              KMD Version: 610.57.04     CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA B200                    On  |   00000000:03:00.0 Off |                    0 |
+| N/A   32C    P0            192W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA B200                    On  |   00000000:13:00.0 Off |                    0 |
+| N/A   34C    P0            198W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA B200                    On  |   00000000:63:00.0 Off |                    0 |
+| N/A   32C    P0            190W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA B200                    On  |   00000000:73:00.0 Off |                    0 |
+| N/A   34C    P0            197W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA B200                    On  |   00000000:83:00.0 Off |                    0 |
+| N/A   32C    P0            198W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA B200                    On  |   00000000:93:00.0 Off |                    0 |
+| N/A   34C    P0            196W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA B200                    On  |   00000000:E3:00.0 Off |                    0 |
+| N/A   32C    P0            189W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA B200                    On  |   00000000:F3:00.0 Off |                    0 |
+| N/A   34C    P0            198W / 1000W |       4MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+[diagnostic unavailable] nvidia-smi topo -m exited 255
+	[4mGPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+Failed to run topology matrix
+
+
+mkdir -p build
+/usr/local/cuda/bin/nvcc -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr -gencode arch=compute_100a,code=sm_100a -ccbin /usr/bin/g++ -lineinfo --ptxas-options=-v -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05 -DINTRA_NUM_DEVICES=8  -DMKERNEL_GEMM_RS_NUM_CONSUMER_WARPS=2 -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell -I/opt/mkernel/include -I/opt/amazon/efa/include -I/usr/local/lib/python3.12/site-packages/torch/include -I/usr/local/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -I/usr/local/include/python3.12 \
+    --compiler-options '-fPIC' -shared -lcuda  -L/usr/local/lib/python3.12/site-packages/torch/lib -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python -Xlinker -rpath -Xlinker /usr/local/lib/python3.12/site-packages/torch/lib -L/usr/local/cuda/lib src/gemm_rs_blackwell.cu -o build/libgemm_rs_blackwell.so
+ptxas info    : 46 bytes gmem
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi2EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi2EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 224 registers, used 2 barriers, 128 bytes smem
+ptxas info    : Compile time = 50.499 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi1EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell17fused_kernel_stubILi1ELi4ELi1EEEvNS_13fused_globalsIXT_EXT0_EXT1_EEE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 197 registers, used 2 barriers, 112 bytes smem
+ptxas info    : Compile time = 32.634 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi256EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi256EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 222 registers, used 0 barriers
+ptxas info    : Compile time = 11.607 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell14rs_only_kernelILi128EEEvPK13__nv_bfloat16PS1_iii' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell14rs_only_kernelILi128EEEvPK13__nv_bfloat16PS1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 222 registers, used 0 barriers
+ptxas info    : Compile time = 11.532 ms
+ptxas info    : Compiling entry function '_ZN17gemm_rs_blackwell18exit_epoch_barrierEN4dist18distributed_tensorINS0_12local_tensorIjLi1ELi1ELi1ELi1EJEEELi8ELb0ELi0ELi1EJEEEi' for 'sm_100a'
+ptxas info    : Function properties for _ZN17gemm_rs_blackwell18exit_epoch_barrierEN4dist18distributed_tensorINS0_12local_tensorIjLi1ELi1ELi1ELi1EJEEELi8ELb0ELi0ELi1EJEEEi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 9 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 1.570 ms
+ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_10006detail11EmptyKernelIvEEvv' for 'sm_100a'
+ptxas info    : Function properties for _ZN3cub17_V_300200_SM_10006detail11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers, used 0 barriers
+ptxas info    : Compile time = 0.285 ms
+
+NCCL version 2.29.7+cuda13.2
+NVIDIA B200; 8 GPUs; NCCL (2, 29, 7)
+BF16 SUM; 148 CTAs, 1 warp/CTA, 16 stores/batch; 16B loads / 32B stores
+Raw = data path only; + exit barrier = cross-rank completion included.
+Immutable inputs; no GEMM/readiness waits; median of max-rank graph timings.
+NCCL_ALGO=auto NCCL_PROTO=auto NCCL_NVLS_ENABLE=auto
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+/usr/local/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.reduce_scatter_tensor` is deprecated. Please use `torch.distributed.reduce_scatter_single` instead.
+  return func(*args, **kwargs)
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+CUDA runtime error src/gemm_rs_blackwell.cu:703 'invalid argument'
+W1021 04:59:47.263000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 127 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 129 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 130 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 131 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 132 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 133 closing signal SIGTERM
+W1021 04:59:47.264000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 134 closing signal SIGTERM
+E1021 04:59:48.004000 106 site-packages/torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: 1) local_rank: 1 (pid: 128) of binary: /usr/local/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1032, in <module>
+    main()
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 383, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+bench/gemm_rs_blackwell_rs_bench.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 127) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 129) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 130) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[4]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 4 (local_rank: 4)
+  exitcode  : 1 (pid: 131) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[5]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 5 (local_rank: 5)
+  exitcode  : 1 (pid: 132) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[6]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 133) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[7]:
+  time      : 2026-10-21_04:59:48
+  host      : localhost
+  rank      : 7 (local_rank: 7)
+  exitcode  : 1 (pid: 134) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-21_04:59:47
+  host      : localhost
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 128) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
