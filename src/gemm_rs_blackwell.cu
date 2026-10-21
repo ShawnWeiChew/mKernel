@@ -697,8 +697,8 @@ inline void launch_rs_only(dist::ParallelBuffer& input,
                     output.scalar_type() == at::kBFloat16 && output.dim() == 2 &&
                     output.is_contiguous(),
                 "Output must be contiguous BF16 on the input device");
-    TORCH_CHECK(tile_rows == 128 || tile_rows == 256 || tile_rows == 512 || tile_rows == 1024,
-                "tile_rows must be 128, 256, 512, or 1024");
+    TORCH_CHECK(tile_rows == 32 || tile_rows == 64 || tile_rows == 128 || tile_rows == 256,
+                "tile_rows must be 32, 64, 128, or 256");
     TORCH_CHECK(num_warps == 1 || num_warps == 2 || num_warps == 4 || num_warps == 8,
                 "num_warps must be 1, 2, 4, or 8");
     const int64_t M = input.data_.size(0), N = input.data_.size(1);
@@ -716,10 +716,10 @@ inline void launch_rs_only(dist::ParallelBuffer& input,
                 "Standalone RS output must not overlap input");
     c10::cuda::CUDAGuard device_guard(input.local_rank_);
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto kernel = tile_rows == 128   ? select_rs_only_kernel<128>(num_warps)
-                  : tile_rows == 256 ? select_rs_only_kernel<256>(num_warps)
-                  : tile_rows == 512 ? select_rs_only_kernel<512>(num_warps)
-                                     : select_rs_only_kernel<1024>(num_warps);
+    auto kernel = tile_rows == 32    ? select_rs_only_kernel<32>(num_warps)
+                  : tile_rows == 64  ? select_rs_only_kernel<64>(num_warps)
+                  : tile_rows == 128 ? select_rs_only_kernel<128>(num_warps)
+                                     : select_rs_only_kernel<256>(num_warps);
     kernel<<<fg::NUM_BLOCKS, num_warps * 32, 0, stream>>>(
         reinterpret_cast<const comm::bf16*>(input.multicast_ptr_),
         reinterpret_cast<comm::bf16*>(output.data_ptr()),

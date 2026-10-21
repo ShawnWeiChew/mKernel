@@ -10,13 +10,13 @@
     # Subset of RS warps per CTA (default sweeps 1,2,4,8):
     modal run bench/modal_gemm_rs_bench.py --num-warps 1,8
 
-    # Subset of RS tile rows (default 128,256,512,1024; non-dividing tiles skipped):
-    modal run bench/modal_gemm_rs_bench.py --tile-rows 256,512
+    # Subset of RS tile rows (default 32,64,128,256; non-dividing tiles skipped):
+    modal run bench/modal_gemm_rs_bench.py --tile-rows 32,64
 
     # Optional fixed GPU type instead of the default B200+ pool:
     MKERNEL_MODAL_GPU=B200 modal run bench/modal_gemm_rs_bench.py
 
-Default: one B200+:8 container, all five GEMM+RS shapes, 128/256/512/1024-row RS tiles,
+Default: one B200+:8 container, all five GEMM+RS shapes, 32/64/128/256-row RS tiles,
 1/2/4/8 RS warps per CTA, raw multimem and multimem+exit-barrier timings. After provisioning, detect the
 GPU capability and compile sm_100a (B200) or sm_103a (B300). Dependencies are
 cached in the image; compilation runs on the GPU container outside timing.
@@ -180,17 +180,17 @@ def run_benchmark(shapes: str, n: int, warmup: int, iters: int,
 def main(shapes: str = "2048,4096,8192,16384,32768", n: int = 7168,
          warmup: int = 5, iters: int = 20, graph_size: int = 20, repeats: int = 5,
          check_only: bool = False, num_warps: str = "1,2,4,8",
-         tile_rows: str = "128,256,512,1024",
+         tile_rows: str = "32,64,128,256",
          output_dir: str = "results/rs-modal"):
     # Validate locally before requesting eight GPUs.
     values = [int(value) for value in shapes.split(",")]
     tiles = tile_rows.split(",")
-    if not tiles or any(value not in ("128", "256", "512", "1024") for value in tiles):
-        raise ValueError("--tile-rows must be a comma-separated subset of 128,256,512,1024")
+    if not tiles or any(value not in ("32", "64", "128", "256") for value in tiles):
+        raise ValueError("--tile-rows must be a comma-separated subset of 32,64,128,256")
     alignment = 8 * min(int(value) for value in tiles)
     if any(m <= 0 or m % alignment for m in values):
         raise ValueError(f"M values must be positive multiples of {alignment} on 8 GPUs; "
-                         "larger tiles that do not divide a shape are skipped for it")
+                         "tiles that do not divide a shape are skipped for it")
     if n <= 0 or n % 256 or warmup < 0 or min(iters, graph_size, repeats) < 1:
         raise ValueError("N must be a positive multiple of 256; timing counts must be positive (warmup >= 0)")
     if not num_warps or any(value not in ("1", "2", "4", "8") for value in num_warps.split(",")):

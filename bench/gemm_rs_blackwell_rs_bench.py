@@ -5,8 +5,8 @@
 
 Default M/N are all five shapes in gemm_rs_blackwell_bench.py. K does not
 change the RS workload. Use --shapes 2048,4096 --n 7168 for a custom sweep.
-RS tiles of 128/256 rows (the one-/two-consumer GEMM variants) and larger
-512/1024-row tiles are tested; tiles that do not divide M/world_size are skipped.
+RS tiles of 128/256 rows (the one-/two-consumer GEMM variants) and smaller
+32/64-row tiles are tested; tiles that do not divide M/world_size are skipped.
 The kernel reuses the fused RS helper: two 16-byte multimem reduction loads per
 32-byte store, 16 stores per batch, 1/2/4/8 warps per CTA (each warp
 reduces a row slice of the tile; stores/batch shrinks to fit), and the same CTA count.
@@ -185,8 +185,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--shapes", default="2048,4096,8192,16384,32768", help="Comma-separated M values")
     parser.add_argument("--n", type=int, default=7168)
-    parser.add_argument("--tile-rows", nargs="+", type=int, choices=(128, 256, 512, 1024),
-                        default=[128, 256, 512, 1024])
+    parser.add_argument("--tile-rows", nargs="+", type=int, choices=(32, 64, 128, 256),
+                        default=[32, 64, 128, 256])
     parser.add_argument("--num-warps", nargs="+", type=int, choices=(1, 2, 4, 8),
                         default=[1, 2, 4, 8], help="RS warps per CTA to sweep")
     parser.add_argument("--warmup", type=int, default=5)
