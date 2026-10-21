@@ -5,8 +5,10 @@
 
 Default M/N are all five shapes in gemm_rs_blackwell_bench.py. K does not
 change the RS workload. Use --shapes 2048,4096 --n 7168 for a custom sweep.
-The kernel uses the fused GEMM's ROW_BLOCK x 256 tiles, one warp per CTA, and
-the same CTA count. Two lane layouts are compared with equal bytes in flight:
+Tuning matrix: tile rows (128/256/512) x warps per CTA (1/4/8) x lane layout,
+all with the fused kernel's 256 columns and CTA count. Each warp reduces its own
+TILE_ROWS / warps row slice; batches shrink to fit small slices. Tiles that do
+not divide M/world_size are skipped. Lane layouts have equal bytes in flight:
   lane=32B: the fused RS helper, two strided 16-byte multimem reduction loads
             per 32-byte store, 16 stores per batch;
   lane=16B: one contiguous 16-byte reduction load + 16-byte store per lane
@@ -107,12 +109,19 @@ def benchmark_shape(module, m, n, rank, world, args):
         dist.reduce_scatter_tensor(output, source.data_, op=dist.ReduceOp.SUM)
 
     launches = {"NCCL": nccl}
-    for lane_bytes in args.lane_bytes:
-        for barrier in (False, True):
-            def multimem(barrier=barrier, lane_bytes=lane_bytes):
-                module.rs_blackwell_launch(source, output, epochs, barrier, lane_bytes)
-            name = f"multimem lane={lane_bytes}B" + (" + exit barrier" if barrier else " raw")
-            launches[name] = multimem
+    for tile_rows in args.tile_rows:
+        if m % (world * tile_rows):
+            continue  # Too few rows per rank for this tile size.
+        for warps in args.num_warps:
+            for lane_bytes in args.lane_bytes:
+                for barrier in (False, True):
+                    def multimem(barrier=barrier, tile_rows=tile_rows, warps=warps,
+                                 lane_bytes=lane_bytes):
+                        module.rs_blackwell_launch(
+                            source, output, epochs, barrier, tile_rows, warps, lane_bytes)
+                    name = f"multimem tile={tile_rows} warps={warps} lane={lane_bytes}B" + (
+                        " + exit barrier" if barrier else " raw")
+                    launches[name] = multimem
 
     graphs = {}
     graph = None
@@ -165,12 +174,13 @@ def benchmark_shape(module, m, n, rank, world, args):
             )
             for name, ms in timings.items():
                 print(
-                    f"  {name:34s} {ms * 1000:9.2f} us  "
+                    f"  {name:50s} {ms * 1000:9.2f} us  "
                     f"{100 * baseline / ms:7.1f}% of NCCL throughput  "
                     f"{ms / baseline:.3f}x NCCL time",
                     flush=True,
                 )
-        return {"m": m, "n": n, "world_size": world, "lane_bytes": args.lane_bytes,
+        return {"m": m, "n": n, "world_size": world, "tile_rows": args.tile_rows,
+                "num_warps": args.num_warps, "lane_bytes": args.lane_bytes,
                 "ms": timings, "samples_ms": samples}
     finally:
         # Free graphs before their communicator and multicast backing allocations.
@@ -183,6 +193,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--shapes", default="2048,4096,8192,16384,32768", help="Comma-separated M values")
     parser.add_argument("--n", type=int, default=7168)
+    parser.add_argument("--tile-rows", nargs="+", type=int, choices=(128, 256, 512),
+                        default=[128, 256, 512])
+    parser.add_argument("--num-warps", nargs="+", type=int, choices=(1, 4, 8), default=[1, 4, 8],
+                        help="RS warps per CTA")
     parser.add_argument("--lane-bytes", nargs="+", type=int, choices=(16, 32), default=[32, 16],
                         help="32 = two strided 16B loads + 32B store per lane; "
                              "16 = one contiguous 16B load/store per lane")
@@ -201,7 +215,12 @@ def main():
         shapes = [int(value) for value in args.shapes.split(",")]
     except ValueError:
         parser.error("--shapes must contain comma-separated M values")
+    args.tile_rows = list(dict.fromkeys(args.tile_rows))
+    args.num_warps = list(dict.fromkeys(args.num_warps))
     args.lane_bytes = list(dict.fromkeys(args.lane_bytes))
+    alignment = world * min(args.tile_rows)
+    if any(m <= 0 or m % alignment for m in shapes):
+        parser.error(f"M must be positive and divisible by {alignment} (world_size * smallest tile)")
     if args.n <= 0 or args.n % 256:
         parser.error("N must be a positive multiple of 256")
     if args.warmup < 0 or min(args.iters, args.graph_size, args.repeats) < 1:
@@ -214,9 +233,6 @@ def main():
     module = load_module.load("gemm_rs_blackwell")
     if module.gemm_rs_blackwell_world_size != world or not hasattr(module, "rs_blackwell_launch"):
         parser.error(f"Rebuild: make GPU=blackwell INTRA_NUM_DEVICES={world} gemm-rs-blackwell")
-    alignment = world * module.rs_blackwell_tile_rows
-    if any(m <= 0 or m % alignment for m in shapes):
-        parser.error(f"M must be positive and divisible by {alignment} (world_size * RS tile rows)")
     torch.manual_seed(42 + rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     results = []
@@ -224,8 +240,8 @@ def main():
         if rank == 0:
             print(
                 f"{torch.cuda.get_device_name()}; {world} GPUs; NCCL {torch.cuda.nccl.version()}\n"
-                f"BF16 SUM; {module.rs_blackwell_blocks} CTAs, 1 warp/CTA, "
-                f"{module.rs_blackwell_tile_rows}x256 tiles; lane layouts {args.lane_bytes} B\n"
+                f"BF16 SUM; {module.rs_blackwell_blocks} CTAs; tiles {args.tile_rows}x256, "
+                f"warps/CTA {args.num_warps}, lane layouts {args.lane_bytes} B\n"
                 "Raw = data path only; + exit barrier = cross-rank completion included.\n"
                 "Immutable inputs; no GEMM/readiness waits; median of max-rank graph timings.\n"
                 f"NCCL_ALGO={os.environ.get('NCCL_ALGO', 'auto')} "

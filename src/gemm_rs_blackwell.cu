@@ -581,32 +581,55 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     }
 }
 
-// Standalone version of the RS warp's tile loop: one warp per CTA and the
-// fused kernel's ROW_BLOCK x COL_BLOCK tiles, but write a compact, separate
+// Standalone version of the RS warp's tile loop, writing a compact, separate
 // output shard so repeated benchmark launches do not reduce previously reduced
-// input. LANE_BYTES selects the lane layout: 32 = two strided 16B loads + one
-// 32B store per lane (the fused helper); 16 = one contiguous 16B load/store per
-// lane, with the same bytes in flight per lane.
-template <int LANE_BYTES>
-__global__ __launch_bounds__(32) void rs_only_kernel(
+// input. Each of NUM_WARPS warps reduces its own contiguous TILE_ROWS /
+// NUM_WARPS row slice of a TILE_ROWS x COL_BLOCK tile. LANE_BYTES selects the
+// lane layout: 32 = two strided 16B loads + one 32B store per lane (the fused
+// helper); 16 = one contiguous 16B load/store per lane, with the same bytes in
+// flight per lane.
+template <int TILE_ROWS, int NUM_WARPS, int LANE_BYTES>
+__global__ __launch_bounds__(NUM_WARPS * 32) void rs_only_kernel(
     const comm::bf16* multicast_input, comm::bf16* output, int rows_per_rank, int N, int rank) {
     using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
+    static_assert(TILE_ROWS % NUM_WARPS == 0, "Tile rows must split evenly across warps");
+    constexpr int WARP_ROWS = TILE_ROWS / NUM_WARPS;
+    // Each 32-byte store covers 32 / (COL_BLOCK / 16) rows per warp. Shrink the
+    // batch when a warp's slice is smaller than the default register batch.
+    constexpr int ROWS_PER_STORE = 32 / (fg::COL_BLOCK / 16);
+    constexpr int STORES_PER_BATCH = std::min(fg::RS_STORES_PER_BATCH, WARP_ROWS / ROWS_PER_STORE);
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
     const int tile_cols = N / fg::COL_BLOCK;
-    const int tiles = (rows_per_rank / fg::ROW_BLOCK) * tile_cols;
+    const int tiles = (rows_per_rank / TILE_ROWS) * tile_cols;
     for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
-        const int row = (tile / tile_cols) * fg::ROW_BLOCK;
+        const int row = (tile / tile_cols) * TILE_ROWS + warp * WARP_ROWS;
         const int col = (tile % tile_cols) * fg::COL_BLOCK;
         const comm::bf16* src = multicast_input + (size_t(rank) * rows_per_rank + row) * N + col;
         comm::bf16* dst = output + size_t(row) * N + col;
         if constexpr (LANE_BYTES == 32) {
-            reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
-                src, dst, N, threadIdx.x);
+            reduce_scatter_tile<WARP_ROWS, fg::COL_BLOCK, STORES_PER_BATCH>(src, dst, N, lane);
         } else {
             static_assert(LANE_BYTES == 16, "LANE_BYTES must be 16 or 32");
-            reduce_scatter_tile_16B<fg::ROW_BLOCK, fg::COL_BLOCK, 2 * fg::RS_STORES_PER_BATCH>(
-                src, dst, N, threadIdx.x);
+            reduce_scatter_tile_16B<WARP_ROWS, fg::COL_BLOCK, 2 * STORES_PER_BATCH>(
+                src, dst, N, lane);
         }
     }
+}
+
+template <int TILE_ROWS, int LANE_BYTES>
+inline auto select_rs_only_kernel(int num_warps) {
+    switch (num_warps) {
+        case 1: return rs_only_kernel<TILE_ROWS, 1, LANE_BYTES>;
+        case 4: return rs_only_kernel<TILE_ROWS, 4, LANE_BYTES>;
+        default: return rs_only_kernel<TILE_ROWS, 8, LANE_BYTES>;
+    }
+}
+
+template <int TILE_ROWS>
+inline auto select_rs_only_kernel(int num_warps, int lane_bytes) {
+    return lane_bytes == 16 ? select_rs_only_kernel<TILE_ROWS, 16>(num_warps)
+                            : select_rs_only_kernel<TILE_ROWS, 32>(num_warps);
 }
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
@@ -710,6 +733,8 @@ inline auto make_gemm_only_globals(
 inline void launch_rs_only(dist::ParallelBuffer& input,
                            at::Tensor& output,
                            dist::ParallelBuffer& epochs,
+                           int tile_rows,
+                           int num_warps,
                            int lane_bytes,
                            bool with_exit_barrier) {
     using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
@@ -725,11 +750,14 @@ inline void launch_rs_only(dist::ParallelBuffer& input,
                     output.scalar_type() == at::kBFloat16 && output.dim() == 2 &&
                     output.is_contiguous(),
                 "Output must be contiguous BF16 on the input device");
+    TORCH_CHECK(tile_rows == 128 || tile_rows == 256 || tile_rows == 512,
+                "tile_rows must be 128, 256, or 512");
+    TORCH_CHECK(num_warps == 1 || num_warps == 4 || num_warps == 8, "num_warps must be 1, 4, or 8");
     TORCH_CHECK(lane_bytes == 16 || lane_bytes == 32, "lane_bytes must be 16 or 32");
     const int64_t M = input.data_.size(0), N = input.data_.size(1);
     TORCH_CHECK(
-        M > 0 && M % (INTRA_NUM_DEVICES * fg::ROW_BLOCK) == 0 && N > 0 && N % fg::COL_BLOCK == 0,
-        "M must be divisible by world_size * ", fg::ROW_BLOCK, "; N by ", fg::COL_BLOCK);
+        M > 0 && M % (INTRA_NUM_DEVICES * tile_rows) == 0 && N > 0 && N % fg::COL_BLOCK == 0,
+        "M must be divisible by world_size * tile_rows; N by ", fg::COL_BLOCK);
     TORCH_CHECK(output.size(0) == M / INTRA_NUM_DEVICES && output.size(1) == N,
                 "Expected output shape [M/world_size, N]");
     TORCH_CHECK(epochs.data_.numel() == 1 && epochs.data_.scalar_type() == at::kInt,
@@ -741,8 +769,10 @@ inline void launch_rs_only(dist::ParallelBuffer& input,
                 "Standalone RS output must not overlap input");
     c10::cuda::CUDAGuard device_guard(input.local_rank_);
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto kernel = lane_bytes == 16 ? rs_only_kernel<16> : rs_only_kernel<32>;
-    kernel<<<fg::NUM_BLOCKS, 32, 0, stream>>>(
+    auto kernel = tile_rows == 128   ? select_rs_only_kernel<128>(num_warps, lane_bytes)
+                  : tile_rows == 256 ? select_rs_only_kernel<256>(num_warps, lane_bytes)
+                                     : select_rs_only_kernel<512>(num_warps, lane_bytes);
+    kernel<<<fg::NUM_BLOCKS, num_warps * 32, 0, stream>>>(
         reinterpret_cast<const comm::bf16*>(input.multicast_ptr_),
         reinterpret_cast<comm::bf16*>(output.data_ptr()),
         M / INTRA_NUM_DEVICES,
