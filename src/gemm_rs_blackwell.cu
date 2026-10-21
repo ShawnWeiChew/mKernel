@@ -608,7 +608,52 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
         MKERNEL_CUDACHECK(cudaGetLastError());
     }
 }
+// Local storage in the existing argument layout. With RS disabled, only C[0]
+// is accessed; multicast addresses and communication counters are unused.
+inline auto make_gemm_only_globals(uint64_t a, uint64_t b, uint64_t c,
+                                   int M, int N, int K, cudaStream_t stream) {
+    using fg = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>;
+    uint64_t outputs[INTRA_NUM_DEVICES];
+    uint64_t unused[INTRA_NUM_DEVICES] = {};
+    std::fill_n(outputs, INTRA_NUM_DEVICES, c);
+    return fg{
+        .dev_idx = 0,
+        .M = M,
+        .N = N,
+        .K = K,
+        .A = dist::make_local_tensor<typename fg::A_local_tensor>(a, 1, 1, M, K),
+        .B = dist::make_local_tensor<typename fg::B_local_tensor>(b, 1, 1, N, K),
+        .C = dist::make_distributed_tensor<typename fg::C_dist_tensor>(0, outputs, 1, 1, M, N),
+        .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+            0, unused, 1, 1, 1, 1),
+        .completion_epochs = dist::make_distributed_tensor<completion_epoch_dist_tensor>(
+            unused, 1, 1, 1, 1),
+        .stream = stream};
+}
+
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
+    TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda(), "A, B, C must be CUDA tensors");
+    TORCH_CHECK(A.device() == B.device() && A.device() == C.device(),
+                "A, B, C must be on the same device");
+    TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 &&
+                    C.scalar_type() == at::kBFloat16, "A, B, C must be BF16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2 &&
+                    A.is_contiguous() && B.is_contiguous() && C.is_contiguous(),
+                "A, B, C must be contiguous matrices");
+    TORCH_CHECK(A.size(1) == B.size(1) && C.size(0) == A.size(0) && C.size(1) == B.size(0),
+                "Expected A[M,K], B[N,K], C[M,N]");
+    TORCH_CHECK(A.size(0) > 0 && B.size(0) > 0 && A.size(1) > 0 &&
+                    A.size(0) % 512 == 0 && B.size(0) % 256 == 0 && A.size(1) % 64 == 0,
+                "M, N, K must be positive multiples of 512, 256, 64");
+    c10::cuda::CUDAGuard device_guard(A.device());
+    auto globals = make_gemm_only_globals(
+        reinterpret_cast<uint64_t>(A.data_ptr()), reinterpret_cast<uint64_t>(B.data_ptr()),
+        reinterpret_cast<uint64_t>(C.data_ptr()), A.size(0), B.size(0), A.size(1),
+        at::cuda::getCurrentCUDAStream().stream());
+    launch_gemm_rs_blackwell(globals, false);
+}
+
 inline void prepare(at::Tensor& A,
                     at::Tensor& B,
                     dist::ParallelBuffer& C,

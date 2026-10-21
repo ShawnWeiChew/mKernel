@@ -11,12 +11,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.attr("gemm_rs_blackwell_world_size") = INTRA_NUM_DEVICES;
     m.def(
+        "gemm_blackwell_launch",
+        [](at::Tensor A, at::Tensor B, at::Tensor C) {
+            gemm_rs_blackwell::launch_gemm_only(A, B, C);
+        },
+        pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
+        "Single-GPU GEMM benchmark: C = A @ B.T. Requires RS disabled in the "
+        "kernel source. Uses ordinary BF16 tensors, no exit barrier or PDL overlap.");
+    m.def(
         "gemm_rs_blackwell_prepare",
         [](at::Tensor A,
            at::Tensor B,
-           at::Tensor& C,
-           at::Tensor& ready,
-           at::Tensor& completion_epochs) {
+           dist::ParallelBuffer& C,
+           dist::ParallelBuffer& ready,
+           dist::ParallelBuffer& completion_epochs) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             gemm_rs_blackwell::prepare(A, B, C, ready, completion_epochs);
         },
@@ -30,9 +38,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gemm_rs_blackwell_launch",
         [](at::Tensor A,
            at::Tensor B,
-           at::Tensor& C,
-           at::Tensor& ready,
-           at::Tensor& completion_epochs,
+           dist::ParallelBuffer& C,
+           dist::ParallelBuffer& ready,
+           dist::ParallelBuffer& completion_epochs,
            bool with_exit_barrier) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             gemm_rs_blackwell::launch(A, B, C, ready, completion_epochs, with_exit_barrier);
