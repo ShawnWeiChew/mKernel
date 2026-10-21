@@ -31,16 +31,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            at::Tensor B,
            dist::ParallelBuffer& C,
            dist::ParallelBuffer& ready,
-           dist::ParallelBuffer& completion_epochs) {
+           dist::ParallelBuffer& completion_epochs,
+           bool with_exit_barrier) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
-            gemm_rs_blackwell::launch(A, B, C, ready, completion_epochs);
+            gemm_rs_blackwell::launch(A, B, C, ready, completion_epochs, with_exit_barrier);
         },
         pybind11::arg("A"),
         pybind11::arg("B"),
         pybind11::arg("C"),
         pybind11::arg("ready"),
         pybind11::arg("completion_epochs"),
+        pybind11::arg("with_exit_barrier") = true,
         "Launch GEMM+RS and the exit barrier on the current stream. The result is "
         "C.data_[rank * M/world_size : (rank+1) * M/world_size]. Keep all buffers "
-        "alive and serialize launches; graph replays advance the device epoch.");
+        "alive and serialize launches; graph replays advance the device epoch. "
+        "Set with_exit_barrier=False only for benchmarking with RS disabled in the "
+        "kernel; this skips the exit barrier and disables PDL launch overlap.");
 }

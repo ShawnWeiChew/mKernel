@@ -47,7 +47,8 @@ template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
 struct fused_globals;
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
+void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G,
+                              bool with_exit_barrier = true);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all

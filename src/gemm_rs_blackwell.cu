@@ -424,46 +424,47 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             pdl::arrive();
         } else {
-            const int lane = laneid();
-            const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
-            const int tiles_per_device = tile_rows_per_device * num_tile_cols;
+            // const int lane = laneid();
+            // const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
+            // const int tiles_per_device = tile_rows_per_device * num_tile_cols;
 
-            const int device_row_start = G.dev_idx * rows_per_device;
+            // const int device_row_start = G.dev_idx * rows_per_device;
 
-            pdl::wait();
-            everyone::tma::cluster::wait();
+            // pdl::wait();
+            // everyone::tma::cluster::wait();
 
-            // Should only read after PDL wait since the previous iteration may have modified the
-            // epoch
-            const uint32_t epoch =
-                comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
-            const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+            // // Should only read after PDL wait since the previous iteration may have modified the
+            // // epoch
+            // const uint32_t epoch =
+            //     comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
+            // const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
 
-            for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
-                 tile_idx += fg::NUM_BLOCKS) {
-                // TODO: review indexing to make sure that all devices have active CTAs
-                const int local_tile_row = tile_idx / num_tile_cols;
-                const int tile_col = tile_idx % num_tile_cols;
+            // for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
+            //      tile_idx += fg::NUM_BLOCKS) {
+            //     // TODO: review indexing to make sure that all devices have active CTAs
+            //     const int local_tile_row = tile_idx / num_tile_cols;
+            //     const int tile_col = tile_idx % num_tile_cols;
 
-                // These match the coordinates used by the epilogue's signal.
-                if (lane == 0) {
-                    // Peers publish tile arrivals with system-scope atomics.
-                    while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                                              &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
-                                          ready_count)) {
-                        __nanosleep(16);
-                    }
-                }
-                __syncwarp();
+            //     // These match the coordinates used by the epilogue's signal.
+            //     if (lane == 0) {
+            //         // Peers publish tile arrivals with system-scope atomics.
+            //         while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
+            //                                   &G.C_barrier[G.dev_idx][{local_tile_row,
+            //                                   tile_col}]),
+            //                               ready_count)) {
+            //             __nanosleep(16);
+            //         }
+            //     }
+            //     __syncwarp();
 
-                const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
-                const int tile_col_start = tile_col * fg::COL_BLOCK;
-                reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
-                    G.C.mc_ptr_at({tile_row_start, tile_col_start}),
-                    &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
-                    G.C[G.dev_idx].cols(),
-                    lane);
-            }
+            //     const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
+            //     const int tile_col_start = tile_col * fg::COL_BLOCK;
+            //     reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
+            //         G.C.mc_ptr_at({tile_row_start, tile_col_start}),
+            //         &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
+            //         G.C[G.dev_idx].cols(),
+            //         lane);
+            // }
         }
 
         pdl::arrive();
@@ -500,23 +501,25 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                          tile_id + num_clusters >= total_num_tiles);
             }
 
-            // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
-            dist::tma::store_async_wait();
+            // // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
+            // dist::tma::store_async_wait();
 
-            // TODO: maybe the only way to validate this is by plugging in actual numbers?
-            const int row_start = cluster_level_tile_id * fg::A_tile::rows;
-            const int device_to_signal = row_start / rows_per_device;
-            const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
+            // // TODO: maybe the only way to validate this is by plugging in actual numbers?
+            // const int row_start = cluster_level_tile_id * fg::A_tile::rows;
+            // const int device_to_signal = row_start / rows_per_device;
+            // const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
 
-            if (warpgroup::laneid() == 0) {
-                if (device_to_signal == G.dev_idx) {
-                    comm::atomic_u32::release_add_gpu(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                } else {
-                    comm::atomic_u32::release_add_sys(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                }
-            }
+            // if (warpgroup::laneid() == 0) {
+            //     if (device_to_signal == G.dev_idx) {
+            //         comm::atomic_u32::release_add_gpu(
+            //             &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+            //             1);
+            //     } else {
+            //         comm::atomic_u32::release_add_sys(
+            //             &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+            //             1);
+            //     }
+            // }
         }
 
         tensor_before_thread_sync();
@@ -562,7 +565,8 @@ inline void initialize_gemm_rs_blackwell_state(
 }
 
 template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
+inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G,
+                                     bool with_exit_barrier) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -583,7 +587,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
 
     cudaLaunchAttribute pdl_attr = {};
     pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    pdl_attr.val.programmaticStreamSerializationAllowed = 1;
+    // Without the exit barrier, serialize complete GEMMs, including output stores.
+    pdl_attr.val.programmaticStreamSerializationAllowed = with_exit_barrier ? 1 : 0;
 
     cudaLaunchConfig_t launch_config = {};
     launch_config.gridDim = grid;
@@ -598,24 +603,51 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
 
     // Full completion dependency, including in captured graphs. The next use
     // of these buffers on this stream cannot pass until every rank is done.
-    exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
-    MKERNEL_CUDACHECK(cudaGetLastError());
+    if (with_exit_barrier) {
+        exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
+        MKERNEL_CUDACHECK(cudaGetLastError());
+    }
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-inline void prepare(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
-                    dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
+inline void prepare(at::Tensor& A,
+                    at::Tensor& B,
+                    dist::ParallelBuffer& C,
+                    dist::ParallelBuffer& ready,
+                    dist::ParallelBuffer& completion_epochs) {
+    auto globals =
+        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+            A,
+            B,
+            C,
+            ready,
+            completion_epochs,
+            C.local_rank_,
+            A.size(0),
+            B.size(0),
+            A.size(1),
+            at::cuda::getCurrentCUDAStream().stream());
     initialize_gemm_rs_blackwell_state(globals);
 }
 
-inline void launch(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
-                   dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
-    launch_gemm_rs_blackwell(globals);
+inline void launch(at::Tensor& A,
+                   at::Tensor& B,
+                   dist::ParallelBuffer& C,
+                   dist::ParallelBuffer& ready,
+                   dist::ParallelBuffer& completion_epochs,
+                   bool with_exit_barrier = true) {
+    auto globals =
+        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+            A,
+            B,
+            C,
+            ready,
+            completion_epochs,
+            C.local_rank_,
+            A.size(0),
+            B.size(0),
+            A.size(1),
+            at::cuda::getCurrentCUDAStream().stream());
+    launch_gemm_rs_blackwell(globals, with_exit_barrier);
 }
 #endif
 
@@ -625,7 +657,8 @@ template void
 initialize_gemm_rs_blackwell_state<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
     const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
 template void launch_gemm_rs_blackwell<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
+    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G,
+    bool with_exit_barrier);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
