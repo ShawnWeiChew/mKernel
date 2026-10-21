@@ -7,17 +7,14 @@
     # Small correctness-only smoke test before the full sweep:
     modal run bench/modal_gemm_rs_bench.py --shapes 2048 --check-only
 
-    # Subset of RS warps per CTA (default sweeps 1,2,4,8):
-    modal run bench/modal_gemm_rs_bench.py --num-warps 1,8
-
-    # Subset of RS tile rows (default 32,64,128,256; non-dividing tiles skipped):
-    modal run bench/modal_gemm_rs_bench.py --tile-rows 32,64
+    # RS lane layout: 32 = two strided 16B loads + 32B store, 16 = contiguous 16B:
+    modal run bench/modal_gemm_rs_bench.py --lane-bytes 16
 
     # Optional fixed GPU type instead of the default B200+ pool:
     MKERNEL_MODAL_GPU=B200 modal run bench/modal_gemm_rs_bench.py
 
-Default: one B200+:8 container, all five GEMM+RS shapes, 32/64/128/256-row RS tiles,
-1/2/4/8 RS warps per CTA, raw multimem and multimem+exit-barrier timings. After provisioning, detect the
+Default: one B200+:8 container, all five GEMM+RS shapes, both RS lane layouts
+(32B and 16B per lane), raw multimem and multimem+exit-barrier timings. After provisioning, detect the
 GPU capability and compile sm_100a (B200) or sm_103a (B300). Dependencies are
 cached in the image; compilation runs on the GPU container outside timing.
 Only the needed source files are sent;
@@ -88,8 +85,7 @@ def optional_diagnostic(command):
 @app.function(image=image, gpu=f"{GPU_TYPE}:8", cpu=16, memory=65536,
               timeout=2100, max_containers=1, retries=0)
 def run_benchmark(shapes: str, n: int, warmup: int, iters: int,
-                  graph_size: int, repeats: int, check_only: bool, num_warps: str,
-                  tile_rows: str):
+                  graph_size: int, repeats: int, check_only: bool, lane_bytes: str):
     import hashlib
     import signal
     import subprocess
@@ -150,8 +146,7 @@ def run_benchmark(shapes: str, n: int, warmup: int, iters: int,
         "--nproc-per-node=8", "--max-restarts=0", "--", "bench/gemm_rs_blackwell_rs_bench.py",
         "--shapes", shapes, "--n", str(n), "--warmup", str(warmup), "--iters", str(iters),
         "--graph-size", str(graph_size), "--repeats", str(repeats),
-        "--num-warps", *num_warps.split(","),
-        "--tile-rows", *tile_rows.split(","),
+        "--lane-bytes", *lane_bytes.split(","),
         "--save-json", str(result_path),
     ]
     if check_only:
@@ -179,24 +174,18 @@ def run_benchmark(shapes: str, n: int, warmup: int, iters: int,
 @app.local_entrypoint()
 def main(shapes: str = "2048,4096,8192,16384,32768", n: int = 7168,
          warmup: int = 5, iters: int = 20, graph_size: int = 20, repeats: int = 5,
-         check_only: bool = False, num_warps: str = "1,2,4,8",
-         tile_rows: str = "32,64,128,256",
+         check_only: bool = False, lane_bytes: str = "32,16",
          output_dir: str = "results/rs-modal"):
     # Validate locally before requesting eight GPUs.
     values = [int(value) for value in shapes.split(",")]
-    tiles = tile_rows.split(",")
-    if not tiles or any(value not in ("32", "64", "128", "256") for value in tiles):
-        raise ValueError("--tile-rows must be a comma-separated subset of 32,64,128,256")
-    alignment = 8 * min(int(value) for value in tiles)
-    if any(m <= 0 or m % alignment for m in values):
-        raise ValueError(f"M values must be positive multiples of {alignment} on 8 GPUs; "
-                         "tiles that do not divide a shape are skipped for it")
+    if not lane_bytes or any(value not in ("16", "32") for value in lane_bytes.split(",")):
+        raise ValueError("--lane-bytes must be a comma-separated subset of 32,16")
+    if any(m <= 0 or m % (8 * 256) for m in values):
+        raise ValueError("M values must be positive multiples of 2048 for 256-row RS tiles on 8 GPUs")
     if n <= 0 or n % 256 or warmup < 0 or min(iters, graph_size, repeats) < 1:
         raise ValueError("N must be a positive multiple of 256; timing counts must be positive (warmup >= 0)")
-    if not num_warps or any(value not in ("1", "2", "4", "8") for value in num_warps.split(",")):
-        raise ValueError("--num-warps must be a comma-separated subset of 1,2,4,8")
     result = run_benchmark.remote(shapes, n, warmup, iters, graph_size, repeats, check_only,
-                                  num_warps, tile_rows)
+                                  lane_bytes)
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

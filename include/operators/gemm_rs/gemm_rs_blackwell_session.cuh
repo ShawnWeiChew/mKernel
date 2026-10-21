@@ -18,16 +18,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("gemm_blackwell_consumer_variants") = pybind11::make_tuple(1, 2);
     m.attr("rs_blackwell_blocks") = fg::NUM_BLOCKS;
     m.attr("rs_blackwell_stores_per_batch") = fg::RS_STORES_PER_BATCH;
+    m.attr("rs_blackwell_tile_rows") = fg::ROW_BLOCK;
     m.def(
         "rs_blackwell_launch",
         [](dist::ParallelBuffer& input, at::Tensor output, dist::ParallelBuffer& epochs,
-           int tile_rows, bool with_exit_barrier, int num_warps) {
-            gemm_rs_blackwell::launch_rs_only(
-                input, output, epochs, tile_rows, num_warps, with_exit_barrier);
+           bool with_exit_barrier, int lane_bytes) {
+            gemm_rs_blackwell::launch_rs_only(input, output, epochs, lane_bytes, with_exit_barrier);
         },
         pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("epochs"),
-        pybind11::arg("tile_rows") = 256, pybind11::arg("with_exit_barrier") = true,
-        pybind11::arg("num_warps") = 1,
+        pybind11::arg("with_exit_barrier") = true, pybind11::arg("lane_bytes") = 32,
         "Standalone multimem SUM reduce-scatter. Initialize epochs once to zero and "
         "synchronize all input writers before launch. Keep input immutable until all "
         "ranks finish. Output is a separate compact [M/world_size,N] BF16 tensor.");
