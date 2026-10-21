@@ -169,11 +169,11 @@ def make_blackwell_buffers(
         (M, N), dtype=torch.bfloat16, device="cuda"
     )
     buffers.ready_mkernel = torch.randn(
-        (M // config.world_size // 256, N // 256), dtype=torch.int32, device="cuda"
+        (M // config.world_size // 256, N // 256), dtype=torch.bfloat16, device="cuda"
         
     )
     buffers.epochs_mkernel = torch.randn(
-        (1,), dtype=torch.int32, device="cuda"
+        (1,), dtype=torch.bfloat16, device="cuda"
     )
     mkernel_module.gemm_rs_blackwell_prepare(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
