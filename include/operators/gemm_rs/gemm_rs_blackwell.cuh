@@ -76,9 +76,7 @@ struct fused_globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
-    // Keep 16 wide-store results live: 128 packed 32-bit registers per RS lane.
-    // Each batch issues 32 x 16-byte reductions before 16 x 32-byte stores.
-    static constexpr int RS_STORES_PER_BATCH = 16;
+    static constexpr int RS_STORES_PER_BATCH = 32;
 
     static constexpr int TMEM_PIPELINE_STAGES =
         kittens::MAX_TENSOR_COLS / COL_BLOCK / CONSUMER_WARPS;

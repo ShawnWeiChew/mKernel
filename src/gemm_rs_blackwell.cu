@@ -68,7 +68,6 @@ __device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16*
 }
 
 __device__ __forceinline__ void store_32B(comm::bf16* dst, const uint32_t* in) {
-    // Store the packed BF16 bits without converting them to float.
     asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                  :
                  : "l"(dst),
@@ -83,33 +82,34 @@ __device__ __forceinline__ void store_32B(comm::bf16* dst, const uint32_t* in) {
                  : "memory");
 }
 
+__device__ __forceinline__ void store_16B(comm::bf16* dst, const uint32_t* in) {
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(dst), "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3])
+                 : "memory");
+}
+
 template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH>
 __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_tile,
                                                     comm::bf16* local_tile,
                                                     size_t row_stride,
                                                     int lane) {
-    constexpr int ELEMENTS_PER_STORE = 16;
+    constexpr int ELEMENTS_PER_STORE = 8;
     constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
-    static_assert(TILE_COLS == 256, "RS maps each half warp to one 256-element row");
-    // TODO: What is ROWS_PER_STORE?
     constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
     constexpr int ROWS_PER_BATCH = STORES_PER_BATCH * ROWS_PER_STORE;
-    static_assert(STORES_PER_BATCH > 0 && STORES_PER_BATCH <= 16);
-    static_assert(TILE_ROWS % ROWS_PER_BATCH == 0, "RS requires whole register batches");
 
     const int lane_col = (lane % LANES_PER_ROW) * ELEMENTS_PER_STORE;
     const int lane_row = lane / LANES_PER_ROW;
 
     for (int batch_row = 0; batch_row < TILE_ROWS; batch_row += ROWS_PER_BATCH) {
-        // Scalarized by the unrolled loops: eight packed words per 32-byte store.
-        uint32_t reduced[STORES_PER_BATCH][8];
+        uint32_t reduced[STORES_PER_BATCH][4];
 
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
             const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
-            reduce_load_16B(&reduced[store_idx][0], src);
-            reduce_load_16B(&reduced[store_idx][4], src + 8);
+            reduce_load_16B(reduced[store_idx], src);
         }
 
         // Recompute addresses instead of keeping a pointer array live with the payload.
@@ -117,7 +117,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
             comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
-            store_32B(dst, reduced[store_idx]);
+            store_16B(dst, reduced[store_idx]);
         }
     }
 }
@@ -602,19 +602,43 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-inline void prepare(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
-                    dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
+inline void prepare(at::Tensor& A,
+                    at::Tensor& B,
+                    dist::ParallelBuffer& C,
+                    dist::ParallelBuffer& ready,
+                    dist::ParallelBuffer& completion_epochs) {
+    auto globals =
+        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+            A,
+            B,
+            C,
+            ready,
+            completion_epochs,
+            C.local_rank_,
+            A.size(0),
+            B.size(0),
+            A.size(1),
+            at::cuda::getCurrentCUDAStream().stream());
     initialize_gemm_rs_blackwell_state(globals);
 }
 
-inline void launch(at::Tensor& A, at::Tensor& B, dist::ParallelBuffer& C,
-                   dist::ParallelBuffer& ready, dist::ParallelBuffer& completion_epochs) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-        A, B, C, ready, completion_epochs, C.local_rank_, A.size(0), B.size(0), A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
+inline void launch(at::Tensor& A,
+                   at::Tensor& B,
+                   dist::ParallelBuffer& C,
+                   dist::ParallelBuffer& ready,
+                   dist::ParallelBuffer& completion_epochs) {
+    auto globals =
+        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
+            A,
+            B,
+            C,
+            ready,
+            completion_epochs,
+            C.local_rank_,
+            A.size(0),
+            B.size(0),
+            A.size(1),
+            at::cuda::getCurrentCUDAStream().stream());
     launch_gemm_rs_blackwell(globals);
 }
 #endif
