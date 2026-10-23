@@ -37,6 +37,7 @@ static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 2;
 static constexpr int DEFAULT_NUM_EPILOGUE_WARPS = 1;
 static constexpr int DEFAULT_C_TILE_DIVISOR = 4;
+static constexpr int DEFAULT_SWIZZLE_SIZE = 4;
 
 // One persistent 32-bit word on each rank; no multicast allocation is needed.
 // Only the owning rank writes its completed epoch. Peers acquire-load it.
@@ -44,21 +45,22 @@ using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
 using completion_epoch_dist_tensor =
     dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
 struct fused_globals;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
+void launch_gemm_rs_blackwell(
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>& G);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
 // ranks before the first launch. Keep the same tile layout and serialize launches
 // on G.stream; both allocations must remain alive across all graph replays.
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
 void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G);
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>& G);
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -124,6 +126,9 @@ struct fused_globals {
     static constexpr int SIGNAL_PIPELINE_STAGES = 4;
 
     static constexpr int C_TILE_DIVISOR = _C_TILE_DIVISOR;
+    // Tile columns per supergroup in the tile rasterization.
+    static constexpr int SWIZZLE_SIZE = _SWIZZLE_SIZE;
+    static_assert(SWIZZLE_SIZE > 0, "SWIZZLE_SIZE must be greater than 0");
 
     using A_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, RED_BLOCK>;  // [M, K]
     using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;    // [N, K]
@@ -186,20 +191,21 @@ inline constexpr bool always_false_v = false;
 
 template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
+          int _SWIZZLE_SIZE,
           typename DistributedTensor,
           typename LocalTensor>
-__host__ inline fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> gemm_rs_blackwell_make_globals(
-    LocalTensor& A,
-    LocalTensor& B,
-    DistributedTensor& C,
-    DistributedTensor& C_barrier,
-    DistributedTensor& completion_epochs,
-    int dev_idx,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+__host__ inline fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>
+gemm_rs_blackwell_make_globals(LocalTensor& A,
+                               LocalTensor& B,
+                               DistributedTensor& C,
+                               DistributedTensor& C_barrier,
+                               DistributedTensor& completion_epochs,
+                               int dev_idx,
+                               int M,
+                               int N,
+                               int K,
+                               cudaStream_t stream) {
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
