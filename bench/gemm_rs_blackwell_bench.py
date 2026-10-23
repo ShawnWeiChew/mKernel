@@ -37,6 +37,10 @@ class BlackwellBenchConfig:
     output_dim = 7168
     split_inner_dim = 12288 // world_size
 
+    # Tile columns per rasterization supergroup; must match the instantiated
+    # values in gemm_rs_blackwell::launch.
+    mkernel_swizzle_sizes = [1, 2, 4, 8]
+
     # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
     # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009
     cutlass_fixed_config = {
@@ -215,10 +219,10 @@ def run_tk(tk_module, buffers: BlackwellBenchVars):
     )
 
 
-def run_mkernel(mkernel_module, buffers: BlackwellBenchVars):
+def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, swizzle_size: int):
     mkernel_module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.ready_mkernel, buffers.epochs_mkernel,
+        buffers.ready_mkernel, buffers.epochs_mkernel, swizzle_size=swizzle_size,
     )
 
 
@@ -253,12 +257,16 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
         )
         buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
         run_baseline(buffers)
-        run_mkernel(mkernel_module, buffers)
-        torch.cuda.synchronize()
-        all_correct = check_close(
-            f"gemm_rs mKernel eager M={M}",
-            mkernel_output(config, buffers), buffers.baseline_c_rs,
-        ) and all_correct
+        for swizzle in config.mkernel_swizzle_sizes:
+            buffers.c_mkernel.data_.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            run_mkernel(mkernel_module, buffers, swizzle)
+            torch.cuda.synchronize()
+            all_correct = check_close(
+                f"gemm_rs mKernel eager swizzle={swizzle} M={M}",
+                mkernel_output(config, buffers), buffers.baseline_c_rs,
+            ) and all_correct
 
         if tk_module is not None:
             run_tk(tk_module, buffers)
@@ -274,19 +282,22 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-        buffers.mkernel_graph = capture_cuda_graph(lambda: run_mkernel(mkernel_module, buffers))
-        # Change inputs on each replay to expose stale counters/output. Prepare
-        # is deliberately never repeated: the graph must advance its own epoch.
-        for replay in range(3):
-            buffers.baseline_a.neg_()
-            run_baseline(buffers)
-            buffers.mkernel_graph.replay()
-            torch.cuda.synchronize()
-            all_correct = check_close(
-                f"gemm_rs mKernel graph replay={replay + 1} M={M}",
-                mkernel_output(config, buffers), buffers.baseline_c_rs,
-            ) and all_correct
-        buffers.mkernel_graph = None
+        for swizzle in config.mkernel_swizzle_sizes:
+            buffers.mkernel_graph = capture_cuda_graph(
+                lambda: run_mkernel(mkernel_module, buffers, swizzle)
+            )
+            # Change inputs on each replay to expose stale counters/output. Prepare
+            # is deliberately never repeated: the graph must advance its own epoch.
+            for replay in range(3):
+                buffers.baseline_a.neg_()
+                run_baseline(buffers)
+                buffers.mkernel_graph.replay()
+                torch.cuda.synchronize()
+                all_correct = check_close(
+                    f"gemm_rs mKernel graph swizzle={swizzle} replay={replay + 1} M={M}",
+                    mkernel_output(config, buffers), buffers.baseline_c_rs,
+                ) and all_correct
+            buffers.mkernel_graph = None
         del buffers
 
     # All ranks must make the same decision before entering the timed collectives.
@@ -319,8 +330,28 @@ def gemm_rs_blackwell_prepare(
 
     fns = [(bench_baseline, "baseline", True)]
 
+    # Autotune on graph replays; benchmark_cuda takes the max over ranks, so
+    # every rank selects the same swizzle.
+    mkernel_timings = []
+    for swizzle in config.mkernel_swizzle_sizes:
+        buffers.mkernel_graph = capture_cuda_graph(
+            lambda: run_mkernel(mkernel_module, buffers, swizzle)
+        )
+        ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
+        mkernel_timings.append((swizzle, ms))
+        buffers.mkernel_graph = None
+    best_swizzle, _ = min(mkernel_timings, key=lambda item: item[1])
+    if config.is_chief:
+        for swizzle, ms in sorted(mkernel_timings, key=lambda item: item[1]):
+            mark = " <- best" if swizzle == best_swizzle else ""
+            print(
+                f"  [autotune] mKernel swizzle={swizzle}: "
+                f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
+                flush=True,
+            )
+
     def bench_mkernel_eager():
-        run_mkernel(mkernel_module, buffers)
+        run_mkernel(mkernel_module, buffers, best_swizzle)
 
     buffers.mkernel_graph = capture_cuda_graph(bench_mkernel_eager)
 

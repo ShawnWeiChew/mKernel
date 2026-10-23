@@ -122,7 +122,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
     }
 }
 
-template <int SUPERGROUP_WIDTH = 8>
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
                                                                    int num_cols,
                                                                    int tile_idx) {
@@ -170,10 +170,10 @@ __global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_
     }
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
 __device__ __forceinline__ void gemm_rs_blackwell(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>& G) {
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -377,8 +377,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
-                    auto [tile_row_idx, tile_col_idx] =
-                        calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, i);
+                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+                        num_tile_rows_per_cluster, num_tile_cols, i);
                     load(tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                              cta_rank * fg::CONSUMER_WARPS,
                          tile_col_idx,
@@ -483,8 +483,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
-            auto [tile_row_idx, tile_col_idx] =
-                calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, tile_id);
+            auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+                num_tile_rows_per_cluster, num_tile_cols, tile_id);
 
             const int cluster_level_tile_id = tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                 cta_rank * fg::CONSUMER_WARPS;
@@ -536,18 +536,20 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     }
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-__global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>::NUM_CLUSTERS, 1, 1)
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
+__global__ __cluster_dims__(
+    fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
-        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>::NUM_THREADS,
-        1) void fused_kernel_stub(const __grid_constant__
-                                      fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR> G) {
-    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>(G);
+        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>::NUM_THREADS,
+        1) void fused_kernel_stub(const __grid_constant__ fused_globals<_NUM_EPILOGUE_WARPS,
+                                                                        _C_TILE_DIVISOR,
+                                                                        _SWIZZLE_SIZE> G) {
+    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>(G);
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
 inline void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>& G) {
     cudaStream_t stream = G.stream;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
@@ -561,8 +563,9 @@ inline void initialize_gemm_rs_blackwell_state(
         cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR>
-inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
+template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _SWIZZLE_SIZE>
+inline void launch_gemm_rs_blackwell(
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -571,12 +574,12 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C
     }
 #endif
 
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
+    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _SWIZZLE_SIZE>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -607,49 +610,76 @@ inline void prepare(at::Tensor& A,
                     dist::ParallelBuffer& C,
                     dist::ParallelBuffer& ready,
                     dist::ParallelBuffer& completion_epochs) {
-    auto globals =
-        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-            A,
-            B,
-            C,
-            ready,
-            completion_epochs,
-            C.local_rank_,
-            A.size(0),
-            B.size(0),
-            A.size(1),
-            at::cuda::getCurrentCUDAStream().stream());
+    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS,
+                                                  DEFAULT_C_TILE_DIVISOR,
+                                                  DEFAULT_SWIZZLE_SIZE>(
+        A,
+        B,
+        C,
+        ready,
+        completion_epochs,
+        C.local_rank_,
+        A.size(0),
+        B.size(0),
+        A.size(1),
+        at::cuda::getCurrentCUDAStream().stream());
     initialize_gemm_rs_blackwell_state(globals);
+}
+
+template <int _SWIZZLE_SIZE>
+inline void launch_with_swizzle(at::Tensor& A,
+                                at::Tensor& B,
+                                dist::ParallelBuffer& C,
+                                dist::ParallelBuffer& ready,
+                                dist::ParallelBuffer& completion_epochs) {
+    auto globals =
+        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS,
+                                       DEFAULT_C_TILE_DIVISOR,
+                                       _SWIZZLE_SIZE>(A,
+                                                      B,
+                                                      C,
+                                                      ready,
+                                                      completion_epochs,
+                                                      C.local_rank_,
+                                                      A.size(0),
+                                                      B.size(0),
+                                                      A.size(1),
+                                                      at::cuda::getCurrentCUDAStream().stream());
+    launch_gemm_rs_blackwell(globals);
 }
 
 inline void launch(at::Tensor& A,
                    at::Tensor& B,
                    dist::ParallelBuffer& C,
                    dist::ParallelBuffer& ready,
-                   dist::ParallelBuffer& completion_epochs) {
-    auto globals =
-        gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-            A,
-            B,
-            C,
-            ready,
-            completion_epochs,
-            C.local_rank_,
-            A.size(0),
-            B.size(0),
-            A.size(1),
-            at::cuda::getCurrentCUDAStream().stream());
-    launch_gemm_rs_blackwell(globals);
+                   dist::ParallelBuffer& completion_epochs,
+                   int swizzle_size) {
+    switch (swizzle_size) {
+        case 1:
+            return launch_with_swizzle<1>(A, B, C, ready, completion_epochs);
+        case 2:
+            return launch_with_swizzle<2>(A, B, C, ready, completion_epochs);
+        case 4:
+            return launch_with_swizzle<4>(A, B, C, ready, completion_epochs);
+        case 8:
+            return launch_with_swizzle<8>(A, B, C, ready, completion_epochs);
+        default:
+            TORCH_CHECK(false, "swizzle_size must be 1, 2, 4, or 8, got ", swizzle_size);
+    }
 }
 #endif
 
 // Instantiate the default API so the compile target checks the fused kernel,
 // initialization, and the exit-barrier launch rather than just template syntax.
+template void initialize_gemm_rs_blackwell_state<DEFAULT_NUM_EPILOGUE_WARPS,
+                                                 DEFAULT_C_TILE_DIVISOR,
+                                                 DEFAULT_SWIZZLE_SIZE>(
+    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, DEFAULT_SWIZZLE_SIZE>&
+        G);
 template void
-initialize_gemm_rs_blackwell_state<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
-template void launch_gemm_rs_blackwell<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
-    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>& G);
+launch_gemm_rs_blackwell<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, DEFAULT_SWIZZLE_SIZE>(
+    const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, DEFAULT_SWIZZLE_SIZE>&
+        G);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
