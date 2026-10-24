@@ -175,6 +175,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>& G) {
     using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR>;
 
+#ifdef PROFILE_TIMINGS
+    const uint64_t timing_entry_ns = timing_profile::globaltimer_ns();
+#endif
+
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
@@ -219,9 +223,18 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     __shared__ uint32_t tmem_addr;
     tensor_allocator<1, fg::NUM_CLUSTERS> tm_alloc{};
 
+#ifdef PROFILE_TIMINGS
+    // Initialized with the mbarriers; every role emits only after the cluster
+    // barrier below, whose release/acquire publishes it.
+    __shared__ uint32_t timing_head;
+#endif
+
     uint32_t phasebits = fg::PHASE_BITS_INIT;
 
     if (warp_id == 0 && elect_warp_leader()) {
+#ifdef PROFILE_TIMINGS
+        timing_head = 0;
+#endif
 #pragma unroll
         for (int i = 0; i < fg::PRODUCER_CONSUMER_PIPELINE_STAGES; i++) {
             init_semaphore(mma_finish[i], fg::CONSUMER_WARPS);
@@ -275,9 +288,17 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     auto consume = [&](typename fg::C_tt_tile* tmem,
                        int& input_stage_id,
                        int& epilogue_stage_id,
-                       const int consumer_id) {
+                       const int consumer_id,
+                       const int tile_id) {
         const int consumer_semaphore_idx = consumer_id + 2;
+#ifdef PROFILE_TIMINGS
+        const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_id);
+        timing_profile::emit(G.timings, &timing_head, EV_MMA_TILE_BEGIN, timing_payload);
+#endif
         wait(epilogue_tmem_finished[consumer_id], (phasebits >> consumer_semaphore_idx) & 0b1);
+#ifdef PROFILE_TIMINGS
+        timing_profile::emit(G.timings, &timing_head, EV_MMA_TMEM_FREE, timing_payload);
+#endif
 
         {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
@@ -306,6 +327,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 
         kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[consumer_id]);
+#ifdef PROFILE_TIMINGS
+        timing_profile::emit(G.timings, &timing_head, EV_MMA_COMMITTED, timing_payload);
+#endif
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
 
         if (epilogue_stage_id == 0) {
@@ -319,12 +343,27 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                         const int consumer_id,
                         int& epilogue_stage_id,
                         int& epilogue_smem_idx,
-                        bool is_last_tile) {
+                        bool is_last_tile,
+                        const int tile_id) {
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::A_tile::rows / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
 
         const int epilogue_semaphore_idx = consumer_id + 4;
+#ifdef PROFILE_TIMINGS
+        // Thread 0 also issues the TMA stores, so it sees the full store path.
+        const bool timing_leader = warpgroup::laneid() == 0;
+        const uint32_t timing_payload =
+            timing_profile::pack_payload(warp_id, tile_id * fg::CONSUMER_WARPS + consumer_id);
+        if (timing_leader) {
+            timing_profile::emit(G.timings, &timing_head, EV_EPI_SUBTILE_BEGIN, timing_payload);
+        }
+#endif
         wait(epilogue_ready[consumer_id], (phasebits >> epilogue_semaphore_idx) & 0b1);
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            timing_profile::emit(G.timings, &timing_head, EV_EPI_MMA_DONE, timing_payload);
+        }
+#endif
 
 #pragma unroll
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
@@ -335,6 +374,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 
         tensor_load_wait();
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            timing_profile::emit(G.timings, &timing_head, EV_EPI_TMEM_LOADED, timing_payload);
+        }
+#endif
         if (elect_warp_leader()) {
             tma::cluster::arrive(epilogue_tmem_finished[consumer_id], 0);
         }
@@ -362,6 +406,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             epilogue_smem_idx = (epilogue_smem_idx + 1) % fg::EPILOGUE_PIPELINE_STAGES;
         }
+#ifdef PROFILE_TIMINGS
+        if (timing_leader) {
+            timing_profile::emit(G.timings, &timing_head, EV_EPI_STORES_ISSUED, timing_payload);
+        }
+#endif
 
         epilogue_stage_id = (epilogue_stage_id + 1) % fg::TMEM_PIPELINE_STAGES;
         if (epilogue_stage_id == 0) {
@@ -375,14 +424,26 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             everyone::tma::cluster::wait();
 
             if (elect_warp_leader()) {
+#ifdef PROFILE_TIMINGS
+                emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+#endif
                 int input_stage_id = 0;
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, i);
+#ifdef PROFILE_TIMINGS
+                    const uint32_t timing_payload = timing_profile::pack_payload(warp_id, i);
+                    timing_profile::emit(
+                        G.timings, &timing_head, EV_LOAD_TILE_BEGIN, timing_payload);
+#endif
                     load(tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                              cta_rank * fg::CONSUMER_WARPS,
                          tile_col_idx,
                          input_stage_id);
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(
+                        G.timings, &timing_head, EV_LOAD_TILE_ISSUED, timing_payload);
+#endif
                 }
             }
 
@@ -404,6 +465,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             tm_alloc.set_addr(tmem_addr);
 
             if (cta_rank == 0 && elect_warp_leader()) {
+#ifdef PROFILE_TIMINGS
+                emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+#endif
                 int input_stage_id = 0;
                 int epilogue_stage_id = 0;
                 const int consumer_id = warp_id - 5;
@@ -418,7 +482,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     // TODO: check consume
-                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_id);
+                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_id, i);
                 }
             }
 
@@ -438,21 +502,35 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             const uint32_t epoch =
                 comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
             const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+#ifdef PROFILE_TIMINGS
+            if (lane == 0) {
+                emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+            }
+#endif
 
             for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
                  tile_idx += fg::NUM_BLOCKS) {
                 // TODO: review indexing to make sure that all devices have active CTAs
                 const int local_tile_row = tile_idx / num_tile_cols;
                 const int tile_col = tile_idx % num_tile_cols;
+#ifdef PROFILE_TIMINGS
+                const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_idx);
+#endif
 
                 // These match the coordinates used by the epilogue's signal.
                 if (lane == 0) {
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
+#endif
                     // Peers publish tile arrivals with system-scope atomics.
                     while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
                                               &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
                                           ready_count)) {
                         __nanosleep(16);
                     }
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(G.timings, &timing_head, EV_RS_READY, timing_payload);
+#endif
                 }
                 __syncwarp();
 
@@ -463,6 +541,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                     &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
                     G.C[G.dev_idx].cols(),
                     lane);
+#ifdef PROFILE_TIMINGS
+                if (lane == 0) {
+                    timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_DONE, timing_payload);
+                }
+#endif
             }
         }
 
@@ -481,6 +564,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
             tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
         }
+#ifdef PROFILE_TIMINGS
+        if (warpgroup::laneid() == 0) {
+            emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+        }
+#endif
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
             auto [tile_row_idx, tile_col_idx] =
@@ -497,11 +585,21 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                          c,
                          epilogue_stage_id[c],
                          epilogue_smem_idx,
-                         tile_id + num_clusters >= total_num_tiles);
+                         tile_id + num_clusters >= total_num_tiles,
+                         tile_id);
             }
 
             // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
             dist::tma::store_async_wait();
+#ifdef PROFILE_TIMINGS
+            // Pairs with the last subtile's EV_EPI_STORES_ISSUED.
+            const uint32_t timing_payload = timing_profile::pack_payload(
+                warp_id, tile_id * fg::CONSUMER_WARPS + fg::CONSUMER_WARPS - 1);
+            if (warpgroup::laneid() == 0) {
+                timing_profile::emit(
+                    G.timings, &timing_head, EV_EPI_STORE_DRAINED, timing_payload);
+            }
+#endif
 
             // TODO: maybe the only way to validate this is by plugging in actual numbers?
             const int row_start = cluster_level_tile_id * fg::A_tile::rows;
@@ -516,9 +614,19 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                     comm::atomic_u32::release_add_sys(
                         &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
                 }
+#ifdef PROFILE_TIMINGS
+                timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
+#endif
             }
         }
 
+#ifdef PROFILE_TIMINGS
+        const uint32_t teardown_payload = timing_profile::pack_payload(warp_id, 0);
+        if (warpgroup::laneid() == 0) {
+            timing_profile::emit(
+                G.timings, &timing_head, EV_EPI_TEARDOWN_BEGIN, teardown_payload);
+        }
+#endif
         tensor_before_thread_sync();
         group<fg::EPILOGUE_WARPS>::sync(1);
 
@@ -532,6 +640,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             // Only reach here if we finish with our tmem. Other party as well
             wait(tmem_finished, 0);
             tm_alloc.deprovision();
+#ifdef PROFILE_TIMINGS
+            if (warpgroup::laneid() == 0) {
+                timing_profile::emit(
+                    G.timings, &timing_head, EV_EPI_TEARDOWN_DONE, teardown_payload);
+            }
+#endif
         }
     }
 }
@@ -626,7 +740,12 @@ inline void launch(at::Tensor& A,
                    at::Tensor& B,
                    dist::ParallelBuffer& C,
                    dist::ParallelBuffer& ready,
-                   dist::ParallelBuffer& completion_epochs) {
+                   dist::ParallelBuffer& completion_epochs
+#ifdef PROFILE_TIMINGS
+                   ,
+                   TimingRecord* timings = nullptr
+#endif
+) {
     auto globals =
         gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>(
             A,
@@ -639,6 +758,9 @@ inline void launch(at::Tensor& A,
             B.size(0),
             A.size(1),
             at::cuda::getCurrentCUDAStream().stream());
+#ifdef PROFILE_TIMINGS
+    globals.timings = timings;
+#endif
     launch_gemm_rs_blackwell(globals);
 }
 #endif

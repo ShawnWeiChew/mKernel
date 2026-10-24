@@ -30,6 +30,7 @@
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
+#include "operators/gemm_rs/gemm_rs_blackwell_timing.cuh"
 
 namespace gemm_rs_blackwell {
 static constexpr int DEFAULT_NUM_CTA = 2;
@@ -120,6 +121,11 @@ struct fused_globals {
     completion_epoch_dist_tensor completion_epochs;
 
     cudaStream_t stream = nullptr;
+
+#ifdef PROFILE_TIMINGS
+    // NUM_BLOCKS * EVENTS_PER_BLOCK records, zero-initialized; nullptr skips stores.
+    TimingRecord* timings = nullptr;
+#endif
 
     struct pipeline_inputs {
         A_tile A[CONSUMER_WARPS];
