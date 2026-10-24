@@ -340,6 +340,8 @@ def gemm_rs_blackwell_prepare(
         ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
         mkernel_timings.append((swizzle, ms))
         buffers.mkernel_graph = None
+        time.sleep(5)
+    
     best_swizzle, _ = min(mkernel_timings, key=lambda item: item[1])
     if config.is_chief:
         for swizzle, ms in sorted(mkernel_timings, key=lambda item: item[1]):
@@ -371,6 +373,7 @@ def gemm_rs_blackwell_prepare(
                 m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
                 warmup=warmup, iterations=iters,
             )
+            time.sleep(5)
             if ms is not None:
                 timings.append((candidate, ms))
 
