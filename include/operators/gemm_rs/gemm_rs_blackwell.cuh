@@ -68,16 +68,19 @@ struct fused_globals {
     static constexpr int REDUCE_SCATTER_WARPS = 4;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
 
-    // Warp layout: [epilogue WG(s)] [producer, 2x MMA, pad] [RS WG]. setmaxnreg is
-    // .sync.aligned over a whole warpgroup, so the producer/MMA tail is padded to a
-    // complete one and the RS warps get a warpgroup of their own.
+    // Warp layout: [epilogue WG(s)] [producer, 2x MMA, signal] [RS WG]. setmaxnreg
+    // is .sync.aligned over a whole warpgroup, so the producer/MMA tail is filled
+    // out by the signal warp and the RS warps get a warpgroup of their own.
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
+    // The warp that pads the producer/MMA warpgroup publishes tile arrivals, so
+    // the epilogue never stalls on the release fence of the signal.
+    static constexpr int SIGNAL_WARP_ID = FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS;
     static constexpr int MAINLOOP_WARPGROUP = EPILOGUE_WARPGROUPS;
     static constexpr int RS_WARPGROUP = MAINLOOP_WARPGROUP + 1;
     static constexpr int FIRST_RS_WARP_ID = RS_WARPGROUP * kittens::WARPGROUP_WARPS;
-    static_assert(FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS <= FIRST_RS_WARP_ID,
-                  "Producer/MMA warps must fit in one warpgroup");
+    static_assert(SIGNAL_WARP_ID < FIRST_RS_WARP_ID,
+                  "Producer/MMA/signal warps must fit in one warpgroup");
     static_assert(REDUCE_SCATTER_WARPS == kittens::WARPGROUP_WARPS,
                   "The RS warps must form exactly one warpgroup");
 
@@ -111,6 +114,8 @@ struct fused_globals {
     // used for SMEM allocation
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 4;
     static constexpr int EPILOGUE_PIPELINE_STAGES = 2;
+    // Drained tiles the epilogue may hand off before the signal warp catches up.
+    static constexpr int SIGNAL_PIPELINE_STAGES = 4;
 
     static constexpr int C_TILE_DIVISOR = _C_TILE_DIVISOR;
 

@@ -94,7 +94,8 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
         print(
             f"[rank {rank}] M={M}: {records.shape[0]} events, trace span "
             f"{timing_lib.wall_span_us(records):.1f} us, launch incl. exit barrier "
-            f"{launch_us:.1f} us\n{timing_lib.summarize(spans)}",
+            f"{launch_us:.1f} us\n{timing_lib.summarize(spans)}\n"
+            f"{timing_lib.summarize_rs_counters(timing_lib.rs_counters(records, module.TIMING_EVENTS), config.world_size)}",
             flush=True,
         )
         if not args.no_render:

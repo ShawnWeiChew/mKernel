@@ -217,6 +217,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     __shared__ semaphore epilogue_ready[fg::NUM_TMEM_SLOTS];
     __shared__ semaphore epilogue_tmem_finished[fg::NUM_TMEM_SLOTS];
 
+    // Epilogue -> signal warp: a tile's stores have drained and it may be published.
+    __shared__ semaphore signal_full[fg::SIGNAL_PIPELINE_STAGES];
+    __shared__ semaphore signal_empty[fg::SIGNAL_PIPELINE_STAGES];
+
     __shared__ semaphore tmem_allocated;
     __shared__ semaphore tmem_finished;
 
@@ -245,6 +249,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
             init_semaphore(epilogue_ready[i], 1);
             init_semaphore(epilogue_tmem_finished[i], WARPGROUP_WARPS * fg::NUM_CLUSTERS);
+        }
+
+#pragma unroll
+        for (int i = 0; i < fg::SIGNAL_PIPELINE_STAGES; i++) {
+            init_semaphore(signal_full[i], 1);
+            init_semaphore(signal_empty[i], 1);
         }
 
         init_semaphore(tmem_allocated, 1);
@@ -490,9 +500,63 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 
             pdl::arrive();
-        } else {
-            // Padding warp: only here so setmaxnreg sees a complete warpgroup.
+        } else if (warp_id == fg::SIGNAL_WARP_ID) {
             everyone::tma::cluster::wait();
+
+            // Walks the epilogue's tile sequence and publishes each tile once its
+            // stores drain. The release fence before the red waits on this SM's
+            // outstanding traffic, which is why it is kept off the epilogue.
+            if (elect_warp_leader()) {
+#ifdef PROFILE_TIMINGS
+                emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+#endif
+                int signal_stage = 0;
+                int signal_phase = 0;
+                for (int tile_id = cluster_idx; tile_id < total_num_tiles;
+                     tile_id += num_clusters) {
+                    auto [tile_row_idx, tile_col_idx] =
+                        calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    const int row_start =
+                        (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
+                         cta_rank * fg::CONSUMER_WARPS) *
+                        fg::A_tile::rows;
+                    const int device_to_signal = row_start / rows_per_device;
+                    const int local_tile_for_device =
+                        (row_start % rows_per_device) / fg::ROW_BLOCK;
+#ifdef PROFILE_TIMINGS
+                    // Pairs with the epilogue's EV_EPI_STORE_DRAINED for this tile.
+                    const uint32_t timing_payload = timing_profile::pack_payload(
+                        warp_id, tile_id * fg::CONSUMER_WARPS + fg::CONSUMER_WARPS - 1);
+                    timing_profile::emit(
+                        G.timings, &timing_head, EV_SIG_TILE_BEGIN, timing_payload);
+#endif
+                    // The epilogue's mbarrier arrive releases its drained stores at
+                    // CTA scope; the release below extends them to the owner.
+                    wait(signal_full[signal_stage], signal_phase);
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(
+                        G.timings, &timing_head, EV_SIG_EPI_DRAINED, timing_payload);
+#endif
+                    if (device_to_signal == G.dev_idx) {
+                        comm::atomic_u32::release_add_gpu(
+                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+                            1);
+                    } else {
+                        comm::atomic_u32::release_add_sys(
+                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+                            1);
+                    }
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
+#endif
+                    arrive(signal_empty[signal_stage]);
+
+                    signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+                    if (signal_stage == 0) {
+                        signal_phase ^= 1;
+                    }
+                }
+            }
         }
     } else if (warpgroup_id == fg::RS_WARPGROUP) {
         warpgroup::decrease_registers<fg::RS_REGISTERS>();
@@ -513,6 +577,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #ifdef PROFILE_TIMINGS
         if (lane == 0) {
             emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+            timing_profile::emit(G.timings,
+                                 &timing_head,
+                                 EV_RS_THRESHOLD,
+                                 timing_profile::pack_payload(warp_id, ready_count));
         }
 #endif
 
@@ -534,13 +602,24 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
 #endif
                 // Peers publish tile arrivals with system-scope atomics.
-                while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                                          &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
-                                      ready_count)) {
+                const auto* ready_counter = &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}];
+                uint32_t observed = comm::atomic_u32::acquire_load_sys(ready_counter);
+#ifdef PROFILE_TIMINGS
+                timing_profile::emit(G.timings,
+                                     &timing_head,
+                                     EV_RS_COUNT_FIRST,
+                                     timing_profile::pack_payload(warp_id, observed));
+#endif
+                while (!epoch_reached(observed, ready_count)) {
                     __nanosleep(16);
+                    observed = comm::atomic_u32::acquire_load_sys(ready_counter);
                 }
 #ifdef PROFILE_TIMINGS
                 timing_profile::emit(G.timings, &timing_head, EV_RS_READY, timing_payload);
+                timing_profile::emit(G.timings,
+                                     &timing_head,
+                                     EV_RS_COUNT_READY,
+                                     timing_profile::pack_payload(warp_id, observed));
 #endif
             }
             __syncwarp();
@@ -565,6 +644,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
         int epilogue_smem_idx = 0;
+        int signal_stage = 0;
+        // Fresh mbarriers complete the phase before parity 0, so the first lap
+        // of signal_empty passes without waiting.
+        int signal_phase = 1;
         typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];
 
         everyone::tma::cluster::wait();
@@ -586,6 +669,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             auto [tile_row_idx, tile_col_idx] =
                 calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, tile_id);
 
+            // The signal warp derives the same row from tile_id; keep the two in step.
             const int cluster_level_tile_id = tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                 cta_rank * fg::CONSUMER_WARPS;
 #pragma unroll
@@ -613,22 +697,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 #endif
 
-            // TODO: maybe the only way to validate this is by plugging in actual numbers?
-            const int row_start = cluster_level_tile_id * fg::A_tile::rows;
-            const int device_to_signal = row_start / rows_per_device;
-            const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
-
+            // Only thread 0 issued and drained the TMA stores, so it alone hands
+            // the tile to the signal warp.
             if (warpgroup::laneid() == 0) {
-                if (device_to_signal == G.dev_idx) {
-                    comm::atomic_u32::release_add_gpu(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                } else {
-                    comm::atomic_u32::release_add_sys(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                }
-#ifdef PROFILE_TIMINGS
-                timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
-#endif
+                wait(signal_empty[signal_stage], signal_phase);
+                arrive(signal_full[signal_stage]);
+            }
+            signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+            if (signal_stage == 0) {
+                signal_phase ^= 1;
             }
         }
 

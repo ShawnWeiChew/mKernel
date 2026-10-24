@@ -39,6 +39,17 @@ enum TimingEvent : uint32_t {
     EV_RS_TILE_BEGIN = 15,
     EV_RS_READY = 16,
     EV_RS_TILE_DONE = 17,
+    // Signal (warp 7, lane 0): payload seq = tile index * CONSUMER_WARPS +
+    // CONSUMER_WARPS - 1, matching the epilogue's EV_EPI_STORE_DRAINED. It also
+    // emits EV_EPI_SIGNALED once the arrival is published.
+    EV_SIG_TILE_BEGIN = 18,
+    EV_SIG_EPI_DRAINED = 19,
+    // Reduce-scatter diagnostics: payload seq is a counter value, not a tile.
+    // THRESHOLD follows SETUP_DONE once per warp; COUNT_FIRST and COUNT_READY
+    // follow that warp's RS_TILE_BEGIN and RS_READY for the same tile.
+    EV_RS_THRESHOLD = 20,
+    EV_RS_COUNT_FIRST = 21,
+    EV_RS_COUNT_READY = 22,
 };
 
 struct TimingEventName {
@@ -66,6 +77,11 @@ inline constexpr TimingEventName TIMING_EVENT_NAMES[] = {
     {"RS_TILE_BEGIN", EV_RS_TILE_BEGIN},
     {"RS_READY", EV_RS_READY},
     {"RS_TILE_DONE", EV_RS_TILE_DONE},
+    {"SIG_TILE_BEGIN", EV_SIG_TILE_BEGIN},
+    {"SIG_EPI_DRAINED", EV_SIG_EPI_DRAINED},
+    {"RS_THRESHOLD", EV_RS_THRESHOLD},
+    {"RS_COUNT_FIRST", EV_RS_COUNT_FIRST},
+    {"RS_COUNT_READY", EV_RS_COUNT_READY},
 };
 
 // The ring head is initialized alongside the mbarriers, after kernel entry, so

@@ -63,9 +63,10 @@ GEMM_RS_BLACKWELL = Layout(
         4: "producer",
         5: "mma",
         6: "mma",
+        7: "signal",
         **{w: "reduce-scatter" for w in range(8, 12)},
     },
-    role_order=["producer", "mma", "epilogue", "reduce-scatter"],
+    role_order=["producer", "mma", "epilogue", "signal", "reduce-scatter"],
     phases={
         "producer": [
             _SETUP,
@@ -86,8 +87,15 @@ GEMM_RS_BLACKWELL = Layout(
             ("EPI_TMEM_LOADED", "EPI_STORES_ISSUED", SLOTS[2], "epi: smem + tma store", "payload"),
             # Once per tile, after its last subtile: n is half of the rows above.
             ("EPI_STORES_ISSUED", "EPI_STORE_DRAINED", SLOTS[3], "epi: drain stores", "payload"),
+            # Traces from before the signal warp: the epilogue signaled inline.
             ("EPI_STORE_DRAINED", "EPI_SIGNALED", SLOTS[4], "epi: signal owner", "payload"),
             ("EPI_TEARDOWN_BEGIN", "EPI_TEARDOWN_DONE", NEUTRAL, "epi: teardown", "payload"),
+        ],
+        "signal": [
+            _SETUP,
+            ("SIG_TILE_BEGIN", "SIG_EPI_DRAINED", SLOTS[0], "sig: wait epilogue", "payload"),
+            # The release fence plus the red: what used to stall the epilogue.
+            ("SIG_EPI_DRAINED", "EPI_SIGNALED", SLOTS[4], "sig: signal owner", "payload"),
         ],
         "reduce-scatter": [
             _SETUP,
@@ -286,6 +294,55 @@ def summarize(spans):
     return "\n".join(lines)
 
 
+def rs_counters(records, name_to_id):
+    """Ready-counter values seen by each RS warp -> (N, 6) int64 table of
+    (block, warp, tile, threshold, first_poll, at_ready), or None for traces
+    without the RS_COUNT_* events.
+
+    The counter events carry a value in place of the tile, so each is matched
+    to the RS_TILE_BEGIN / RS_READY its warp emitted just before it.
+    """
+    ids = {n: name_to_id.get(n) for n in
+           ("RS_THRESHOLD", "RS_TILE_BEGIN", "RS_READY", "RS_COUNT_FIRST", "RS_COUNT_READY")}
+    if any(v is None for v in ids.values()):
+        return None
+    pld = records[:, 3] & 0xFFFFFFFF
+    warp, seq = pld >> WARP_ID_SHIFT, pld & SEQ_MASK
+    rows, threshold, open_tile, last_row = [], {}, {}, {}
+    # Rows are in ring order per block, which is emission order per warp.
+    for blk, eid, w, s in zip(records[:, 0], records[:, 2], warp, seq):
+        key = (int(blk), int(w))
+        if eid == ids["RS_THRESHOLD"]:
+            threshold[key] = int(s)
+        elif eid == ids["RS_TILE_BEGIN"]:
+            open_tile[key] = int(s)
+        elif eid == ids["RS_COUNT_FIRST"]:
+            last_row[key] = [*key, open_tile[key], threshold.get(key, -1), int(s), -1]
+            rows.append(last_row[key])
+        elif eid == ids["RS_COUNT_READY"]:
+            last_row[key][5] = int(s)
+    return np.asarray(rows, dtype=np.int64) if rows else None
+
+
+def summarize_rs_counters(table, num_devices: int):
+    """At the first poll a counter should sit at threshold - num_devices plus
+    whatever peers have already published; anything at or past the threshold
+    then was satisfied before this launch contributed."""
+    if table is None:
+        return "  (no RS counter events in this trace)"
+    thr, first, ready = table[:, 3], table[:, 4], table[:, 5]
+    base = thr - num_devices
+    pre = int((first >= thr).sum())
+    lines = [
+        f"  RS counters: {len(table)} tiles, threshold {sorted(set(thr.tolist()))}",
+        f"  first poll - (threshold - {num_devices}): "
+        f"min {int((first - base).min())} max {int((first - base).max())}",
+        f"  at ready - threshold: min {int((ready - thr).min())} max {int((ready - thr).max())}",
+        f"  tiles already ready at first poll: {pre}",
+    ]
+    return "\n".join(lines)
+
+
 def wall_span_us(records):
     """Wall time covered by the trace. Should agree with the measured kernel
     time to within a few percent; a large gap is time in uninstrumented phases."""
@@ -434,6 +491,8 @@ def main(argv=None):
 
     print(f"{records.shape[0]} events, wall span {wall_span_us(records):.1f} us")
     print(summarize(spans_for_layout(records, name_to_id, layout)))
+    if "world_size" in meta:
+        print(summarize_rs_counters(rs_counters(records, name_to_id), int(meta["world_size"])))
 
     out = Path(args.out) if args.out else Path(args.npz).with_suffix(".pdf")
     written = plot(records, out, name_to_id, layout, title=title)
