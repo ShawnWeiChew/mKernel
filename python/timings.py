@@ -58,7 +58,13 @@ class Layout:
 _SETUP = ("SETUP_BEGIN", "SETUP_DONE", NEUTRAL, "setup", "payload")
 GEMM_RS_BLACKWELL = Layout(
     # Only thread 0 emits for the epilogue warpgroup, so it is one row per CTA.
-    warp_roles={0: "epilogue", 4: "producer", 5: "mma", 6: "mma", 7: "reduce-scatter"},
+    warp_roles={
+        0: "epilogue",
+        4: "producer",
+        5: "mma",
+        6: "mma",
+        **{w: "reduce-scatter" for w in range(8, 12)},
+    },
     role_order=["producer", "mma", "epilogue", "reduce-scatter"],
     phases={
         "producer": [

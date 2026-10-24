@@ -418,8 +418,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
     };
 
-    if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
-        if (warp_id == 4) {
+    if (warpgroup_id == fg::MAINLOOP_WARPGROUP) {
+        warpgroup::decrease_registers<fg::MAINLOOP_REGISTERS>();
+
+        if (warp_id == fg::PRODUCER_WARP_ID) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -448,13 +450,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 
             pdl::arrive();
-        } else if (warp_id == 5 || warp_id == 6) {
+        } else if (warp_id >= fg::FIRST_CONSUMER_WARP_ID &&
+                   warp_id < fg::FIRST_CONSUMER_WARP_ID + fg::CONSUMER_WARPS) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
             // The two-CTA allocation requires a complete warp in each CTA,
             // before restricting MMA issue to the leader in CTA 0.
-            if (warp_id == 5) {
+            if (warp_id == fg::FIRST_CONSUMER_WARP_ID) {
                 tm_alloc.provision(tmem_addr);
                 if (elect_warp_leader()) {
                     arrive(tmem_allocated);
@@ -470,7 +473,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #endif
                 int input_stage_id = 0;
                 int epilogue_stage_id = 0;
-                const int consumer_id = warp_id - 5;
+                const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
                 typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
@@ -488,69 +491,78 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             pdl::arrive();
         } else {
-            const int lane = laneid();
-            const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
-            const int tiles_per_device = tile_rows_per_device * num_tile_cols;
-
-            const int device_row_start = G.dev_idx * rows_per_device;
-
-            pdl::wait();
+            // Padding warp: only here so setmaxnreg sees a complete warpgroup.
             everyone::tma::cluster::wait();
+        }
+    } else if (warpgroup_id == fg::RS_WARPGROUP) {
+        warpgroup::decrease_registers<fg::RS_REGISTERS>();
+        const int lane = laneid();
+        const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
+        const int tiles_per_device = tile_rows_per_device * num_tile_cols;
 
-            // Should only read after PDL wait since the previous iteration may have modified the
-            // epoch
-            const uint32_t epoch =
-                comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
-            const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+        const int device_row_start = G.dev_idx * rows_per_device;
+
+        pdl::wait();
+        everyone::tma::cluster::wait();
+
+        // Should only read after PDL wait since the previous iteration may have modified the
+        // epoch
+        const uint32_t epoch =
+            comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
+        const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+#ifdef PROFILE_TIMINGS
+        if (lane == 0) {
+            emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+        }
+#endif
+
+        // The CTA keeps the same tiles (blockIdx.x + k * NUM_BLOCKS); its RS warps take
+        // them round-robin.
+        const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
+        for (int tile_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS; tile_idx < tiles_per_device;
+             tile_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
+            // TODO: review indexing to make sure that all devices have active CTAs
+            const int local_tile_row = tile_idx / num_tile_cols;
+            const int tile_col = tile_idx % num_tile_cols;
+#ifdef PROFILE_TIMINGS
+            const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_idx);
+#endif
+
+            // These match the coordinates used by the epilogue's signal.
+            if (lane == 0) {
+#ifdef PROFILE_TIMINGS
+                timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
+#endif
+                // Peers publish tile arrivals with system-scope atomics.
+                while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
+                                          &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
+                                      ready_count)) {
+                    __nanosleep(16);
+                }
+#ifdef PROFILE_TIMINGS
+                timing_profile::emit(G.timings, &timing_head, EV_RS_READY, timing_payload);
+#endif
+            }
+            __syncwarp();
+
+            const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
+            const int tile_col_start = tile_col * fg::COL_BLOCK;
+            reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
+                G.C.mc_ptr_at({tile_row_start, tile_col_start}),
+                &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
+                G.C[G.dev_idx].cols(),
+                lane);
 #ifdef PROFILE_TIMINGS
             if (lane == 0) {
-                emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
+                timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_DONE, timing_payload);
             }
 #endif
-
-            for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
-                 tile_idx += fg::NUM_BLOCKS) {
-                // TODO: review indexing to make sure that all devices have active CTAs
-                const int local_tile_row = tile_idx / num_tile_cols;
-                const int tile_col = tile_idx % num_tile_cols;
-#ifdef PROFILE_TIMINGS
-                const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_idx);
-#endif
-
-                // These match the coordinates used by the epilogue's signal.
-                if (lane == 0) {
-#ifdef PROFILE_TIMINGS
-                    timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
-#endif
-                    // Peers publish tile arrivals with system-scope atomics.
-                    while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                                              &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
-                                          ready_count)) {
-                        __nanosleep(16);
-                    }
-#ifdef PROFILE_TIMINGS
-                    timing_profile::emit(G.timings, &timing_head, EV_RS_READY, timing_payload);
-#endif
-                }
-                __syncwarp();
-
-                const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
-                const int tile_col_start = tile_col * fg::COL_BLOCK;
-                reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
-                    G.C.mc_ptr_at({tile_row_start, tile_col_start}),
-                    &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
-                    G.C[G.dev_idx].cols(),
-                    lane);
-#ifdef PROFILE_TIMINGS
-                if (lane == 0) {
-                    timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_DONE, timing_payload);
-                }
-#endif
-            }
         }
 
         pdl::arrive();
     } else {
+        warpgroup::increase_registers<fg::EPILOGUE_REGISTERS>();
+
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
         int epilogue_smem_idx = 0;
         typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];

@@ -65,12 +65,37 @@ struct fused_globals {
     static constexpr int CONSUMER_WARPS = 2;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = _NUM_EPILOGUE_WARPS;
-    static constexpr int REDUCE_SCATTER_WARPS = 1;
+    static constexpr int REDUCE_SCATTER_WARPS = 4;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
 
-    static constexpr int NUM_THREADS =
-        (CONSUMER_WARPS + PRODUCER_WARPS + REDUCE_SCATTER_WARPS + EPILOGUE_WARPS) *
-        kittens::WARP_THREADS;
+    // Warp layout: [epilogue WG(s)] [producer, 2x MMA, pad] [RS WG]. setmaxnreg is
+    // .sync.aligned over a whole warpgroup, so the producer/MMA tail is padded to a
+    // complete one and the RS warps get a warpgroup of their own.
+    static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
+    static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
+    static constexpr int MAINLOOP_WARPGROUP = EPILOGUE_WARPGROUPS;
+    static constexpr int RS_WARPGROUP = MAINLOOP_WARPGROUP + 1;
+    static constexpr int FIRST_RS_WARP_ID = RS_WARPGROUP * kittens::WARPGROUP_WARPS;
+    static_assert(FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS <= FIRST_RS_WARP_ID,
+                  "Producer/MMA warps must fit in one warpgroup");
+    static_assert(REDUCE_SCATTER_WARPS == kittens::WARPGROUP_WARPS,
+                  "The RS warps must form exactly one warpgroup");
+
+    static constexpr int NUM_WARPS = FIRST_RS_WARP_ID + REDUCE_SCATTER_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+
+    static constexpr int MAINLOOP_REGISTERS = 40;
+    static constexpr int RS_REGISTERS = 160;
+    static constexpr int EPILOGUE_REGISTERS = 224;
+    // guard against register overallocation
+    static_assert((MAINLOOP_REGISTERS + RS_REGISTERS) * kittens::WARPGROUP_THREADS +
+                          EPILOGUE_REGISTERS * EPILOGUE_WARPS * kittens::WARP_THREADS <=
+                      65536,
+                  "setmaxnreg budget exceeds the register file");
+    // setmaxnreg.dec can only lower a warp's count from the launch allocation.
+    static constexpr int REGISTER_CEILING = (65536 / NUM_THREADS / 8) * 8;
+    static_assert(MAINLOOP_REGISTERS <= REGISTER_CEILING && RS_REGISTERS <= REGISTER_CEILING,
+                  "Decreased register counts must not exceed the launch allocation");
     static constexpr int NUM_CLUSTERS = DEFAULT_NUM_CTA;
 
     static constexpr int ROW_BLOCK = 256;
