@@ -213,6 +213,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     __shared__ semaphore epilogue_ready[fg::NUM_TMEM_SLOTS];
     __shared__ semaphore epilogue_tmem_finished[fg::NUM_TMEM_SLOTS];
 
+    // Epilogue -> signal warp: a tile's stores have drained and it may be published.
+    __shared__ semaphore signal_full[fg::SIGNAL_PIPELINE_STAGES];
+    __shared__ semaphore signal_empty[fg::SIGNAL_PIPELINE_STAGES];
+
     __shared__ semaphore tmem_allocated;
     __shared__ semaphore tmem_finished;
 
@@ -232,6 +236,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
             init_semaphore(epilogue_ready[i], 1);
             init_semaphore(epilogue_tmem_finished[i], WARPGROUP_WARPS * fg::NUM_CLUSTERS);
+        }
+
+#pragma unroll
+        for (int i = 0; i < fg::SIGNAL_PIPELINE_STAGES; i++) {
+            init_semaphore(signal_full[i], 1);
+            init_semaphore(signal_empty[i], 1);
         }
 
         init_semaphore(tmem_allocated, 1);
@@ -369,8 +379,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
     };
 
-    if (warpgroup_id >= fg::EPILOGUE_WARPGROUPS) {
-        if (warp_id == 4) {
+    if (warpgroup_id == fg::MAINLOOP_WARPGROUP) {
+        warpgroup::decrease_registers<fg::MAINLOOP_REGISTERS>();
+
+        if (warp_id == fg::PRODUCER_WARP_ID) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -387,13 +399,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 
             pdl::arrive();
-        } else if (warp_id == 5 || warp_id == 6) {
+        } else if (warp_id >= fg::FIRST_CONSUMER_WARP_ID &&
+                   warp_id < fg::FIRST_CONSUMER_WARP_ID + fg::CONSUMER_WARPS) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
             // The two-CTA allocation requires a complete warp in each CTA,
             // before restricting MMA issue to the leader in CTA 0.
-            if (warp_id == 5) {
+            if (warp_id == fg::FIRST_CONSUMER_WARP_ID) {
                 tm_alloc.provision(tmem_addr);
                 if (elect_warp_leader()) {
                     arrive(tmem_allocated);
@@ -406,7 +419,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             if (cta_rank == 0 && elect_warp_leader()) {
                 int input_stage_id = 0;
                 int epilogue_stage_id = 0;
-                const int consumer_id = warp_id - 5;
+                const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
                 typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
 
@@ -423,53 +436,103 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
 
             pdl::arrive();
-        } else {
-            const int lane = laneid();
-            const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
-            const int tiles_per_device = tile_rows_per_device * num_tile_cols;
-
-            const int device_row_start = G.dev_idx * rows_per_device;
-
-            pdl::wait();
+        } else if (warp_id == fg::SIGNAL_WARP_ID) {
             everyone::tma::cluster::wait();
 
-            // Should only read after PDL wait since the previous iteration may have modified the
-            // epoch
-            const uint32_t epoch =
-                comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
-            const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+            // Walks the epilogue's tile sequence and publishes each tile once its
+            // stores drain. The release fence before the red waits on this SM's
+            // outstanding traffic, which is why it is kept off the epilogue.
+            if (elect_warp_leader()) {
+                int signal_stage = 0;
+                int signal_phase = 0;
+                for (int tile_id = cluster_idx; tile_id < total_num_tiles;
+                     tile_id += num_clusters) {
+                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+                        num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    const int row_start =
+                        (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
+                         cta_rank * fg::CONSUMER_WARPS) *
+                        fg::A_tile::rows;
+                    const int device_to_signal = row_start / rows_per_device;
+                    const int local_tile_for_device =
+                        (row_start % rows_per_device) / fg::ROW_BLOCK;
+                    // The epilogue's mbarrier arrive releases its drained stores at
+                    // CTA scope; the release below extends them to the owner.
+                    wait(signal_full[signal_stage], signal_phase);
+                    if (device_to_signal == G.dev_idx) {
+                        comm::atomic_u32::release_add_gpu(
+                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+                            1);
+                    } else {
+                        comm::atomic_u32::release_add_sys(
+                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
+                            1);
+                    }
+                    arrive(signal_empty[signal_stage]);
 
-            for (int tile_idx = blockIdx.x; tile_idx < tiles_per_device;
-                 tile_idx += fg::NUM_BLOCKS) {
-                // TODO: review indexing to make sure that all devices have active CTAs
-                const int local_tile_row = tile_idx / num_tile_cols;
-                const int tile_col = tile_idx % num_tile_cols;
-
-                // These match the coordinates used by the epilogue's signal.
-                if (lane == 0) {
-                    // Peers publish tile arrivals with system-scope atomics.
-                    while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                                              &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
-                                          ready_count)) {
-                        __nanosleep(16);
+                    signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+                    if (signal_stage == 0) {
+                        signal_phase ^= 1;
                     }
                 }
-                __syncwarp();
-
-                const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
-                const int tile_col_start = tile_col * fg::COL_BLOCK;
-                reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
-                    G.C.mc_ptr_at({tile_row_start, tile_col_start}),
-                    &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
-                    G.C[G.dev_idx].cols(),
-                    lane);
             }
+        }
+    } else if (warpgroup_id == fg::RS_WARPGROUP) {
+        warpgroup::decrease_registers<fg::RS_REGISTERS>();
+        const int lane = laneid();
+        const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
+        const int tiles_per_device = tile_rows_per_device * num_tile_cols;
+
+        const int device_row_start = G.dev_idx * rows_per_device;
+
+        pdl::wait();
+        everyone::tma::cluster::wait();
+
+        // Should only read after PDL wait since the previous iteration may have modified the
+        // epoch
+        const uint32_t epoch =
+            comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
+        const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+
+        // The CTA keeps the same tiles (blockIdx.x + k * NUM_BLOCKS); its RS warps take
+        // them round-robin.
+        const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
+        for (int tile_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS; tile_idx < tiles_per_device;
+             tile_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
+            // TODO: review indexing to make sure that all devices have active CTAs
+            const int local_tile_row = tile_idx / num_tile_cols;
+            const int tile_col = tile_idx % num_tile_cols;
+
+            // These match the coordinates used by the epilogue's signal.
+            if (lane == 0) {
+                // Peers publish tile arrivals with system-scope atomics.
+                while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
+                                          &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}]),
+                                      ready_count)) {
+                    __nanosleep(16);
+                }
+            }
+            __syncwarp();
+
+            const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
+            const int tile_col_start = tile_col * fg::COL_BLOCK;
+            reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
+                G.C.mc_ptr_at({tile_row_start, tile_col_start}),
+                &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
+                G.C[G.dev_idx].cols(),
+                lane);
         }
 
         pdl::arrive();
     } else {
+        warpgroup::increase_registers<fg::EPILOGUE_REGISTERS>();
+
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
         int epilogue_smem_idx = 0;
+        int signal_stage = 0;
+        // Fresh mbarriers complete the phase before parity 0, so the first lap
+        // of signal_empty passes without waiting.
+        int signal_phase = 1;
         typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];
 
         everyone::tma::cluster::wait();
@@ -486,6 +549,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
                 num_tile_rows_per_cluster, num_tile_cols, tile_id);
 
+            // The signal warp derives the same row from tile_id; keep the two in step.
             const int cluster_level_tile_id = tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                 cta_rank * fg::CONSUMER_WARPS;
 #pragma unroll
@@ -503,19 +567,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
             dist::tma::store_async_wait();
 
-            // TODO: maybe the only way to validate this is by plugging in actual numbers?
-            const int row_start = cluster_level_tile_id * fg::A_tile::rows;
-            const int device_to_signal = row_start / rows_per_device;
-            const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
-
+            // Only thread 0 issued and drained the TMA stores, so it alone hands
+            // the tile to the signal warp.
             if (warpgroup::laneid() == 0) {
-                if (device_to_signal == G.dev_idx) {
-                    comm::atomic_u32::release_add_gpu(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                } else {
-                    comm::atomic_u32::release_add_sys(
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}], 1);
-                }
+                wait(signal_empty[signal_stage], signal_phase);
+                arrive(signal_full[signal_stage]);
+            }
+            signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+            if (signal_stage == 0) {
+                signal_phase ^= 1;
             }
         }
 

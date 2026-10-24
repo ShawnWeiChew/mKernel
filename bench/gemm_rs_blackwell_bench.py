@@ -39,7 +39,7 @@ class BlackwellBenchConfig:
 
     # Tile columns per rasterization supergroup; must match the instantiated
     # values in gemm_rs_blackwell::launch.
-    mkernel_swizzle_sizes = [1, 2, 4, 8]
+    mkernel_swizzle_sizes = [4]
 
     # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
     # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009
@@ -519,6 +519,18 @@ def main():
                         f"{results['ThunderKittens eager'] / results['ThunderKittens graph']:.3f}x",
                         flush=True,
                     )
+                # Like-for-like launch modes against TK; CUTLASS times itself.
+                for mkernel_name, other_name in (
+                    ("mKernel eager", "ThunderKittens eager"),
+                    ("mKernel graph", "ThunderKittens graph"),
+                    ("mKernel graph", "cutlass"),
+                ):
+                    if mkernel_name in results and other_name in results:
+                        print(
+                            f"  {mkernel_name} speedup vs {other_name}: "
+                            f"{results[other_name] / results[mkernel_name]:.3f}x",
+                            flush=True,
+                        )
 
     finally:
         # all cudagraphs referencing the NCCL communicator have to be released first,

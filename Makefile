@@ -204,7 +204,11 @@ $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $
 
 gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
 
-$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu Makefile | $(BUILD)
+GEMM_RS_BLACKWELL_HEADERS := \
+	include/operators/gemm_rs/gemm_rs_blackwell.cuh \
+	include/operators/gemm_rs/gemm_rs_blackwell_session.cuh
+
+$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWELL_HEADERS) Makefile | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
