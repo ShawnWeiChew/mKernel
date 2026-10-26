@@ -2,9 +2,9 @@
 
 Build with make GPU=blackwell INTRA_NUM_DEVICES=8 gemm-rs-blackwell-profile, then
     torchrun --standalone --nproc-per-node=8 bench/gemm_rs_blackwell_profile.py --shapes 8192
-Each dumping rank warms up without the ring, records exactly one launch, checks
-it against cuBLAS + NCCL, and writes <out-dir>/gemm_rs_blackwell_M<M>_rank<r>.npz
-plus a Gantt PDF. Re-render or zoom without a GPU:
+Each dumping rank warms up without the ring, records exactly one launch at the
+end of a back-to-back chain (--lead-in), checks it against cuBLAS + NCCL, and
+writes <out-dir>/gemm_rs_blackwell_M<M>_rank<r>.npz plus a Gantt PDF. Re-render or zoom without a GPU:
     python python/timings.py traces/gemm_rs_blackwell_M8192_rank0.npz --blocks 0-7
 %globaltimer is per GPU, so traces from different ranks share no time axis.
 """
@@ -50,6 +50,12 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
         run_mkernel(module, buffers)
     torch.cuda.synchronize()
     dist.barrier()
+
+    # Leaving the host barrier skews each rank's start by tens of us. Queue a chain
+    # of unrecorded launches with no host sync, so the recorded launch starts when
+    # the previous one drains on its own GPU, and the RS tail couples those ends.
+    for _ in range(args.lead_in):
+        run_mkernel(module, buffers)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -117,6 +123,11 @@ def main():
     parser.add_argument("--shapes", default="8192", help="Comma-separated M values")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
+        "--lead-in", type=int, default=8,
+        help="Unrecorded launches queued back-to-back before the recorded one; 0 "
+        "records the first launch after the host barrier",
+    )
+    parser.add_argument(
         "--ranks", default="0", help="Comma-separated ranks that dump a trace, or 'all'",
     )
     parser.add_argument("--out-dir", default=str(HERE.parent / "traces"))
@@ -130,8 +141,8 @@ def main():
         parser.error("This profiler requires a single node")
     if any(m <= 0 or m % (config.world_size * 256) or m % 512 for m in shapes):
         parser.error("mKernel requires M divisible by both WORLD_SIZE * 256 and 512")
-    if args.warmup < 0:
-        parser.error("--warmup must be nonnegative")
+    if args.warmup < 0 or args.lead_in < 0:
+        parser.error("--warmup and --lead-in must be nonnegative")
     dump_ranks = (
         set(range(config.world_size)) if args.ranks == "all"
         else {int(r) for r in args.ranks.split(",")}
