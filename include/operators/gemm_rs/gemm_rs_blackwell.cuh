@@ -105,7 +105,13 @@ struct fused_globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
-    static constexpr int RS_STORES_PER_BATCH = 32;
+    static constexpr int RS_M_STRIP_SIZE = 32;
+    // Loads in flight per lane. Capped at the strip height (one row per store at
+    // COL_BLOCK = 256) so a batch never runs past the end of a strip.
+    static constexpr int RS_STORES_PER_BATCH = RS_M_STRIP_SIZE < 32 ? RS_M_STRIP_SIZE : 32;
+    // Partition a single tile into mini strips as well, so we can have more CTAs active per
+    // completed RS tile
+    static constexpr int RS_STRIPS_PER_TILE = ROW_BLOCK / RS_M_STRIP_SIZE;
 
     static constexpr int TMEM_PIPELINE_STAGES =
         kittens::MAX_TENSOR_COLS / COL_BLOCK / CONSUMER_WARPS;

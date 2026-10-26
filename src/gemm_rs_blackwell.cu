@@ -98,6 +98,8 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
     constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
     constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
     constexpr int ROWS_PER_BATCH = STORES_PER_BATCH * ROWS_PER_STORE;
+    // A partial batch would reduce and store rows past the end of the tile.
+    static_assert(TILE_ROWS % ROWS_PER_BATCH == 0, "TILE_ROWS must be a whole number of batches");
 
     const int lane_col = (lane % LANES_PER_ROW) * ELEMENTS_PER_STORE;
     const int lane_row = lane / LANES_PER_ROW;
@@ -122,7 +124,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
     }
 }
 
-template <int SUPERGROUP_WIDTH = 8>
+template <int SUPERGROUP_WIDTH = 2>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
                                                                    int num_cols,
                                                                    int tile_idx) {
@@ -516,13 +518,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                      tile_id += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, tile_id);
-                    const int row_start =
-                        (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
-                         cta_rank * fg::CONSUMER_WARPS) *
+                    const int row_start = (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
+                                           cta_rank * fg::CONSUMER_WARPS) *
                         fg::A_tile::rows;
                     const int device_to_signal = row_start / rows_per_device;
-                    const int local_tile_for_device =
-                        (row_start % rows_per_device) / fg::ROW_BLOCK;
+                    const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
 #ifdef PROFILE_TIMINGS
                     // Pairs with the epilogue's EV_EPI_STORE_DRAINED for this tile.
                     const uint32_t timing_payload = timing_profile::pack_payload(
@@ -537,15 +537,18 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                     timing_profile::emit(
                         G.timings, &timing_head, EV_SIG_EPI_DRAINED, timing_payload);
 #endif
-                    if (device_to_signal == G.dev_idx) {
-                        comm::atomic_u32::release_add_gpu(
-                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
-                            1);
-                    } else {
-                        comm::atomic_u32::release_add_sys(
-                            &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}],
-                            1);
-                    }
+                    // Fence then relaxed red: the same release as red.release, split
+                    // so the trace shows the fence and the red separately.
+                    auto* ready_counter =
+                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}];
+                    const bool local_owner = device_to_signal == G.dev_idx;
+
+                    comm::atomic_u32::fence_acq_rel_gpu();
+#ifdef PROFILE_TIMINGS
+                    timing_profile::emit(G.timings, &timing_head, EV_SIG_FENCED, timing_payload);
+#endif
+
+                    comm::atomic_u32::relaxed_add_gpu(ready_counter, 1);
 #ifdef PROFILE_TIMINGS
                     timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
 #endif
@@ -584,12 +587,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 #endif
 
-        // The CTA keeps the same tiles (blockIdx.x + k * NUM_BLOCKS); its RS warps take
-        // them round-robin.
         const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
-        for (int tile_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS; tile_idx < tiles_per_device;
-             tile_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
-            // TODO: review indexing to make sure that all devices have active CTAs
+        for (int unit_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS;
+             unit_idx < tiles_per_device * fg::RS_STRIPS_PER_TILE;
+             unit_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
+            const int strip_idx = unit_idx % fg::RS_STRIPS_PER_TILE;
+            const int tile_idx = unit_idx / fg::RS_STRIPS_PER_TILE;
             const int local_tile_row = tile_idx / num_tile_cols;
             const int tile_col = tile_idx % num_tile_cols;
 #ifdef PROFILE_TIMINGS
@@ -603,7 +606,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #endif
                 // Peers publish tile arrivals with system-scope atomics.
                 const auto* ready_counter = &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}];
-                uint32_t observed = comm::atomic_u32::acquire_load_sys(ready_counter);
+                uint32_t observed = comm::atomic_u32::acquire_load_gpu(ready_counter);
 #ifdef PROFILE_TIMINGS
                 timing_profile::emit(G.timings,
                                      &timing_head,
@@ -612,7 +615,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #endif
                 while (!epoch_reached(observed, ready_count)) {
                     __nanosleep(16);
-                    observed = comm::atomic_u32::acquire_load_sys(ready_counter);
+                    observed = comm::atomic_u32::acquire_load_gpu(ready_counter);
                 }
 #ifdef PROFILE_TIMINGS
                 timing_profile::emit(G.timings, &timing_head, EV_RS_READY, timing_payload);
@@ -624,9 +627,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             }
             __syncwarp();
 
-            const int tile_row_start = device_row_start + local_tile_row * fg::ROW_BLOCK;
+            const int tile_row_start =
+                device_row_start + local_tile_row * fg::ROW_BLOCK + strip_idx * fg::RS_M_STRIP_SIZE;
             const int tile_col_start = tile_col * fg::COL_BLOCK;
-            reduce_scatter_tile<fg::ROW_BLOCK, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
+            reduce_scatter_tile<fg::RS_M_STRIP_SIZE, fg::COL_BLOCK, fg::RS_STORES_PER_BATCH>(
                 G.C.mc_ptr_at({tile_row_start, tile_col_start}),
                 &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
                 G.C[G.dev_idx].cols(),
@@ -692,8 +696,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             const uint32_t timing_payload = timing_profile::pack_payload(
                 warp_id, tile_id * fg::CONSUMER_WARPS + fg::CONSUMER_WARPS - 1);
             if (warpgroup::laneid() == 0) {
-                timing_profile::emit(
-                    G.timings, &timing_head, EV_EPI_STORE_DRAINED, timing_payload);
+                timing_profile::emit(G.timings, &timing_head, EV_EPI_STORE_DRAINED, timing_payload);
             }
 #endif
 
@@ -712,8 +715,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #ifdef PROFILE_TIMINGS
         const uint32_t teardown_payload = timing_profile::pack_payload(warp_id, 0);
         if (warpgroup::laneid() == 0) {
-            timing_profile::emit(
-                G.timings, &timing_head, EV_EPI_TEARDOWN_BEGIN, teardown_payload);
+            timing_profile::emit(G.timings, &timing_head, EV_EPI_TEARDOWN_BEGIN, teardown_payload);
         }
 #endif
         tensor_before_thread_sync();

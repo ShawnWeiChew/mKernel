@@ -94,8 +94,10 @@ GEMM_RS_BLACKWELL = Layout(
         "signal": [
             _SETUP,
             ("SIG_TILE_BEGIN", "SIG_EPI_DRAINED", SLOTS[0], "sig: wait epilogue", "payload"),
-            # The release fence plus the red: what used to stall the epilogue.
-            ("SIG_EPI_DRAINED", "EPI_SIGNALED", SLOTS[4], "sig: signal owner", "payload"),
+            # The release, split into the fence and the relaxed red after it.
+            # Traces from before SIG_FENCED show neither row.
+            ("SIG_EPI_DRAINED", "SIG_FENCED", SLOTS[4], "sig: fence", "payload"),
+            ("SIG_FENCED", "EPI_SIGNALED", SLOTS[5], "sig: red", "payload"),
         ],
         "reduce-scatter": [
             _SETUP,

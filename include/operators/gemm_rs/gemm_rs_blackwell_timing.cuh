@@ -50,6 +50,9 @@ enum TimingEvent : uint32_t {
     EV_RS_THRESHOLD = 20,
     EV_RS_COUNT_FIRST = 21,
     EV_RS_COUNT_READY = 22,
+    // Signal: between the release fence and the relaxed red, splitting what
+    // SIG_EPI_DRAINED -> EPI_SIGNALED used to time as one red.release.
+    EV_SIG_FENCED = 23,
 };
 
 struct TimingEventName {
@@ -82,6 +85,7 @@ inline constexpr TimingEventName TIMING_EVENT_NAMES[] = {
     {"RS_THRESHOLD", EV_RS_THRESHOLD},
     {"RS_COUNT_FIRST", EV_RS_COUNT_FIRST},
     {"RS_COUNT_READY", EV_RS_COUNT_READY},
+    {"SIG_FENCED", EV_SIG_FENCED},
 };
 
 // The ring head is initialized alongside the mbarriers, after kernel entry, so

@@ -100,6 +100,32 @@ __device__ inline void release_add_sys(PtrT* ptr, int32_t v) {
 }
 
 // ============================================================================
+// Split release — a fence followed by a relaxed add is a release pattern in
+// the PTX memory model, equivalent to the red.release above. Splitting it lets
+// the two halves be timed separately.
+// ============================================================================
+
+__device__ inline void fence_acq_rel_gpu() { asm volatile("fence.acq_rel.gpu;" ::: "memory"); }
+
+__device__ inline void fence_acq_rel_sys() { asm volatile("fence.acq_rel.sys;" ::: "memory"); }
+
+template <typename PtrT>
+__device__ inline void relaxed_add_gpu(PtrT* ptr, int32_t v) {
+    asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;"
+                 :
+                 : "l"(reinterpret_cast<volatile int32_t*>(ptr)), "r"(v)
+                 : "memory");
+}
+
+template <typename PtrT>
+__device__ inline void relaxed_add_sys(PtrT* ptr, int32_t v) {
+    asm volatile("red.relaxed.sys.global.add.s32 [%0], %1;"
+                 :
+                 : "l"(reinterpret_cast<volatile int32_t*>(ptr)), "r"(v)
+                 : "memory");
+}
+
+// ============================================================================
 // Relaxed loads — no synchronization, just an opaque 32-bit read. Mostly used
 // for poll loops where the reader will re-load with stronger ordering after
 // the comparison succeeds.
