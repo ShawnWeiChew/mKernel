@@ -104,4 +104,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "alive and serialize launches; graph replays advance the device epoch. "
         "swizzle_size (1, 2, 4, or 8) is the tile-column width of each rasterization "
         "supergroup.");
+#endif
 }
