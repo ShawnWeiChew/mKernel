@@ -124,7 +124,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
     }
 }
 
-template <int SUPERGROUP_WIDTH = 2>
+template <int SUPERGROUP_WIDTH>
 __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
                                                                    int num_cols,
                                                                    int tile_idx) {
@@ -516,8 +516,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 int signal_phase = 0;
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_clusters) {
-                    auto [tile_row_idx, tile_col_idx] =
-                        calculate_tile_idx(num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+                        num_tile_rows_per_cluster, num_tile_cols, tile_id);
                     const int row_start = (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                                            cta_rank * fg::CONSUMER_WARPS) *
                         fg::A_tile::rows;
