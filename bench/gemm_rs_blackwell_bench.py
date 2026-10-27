@@ -39,7 +39,7 @@ class BlackwellBenchConfig:
 
     # Tile columns per rasterization supergroup; must match the instantiated
     # values in gemm_rs_blackwell::launch.
-    mkernel_swizzle_sizes = [4]
+    mkernel_swizzle_sizes = [1, 2, 4, 8]
 
     # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
     # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009

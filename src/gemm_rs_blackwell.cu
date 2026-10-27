@@ -836,7 +836,12 @@ inline void launch_with_swizzle(at::Tensor& A,
                                 at::Tensor& B,
                                 dist::ParallelBuffer& C,
                                 dist::ParallelBuffer& ready,
-                                dist::ParallelBuffer& completion_epochs) {
+                                dist::ParallelBuffer& completion_epochs
+#ifdef PROFILE_TIMINGS
+                                ,
+                                TimingRecord* timings
+#endif
+) {
     auto globals =
         gemm_rs_blackwell_make_globals<DEFAULT_NUM_EPILOGUE_WARPS,
                                        DEFAULT_C_TILE_DIVISOR,
@@ -850,6 +855,9 @@ inline void launch_with_swizzle(at::Tensor& A,
                                                       B.size(0),
                                                       A.size(1),
                                                       at::cuda::getCurrentCUDAStream().stream());
+#ifdef PROFILE_TIMINGS
+    globals.timings = timings;
+#endif
     launch_gemm_rs_blackwell(globals);
 }
 
@@ -858,19 +866,34 @@ inline void launch(at::Tensor& A,
                    dist::ParallelBuffer& C,
                    dist::ParallelBuffer& ready,
                    dist::ParallelBuffer& completion_epochs,
-                   int swizzle_size) {
+                   int swizzle_size
+#ifdef PROFILE_TIMINGS
+                   ,
+                   TimingRecord* timings = nullptr
+#endif
+) {
+#ifdef PROFILE_TIMINGS
+#define MKERNEL_LAUNCH_TIMINGS_ARG , timings
+#else
+#define MKERNEL_LAUNCH_TIMINGS_ARG
+#endif
     switch (swizzle_size) {
         case 1:
-            return launch_with_swizzle<1>(A, B, C, ready, completion_epochs);
+            return launch_with_swizzle<1>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         case 2:
-            return launch_with_swizzle<2>(A, B, C, ready, completion_epochs);
+            return launch_with_swizzle<2>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         case 4:
-            return launch_with_swizzle<4>(A, B, C, ready, completion_epochs);
+            return launch_with_swizzle<4>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         case 8:
-            return launch_with_swizzle<8>(A, B, C, ready, completion_epochs);
+            return launch_with_swizzle<8>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         default:
             TORCH_CHECK(false, "swizzle_size must be 1, 2, 4, or 8, got ", swizzle_size);
     }
+#undef MKERNEL_LAUNCH_TIMINGS_ARG
 }
 #endif
 

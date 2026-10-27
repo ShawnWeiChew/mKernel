@@ -34,7 +34,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifdef PROFILE_TIMINGS
     using namespace gemm_rs_blackwell;
     constexpr int timing_num_blocks =
-        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR>::NUM_BLOCKS;
+        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, DEFAULT_SWIZZLE_SIZE>::
+            NUM_BLOCKS;
     m.def(
         "gemm_rs_blackwell_launch",
         [](at::Tensor A,
@@ -42,6 +43,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            dist::ParallelBuffer& C,
            dist::ParallelBuffer& ready,
            dist::ParallelBuffer& completion_epochs,
+           int swizzle_size,
            std::optional<at::Tensor> timings) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             TimingRecord* timing_records = nullptr;
@@ -61,13 +63,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                             timings->numel());
                 timing_records = reinterpret_cast<TimingRecord*>(timings->data_ptr<int64_t>());
             }
-            gemm_rs_blackwell::launch(A, B, C, ready, completion_epochs, timing_records);
+            gemm_rs_blackwell::launch(
+                A, B, C, ready, completion_epochs, swizzle_size, timing_records);
         },
         pybind11::arg("A"),
         pybind11::arg("B"),
         pybind11::arg("C"),
         pybind11::arg("ready"),
         pybind11::arg("completion_epochs"),
+        pybind11::arg("swizzle_size") = DEFAULT_SWIZZLE_SIZE,
         pybind11::arg("timings") = pybind11::none(),
         "Profile build of gemm_rs_blackwell_launch. Pass a zeroed int64 tensor of "
         "TIMING_NUM_BLOCKS * EVENTS_PER_BLOCK * 2 elements to record one launch.");
