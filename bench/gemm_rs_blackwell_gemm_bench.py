@@ -10,6 +10,8 @@ GEMM dimension. By default K=12288/8=1536; use --emulated-world-size 2 for
 K=6144, or --k to specify it directly. The emulated size only selects K.
 Requires the RS body/signals to remain disabled in src/gemm_rs_blackwell.cu.
 Reports warm-cache CUDA graph timings, excluding allocation and the exit barrier.
+Samples run in a fixed order, each after --rest idle seconds, so every kernel
+starts from the same thermal/clock state.
 Compare against a separate full GEMM+RS run at matching local dimensions to
 assess GEMM's contribution; overlap means the times are not additive.
 Both consumer counts are compiled into one extension and benchmarked by default.
@@ -130,13 +132,11 @@ def benchmark_shape(module, tk, m, n, k, args):
                     check(name)
 
         samples = {name: [] for name in graphs}
-        for repeat in range(args.repeats):
-            names = list(graphs)
-            offset = repeat % len(names)
-            order = names[offset:] + names[:offset]
-            for name in order:
-                samples[name].append(time_graph(graphs[name], args))
-                time.sleep(5)
+        # Fixed order; every sample starts from the same idle GPU after --rest seconds.
+        for _ in range(args.repeats):
+            for name, graph in graphs.items():
+                time.sleep(args.rest)
+                samples[name].append(time_graph(graph, args))
         cu = statistics.median(samples["cuBLAS"])
         flops = 2 * m * n * k
         print(
@@ -183,6 +183,8 @@ def main():
     parser.add_argument("--iters", type=int, default=20, help="Timed graph replays per sample")
     parser.add_argument("--graph-size", type=int, default=20, help="GEMMs per graph replay")
     parser.add_argument("--repeats", type=int, default=5, help="Number of samples for median timing")
+    parser.add_argument("--rest", type=float, default=5.0,
+                        help="Idle seconds before each timed sample (default: 5)")
     args = parser.parse_args()
     args.consumer_warps = list(dict.fromkeys(args.consumer_warps))
     try:
@@ -201,8 +203,8 @@ def main():
         parser.error(f"Selected variants require M to be a positive multiple of {cluster_rows}")
     if args.n <= 0 or args.n % 256 or k <= 0 or k % 64:
         parser.error("N must be a positive multiple of 256; K must be a positive multiple of 64")
-    if args.warmup < 0 or min(args.iters, args.graph_size, args.repeats) < 1:
-        parser.error("--warmup must be nonnegative; --iters, --graph-size, --repeats must be positive")
+    if args.warmup < 0 or args.rest < 0 or min(args.iters, args.graph_size, args.repeats) < 1:
+        parser.error("--warmup, --rest must be nonnegative; --iters, --graph-size, --repeats must be positive")
     if not torch.cuda.is_available():
         parser.error("CUDA is required")
     if not 0 <= args.device < torch.cuda.device_count():
@@ -224,7 +226,8 @@ def main():
         f"{torch.cuda.get_device_name()}; device {args.device}; BF16, FP32 accumulation\n"
         f"Consumer variants: {args.consumer_warps}\n"
         f"ThunderKittens: {args.tk_dir or 'off'}\n"
-        f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples.\n"
+        f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples, "
+        f"{args.rest:g} s rest before each.\n"
         "mKernel throughput: 100% matches cuBLAS; higher is faster. Correctness checked before timing.",
         flush=True,
     )
