@@ -340,6 +340,7 @@ def gemm_rs_blackwell_prepare(
         ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
         mkernel_timings.append((swizzle, ms))
         buffers.mkernel_graph = None
+        time.sleep(3)
     
     best_swizzle, _ = min(mkernel_timings, key=lambda item: item[1])
     if config.is_chief:
@@ -374,6 +375,8 @@ def gemm_rs_blackwell_prepare(
             )
             if ms is not None:
                 timings.append((candidate, ms))
+
+            time.sleep(3)
 
         if not timings:
             if config.is_chief:
