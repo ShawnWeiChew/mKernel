@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import statistics
 import sys
-
+import time
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -136,6 +136,7 @@ def benchmark_shape(module, tk, m, n, k, args):
             order = names[offset:] + names[:offset]
             for name in order:
                 samples[name].append(time_graph(graphs[name], args))
+                time.sleep(5)
         cu = statistics.median(samples["cuBLAS"])
         flops = 2 * m * n * k
         print(
