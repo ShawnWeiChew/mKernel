@@ -592,9 +592,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(
              unit_idx < tiles_per_device * fg::RS_STRIPS_PER_TILE;
              unit_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
             const int strip_idx = unit_idx % fg::RS_STRIPS_PER_TILE;
-            const int tile_idx = unit_idx / fg::RS_STRIPS_PER_TILE;
-            const int local_tile_row = tile_idx / num_tile_cols;
-            const int tile_col = tile_idx % num_tile_cols;
+            // Walk this device's tiles in the GEMM's rasterization so strips are taken
+            // roughly in completion order; keep the width in step with the GEMM's calls.
+            const auto [local_tile_row, tile_col] = calculate_tile_idx(
+                tile_rows_per_device, num_tile_cols, unit_idx / fg::RS_STRIPS_PER_TILE);
+            // Row-major id, so profile payloads keep naming the same tile as before.
+            const int tile_idx = local_tile_row * num_tile_cols + tile_col;
 #ifdef PROFILE_TIMINGS
             const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_idx);
 #endif
