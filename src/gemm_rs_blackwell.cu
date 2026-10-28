@@ -210,10 +210,14 @@ __global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_
     }
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 __device__ __forceinline__ void gemm_rs_blackwell(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G) {
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>& G) {
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -244,8 +248,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
     typename fg::pipeline_inputs(&inputs_smem)[fg::PRODUCER_CONSUMER_PIPELINE_STAGES] =
         smem_allocator.allocate<fg::pipeline_inputs, fg::PRODUCER_CONSUMER_PIPELINE_STAGES>();
-    typename fg::C_tile(&C_smem)[fg::EPILOGUE_PIPELINE_STAGES] =
-        smem_allocator.allocate<fg::C_tile, fg::EPILOGUE_PIPELINE_STAGES>();
+    typename fg::C_stage_tile(&C_smem)[fg::EPILOGUE_PIPELINE_STAGES] =
+        smem_allocator.allocate<fg::C_stage_tile, fg::EPILOGUE_PIPELINE_STAGES>();
 
     __shared__ semaphore mma_finish[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
     __shared__ semaphore tma_load[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
@@ -356,22 +360,24 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
     auto epilogue = [&](int tile_row_idx,
                         int tile_col_idx,
-                        typename fg::C_tt_tile* tmem,
+                        typename fg::C_epi_tt_tile* tmem,
                         const int consumer_id,
                         int& epilogue_stage_id,
                         int& epilogue_smem_idx,
                         bool is_last_tile) {
-        constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
-        rt_bf<fg::A_tile::rows / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
+        constexpr int C_CHUNK_COLS = fg::C_tile::cols;
+        constexpr int EPI_ROWS = fg::C_epi_tt_tile::rows;
+        constexpr int EPI_CHUNKS = fg::C_epi_tt_tile::cols / C_CHUNK_COLS;
+        rt_bf<EPI_ROWS / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[EPI_CHUNKS];
 
         const int epilogue_semaphore_idx = consumer_id + 4;
         wait(epilogue_ready[consumer_id], (phasebits >> epilogue_semaphore_idx) & 0b1);
 
 #pragma unroll
-        for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
+        for (int i = 0; i < EPI_CHUNKS; i++) {
             warpgroup::load_async(
                 c_reg[i],
-                tmem[epilogue_stage_id].template subtile<tt<float, fg::A_tile::rows, C_CHUNK_COLS>>(
+                tmem[epilogue_stage_id].template subtile<tt<float, EPI_ROWS, C_CHUNK_COLS>>(
                     i * C_CHUNK_COLS));
         }
 
@@ -386,9 +392,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         }
 
 #pragma unroll
-        for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
+        for (int i = 0; i < EPI_CHUNKS; i++) {
             // need to know that there is at least 1 slot of smem in C tile that is free
-            dist::tma::store_async_read_wait<fg::EPILOGUE_PIPELINE_STAGES - 1>();
+            dist::tma::store_async_read_wait<fg::C_STORES_PER_STAGE *
+                                             (fg::EPILOGUE_PIPELINE_STAGES - 1)>();
             warpgroup::sync(1);
             // this already does the swizzle inside it
             warpgroup::store(C_smem[epilogue_smem_idx], c_reg[i]);
@@ -396,9 +403,17 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             // TODO: check if warpgroup_id == 0 and elect_sync() work for this too
             if (warpgroup::laneid() == 0) {
-                dist::tma::store_async(G.C[G.dev_idx],
-                                       C_smem[epilogue_smem_idx],
-                                       {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
+                // A folded stage stacks the [0, N/2) and [N/2, N) column halves by rows.
+#pragma unroll
+                for (int h = 0; h < fg::C_STORES_PER_STAGE; h++) {
+                    auto& C_half = *reinterpret_cast<typename fg::C_tile*>(
+                        &C_smem[epilogue_smem_idx].data[h * fg::C_tile::num_elements]);
+                    dist::tma::store_async(
+                        G.C[G.dev_idx],
+                        C_half,
+                        {tile_row_idx,
+                         tile_col_idx * fg::C_TILE_DIVISOR + i * fg::C_STORES_PER_STAGE + h});
+                }
             }
 
             epilogue_smem_idx = (epilogue_smem_idx + 1) % fg::EPILOGUE_PIPELINE_STAGES;
@@ -456,8 +471,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
 #pragma unroll
                 for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
-                    tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(
-                        (i + consumer_id * fg::TMEM_PIPELINE_STAGES) * fg::COL_BLOCK);
+                    tmem[i] = typename fg::C_tt_tile(
+                        tm_alloc.template allocate<typename fg::C_epi_tt_tile>(
+                            (i + consumer_id * fg::TMEM_PIPELINE_STAGES) * fg::COL_BLOCK).addr);
                 }
 
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
@@ -521,7 +537,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
         int epilogue_stage_id[fg::CONSUMER_WARPS] = {};
         int epilogue_smem_idx = 0;
-        typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];
+        typename fg::C_epi_tt_tile tmem[fg::NUM_TMEM_SLOTS];
 
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
@@ -530,7 +546,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
 #pragma unroll
         for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
-            tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
+            tmem[i] = tm_alloc.template allocate<typename fg::C_epi_tt_tile>(i * fg::COL_BLOCK);
         }
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
@@ -640,20 +656,30 @@ inline auto select_rs_only_kernel(int num_warps, int lane_bytes) {
                             : select_rs_only_kernel<TILE_ROWS, 32>(num_warps);
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 __global__ __cluster_dims__(
-    fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_CLUSTERS, 1, 1)
+    fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(
-        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>::NUM_THREADS,
+        fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_NUM_EPILOGUE_WARPS,
                                                                         _C_TILE_DIVISOR,
-                                                                        _NUM_CONSUMER_WARPS> G) {
-    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>(G);
+                                                                        _NUM_CONSUMER_WARPS,
+                                                                        _COL_BLOCK,
+                                                                        _CONSUMER_ROWS> G) {
+    gemm_rs_blackwell<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>(G);
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 inline void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G) {
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>& G) {
     cudaStream_t stream = G.stream;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
@@ -667,9 +693,13 @@ inline void initialize_gemm_rs_blackwell_state(
         cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
 }
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 inline void launch_gemm_rs_blackwell(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>& G,
     bool with_exit_barrier) {
     cudaStream_t stream = G.stream;
 
@@ -679,12 +709,12 @@ inline void launch_gemm_rs_blackwell(
     }
 #endif
 
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
+    using fg = fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>;
+    auto this_kernel = fused_kernel_stub<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -714,11 +744,18 @@ inline void launch_gemm_rs_blackwell(
 }
 // Local storage in the existing argument layout. With RS disabled, only C[0]
 // is accessed; multicast addresses and communication counters are unused.
-template <int NUM_CONSUMER_WARPS>
+// The C-tile divisor tracks COL_BLOCK so every variant stores 64-column chunks.
+template <int NUM_CONSUMER_WARPS, int COL_BLOCK, int CONSUMER_ROWS>
+using gemm_only_globals = fused_globals<DEFAULT_NUM_EPILOGUE_WARPS,
+                                        COL_BLOCK / 64,
+                                        NUM_CONSUMER_WARPS,
+                                        COL_BLOCK,
+                                        CONSUMER_ROWS>;
+
+template <int NUM_CONSUMER_WARPS, int COL_BLOCK, int CONSUMER_ROWS>
 inline auto make_gemm_only_globals(
     uint64_t a, uint64_t b, uint64_t c, int M, int N, int K, cudaStream_t stream) {
-    using fg =
-        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
+    using fg = gemm_only_globals<NUM_CONSUMER_WARPS, COL_BLOCK, CONSUMER_ROWS>;
     uint64_t outputs[INTRA_NUM_DEVICES];
     uint64_t unused[INTRA_NUM_DEVICES] = {};
     std::fill_n(outputs, INTRA_NUM_DEVICES, c);
@@ -795,10 +832,9 @@ inline void launch_rs_only(dist::ParallelBuffer& input,
     }
 }
 
-template <int NUM_CONSUMER_WARPS>
+template <int NUM_CONSUMER_WARPS, int COL_BLOCK, int CONSUMER_ROWS>
 inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C) {
-    using fg =
-        fused_globals<DEFAULT_NUM_EPILOGUE_WARPS, DEFAULT_C_TILE_DIVISOR, NUM_CONSUMER_WARPS>;
+    using fg = gemm_only_globals<NUM_CONSUMER_WARPS, COL_BLOCK, CONSUMER_ROWS>;
     TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda(), "A, B, C must be CUDA tensors");
     TORCH_CHECK(A.device() == B.device() && A.device() == C.device(),
                 "A, B, C must be on the same device");
@@ -821,7 +857,7 @@ inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C
                 fg::RED_BLOCK);
     c10::cuda::CUDAGuard device_guard(A.device());
     auto globals =
-        make_gemm_only_globals<NUM_CONSUMER_WARPS>(reinterpret_cast<uint64_t>(A.data_ptr()),
+        make_gemm_only_globals<NUM_CONSUMER_WARPS, COL_BLOCK, CONSUMER_ROWS>(reinterpret_cast<uint64_t>(A.data_ptr()),
                                                    reinterpret_cast<uint64_t>(B.data_ptr()),
                                                    reinterpret_cast<uint64_t>(C.data_ptr()),
                                                    A.size(0),
@@ -831,13 +867,27 @@ inline void launch_gemm_only_variant(at::Tensor& A, at::Tensor& B, at::Tensor& C
     launch_gemm_rs_blackwell(globals, false);
 }
 
-inline void launch_gemm_only(at::Tensor& A, at::Tensor& B, at::Tensor& C, int num_consumer_warps) {
+// consumer_rows is the per-CTA share of the 2-CTA MMA M: 128 (M = 256) or 64 (M = 128).
+inline void launch_gemm_only(at::Tensor& A,
+                             at::Tensor& B,
+                             at::Tensor& C,
+                             int num_consumer_warps,
+                             int col_block,
+                             int consumer_rows) {
     TORCH_CHECK(num_consumer_warps == 1 || num_consumer_warps == 2,
                 "num_consumer_warps must be 1 or 2");
-    if (num_consumer_warps == 1) {
-        launch_gemm_only_variant<1>(A, B, C);
+    TORCH_CHECK(col_block == 256 || (col_block == 128 && num_consumer_warps == 1),
+                "col_block must be 256, or 128 with one consumer warp");
+    TORCH_CHECK(consumer_rows == 128 || (consumer_rows == 64 && col_block == 128),
+                "consumer_rows must be 128, or 64 with col_block 128");
+    if (consumer_rows == 64) {
+        launch_gemm_only_variant<1, 128, 64>(A, B, C);
+    } else if (col_block == 128) {
+        launch_gemm_only_variant<1, 128, 128>(A, B, C);
+    } else if (num_consumer_warps == 1) {
+        launch_gemm_only_variant<1, 256, 128>(A, B, C);
     } else {
-        launch_gemm_only_variant<2>(A, B, C);
+        launch_gemm_only_variant<2, 256, 128>(A, B, C);
     }
 }
 

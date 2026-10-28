@@ -16,6 +16,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("gemm_blackwell_num_consumer_warps") = fg::CONSUMER_WARPS;
     m.attr("gemm_blackwell_cluster_rows") = fg::ROW_BLOCK * fg::NUM_CLUSTERS;
     m.attr("gemm_blackwell_consumer_variants") = pybind11::make_tuple(1, 2);
+    // (num_consumer_warps, col_block, consumer_rows) accepted by gemm_blackwell_launch.
+    m.attr("gemm_blackwell_tile_variants") = pybind11::make_tuple(
+        pybind11::make_tuple(1, 256, 128), pybind11::make_tuple(2, 256, 128),
+        pybind11::make_tuple(1, 128, 128), pybind11::make_tuple(1, 128, 64));
     m.attr("rs_blackwell_blocks") = fg::NUM_BLOCKS;
     m.attr("rs_blackwell_stores_per_batch") = fg::RS_STORES_PER_BATCH;
     m.def(
@@ -33,11 +37,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "ranks finish. Output is a separate compact [M/world_size,N] BF16 tensor.");
     m.def(
         "gemm_blackwell_launch",
-        [](at::Tensor A, at::Tensor B, at::Tensor C, int num_consumer_warps) {
-            gemm_rs_blackwell::launch_gemm_only(A, B, C, num_consumer_warps);
+        [](at::Tensor A, at::Tensor B, at::Tensor C, int num_consumer_warps, int col_block,
+           int consumer_rows) {
+            gemm_rs_blackwell::launch_gemm_only(
+                A, B, C, num_consumer_warps, col_block, consumer_rows);
         },
         pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
         pybind11::arg("num_consumer_warps") = gemm_rs_blackwell::DEFAULT_NUM_CONSUMER_WARPS,
+        pybind11::arg("col_block") = gemm_rs_blackwell::DEFAULT_COL_BLOCK,
+        pybind11::arg("consumer_rows") = gemm_rs_blackwell::DEFAULT_CONSUMER_ROWS,
         "Single-GPU GEMM benchmark: C = A @ B.T. Requires RS disabled in the "
         "kernel source. Uses ordinary BF16 tensors, no exit barrier or PDL overlap.");
     m.def(

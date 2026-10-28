@@ -41,6 +41,8 @@ static_assert(DEFAULT_NUM_CONSUMER_WARPS == 1 || DEFAULT_NUM_CONSUMER_WARPS == 2
               "NUM_CONSUMER_WARPS must be 1 or 2");
 static constexpr int DEFAULT_NUM_EPILOGUE_WARPS = 1;
 static constexpr int DEFAULT_C_TILE_DIVISOR = 4;
+static constexpr int DEFAULT_COL_BLOCK = 256;
+static constexpr int DEFAULT_CONSUMER_ROWS = 128;
 
 // One persistent 32-bit word on each rank; no multicast allocation is needed.
 // Only the owning rank writes its completed epoch. Peers acquire-load it.
@@ -48,22 +50,38 @@ using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
 using completion_epoch_dist_tensor =
     dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS,
+          int _COL_BLOCK = DEFAULT_COL_BLOCK,
+          int _CONSUMER_ROWS = DEFAULT_CONSUMER_ROWS>
 struct fused_globals;
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
-void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G,
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
+void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>& G,
                               bool with_exit_barrier = true);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
 // ranks before the first launch. Keep the same tile layout and serialize launches
 // on G.stream; both allocations must remain alive across all graph replays.
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS>& G);
+    const fused_globals<_NUM_EPILOGUE_WARPS, _C_TILE_DIVISOR, _NUM_CONSUMER_WARPS, _COL_BLOCK, _CONSUMER_ROWS>& G);
 
-template <int _NUM_EPILOGUE_WARPS, int _C_TILE_DIVISOR, int _NUM_CONSUMER_WARPS>
+template <int _NUM_EPILOGUE_WARPS,
+          int _C_TILE_DIVISOR,
+          int _NUM_CONSUMER_WARPS,
+          int _COL_BLOCK,
+          int _CONSUMER_ROWS>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -104,9 +122,21 @@ struct fused_globals {
                   "Decreased register counts must not exceed the launch allocation");
     static constexpr int NUM_CLUSTERS = DEFAULT_NUM_CTA;
 
-    // Preserve the 128-row MMA tile per consumer; fewer consumers shrink the CTA tile.
-    static constexpr int ROW_BLOCK = 128 * CONSUMER_WARPS;
-    static constexpr int COL_BLOCK = 256;
+    // Rows of the 2-CTA MMA tile per consumer per CTA: 128 (MMA M = 256) or 64
+    // (MMA M = 128). Fewer consumers shrink the CTA tile.
+    static constexpr int CONSUMER_ROWS = _CONSUMER_ROWS;
+    static constexpr int ROW_BLOCK = CONSUMER_ROWS * CONSUMER_WARPS;
+    // 2-CTA MMA N; each CTA loads half of B. 128 halves the per-CTA output tile width.
+    static constexpr int COL_BLOCK = _COL_BLOCK;
+    static_assert(COL_BLOCK == 128 || COL_BLOCK == 256, "COL_BLOCK must be 128 or 256");
+    // MMA M = 128 leaves each CTA a 64-row accumulator folded across all 128 TMEM
+    // lanes: lanes 0-63 hold columns [0, N/2), lanes 64-127 hold [N/2, N). The
+    // epilogue reads it as a 128 x N/2 tile and stores each half as its own C_tile.
+    static constexpr bool FOLDED_ACCUMULATOR = CONSUMER_ROWS == 64;
+    static_assert(CONSUMER_ROWS == 128 ||
+                      (FOLDED_ACCUMULATOR && CONSUMER_WARPS == 1 && COL_BLOCK == 128 &&
+                       _C_TILE_DIVISOR == 2),
+                  "64 consumer rows are only implemented for 1 consumer, 128 cols, divisor 2");
     static constexpr int RED_BLOCK = 64;
 
     // Keep 16 wide-store results live: 128 packed 32-bit registers per RS lane.
@@ -128,13 +158,22 @@ struct fused_globals {
     using A_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, RED_BLOCK>;  // [M, K]
     using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;    // [N, K]
 
-    using C_tt_tile = kittens::tt<float, ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK>;  // [M, N]
+    using C_tt_tile = kittens::tt<float, ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK>;  // [M, N], MMA view
+    // Epilogue view of the same TMEM columns.
+    using C_epi_tt_tile = std::conditional_t<FOLDED_ACCUMULATOR,
+                                             kittens::tt<float, 128, COL_BLOCK / 2>,
+                                             C_tt_tile>;
     using C_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, COL_BLOCK / C_TILE_DIVISOR>;
+    // One epilogue SMEM stage: a folded stage holds both C_tile halves, rows stacked.
+    using C_stage_tile = std::conditional_t<FOLDED_ACCUMULATOR,
+                                            kittens::st_bf<2 * C_tile::rows, C_tile::cols>,
+                                            C_tile>;
+    static constexpr int C_STORES_PER_STAGE = sizeof(C_stage_tile) / sizeof(C_tile);
 
     static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY =
         (sizeof(A_tile) * CONSUMER_WARPS + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
-        sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
+        sizeof(C_stage_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
     static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;

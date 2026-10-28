@@ -15,10 +15,22 @@ replay of --graph-size back-to-back GEMMs (no warmup by default) and reports the
 per-GEMM average, so every kernel starts from the same thermal/clock state.
 Compare against a separate full GEMM+RS run at matching local dimensions to
 assess GEMM's contribution; overlap means the times are not additive.
-Both consumer counts are compiled into one extension and benchmarked by default.
-Use --consumer-warps 1 or --consumer-warps 2 to select just one. Each consumer
-handles 128 rows per CTA: cluster tiles are 256 or 512 rows, respectively.
-Both use one accumulator stage per consumer.
+All tile variants are compiled into one extension. --variants names each by its
+2-SM (cluster) output tile: 256x256, 512x256 (two consumers), 256x128, or 128x128
+(default: 256x256 512x256 128x128). 128x128 uses the M = 128 2-CTA MMA, so each
+CTA computes 64x128; the others give each CTA 128 rows per consumer. All use one
+accumulator stage per consumer.
+
+Tiles 128 columns wide (mKernel 256x128/128x128, CUTLASS mma Mx128) only run for
+M <= --small-tile-max-m (default 4096); 256-wide tiles run at every shape.
+
+Pass --cutlass-dir (or set CUTLASS_LOCAL_DIR) to also time CuTeDSL's
+distributed_gemm_reduce_scatter_blackwell.py as a plain GEMM: single-process with
+reduce_scatter="none", which compiles out the comm warps and flags. It runs 2-SM
+configs on a 2x1 cluster (the MMA pair, like mKernel): mma 256x256 at every shape, and for small M mma
+128x128 (128x128 per cluster, 64x128 per CTA, like mKernel's 128x128) and mma
+256x128 (128x128 per CTA). Both raster orders, with swizzle fixed at
+--cutlass-swizzle (default 8). Each config compiles once per shape.
 
 Pass --tk-dir (or set TK_GEMM_RS_DIR) to also time ThunderKittens' GEMM-only
 gemm_rs_b200 build (its _C*.so, built with ARCH=SM103 make). It writes to a
@@ -79,7 +91,94 @@ def load_tk(tk_dir):
     return tk
 
 
-def benchmark_shape(module, tk, m, n, k, args):
+CUTLASS_KERNEL = ("examples/python/CuTeDSL/cute/blackwell/kernel/distributed/"
+                  "distributed_gemm_reduce_scatter_blackwell.py")
+# (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_order): 2-SM benchmark_all
+# candidates. mma 256x256 is the full GEMM+RS bench's tile; the 128-wide ones are
+# the 128x128 MMA tile and mma 256x128, whose CTA tile (mma M / 2, mma N) is 128x128.
+CUTLASS_CONFIGS = [
+    (True, mma, cluster, raster)
+    for mma in ((256, 256), (128, 128), (256, 128))
+    for cluster in ((2, 1),)
+    for raster in ("m", "n")
+]
+
+# 2-SM output tile -> (num_consumer_warps, col_block, consumer_rows) for gemm_blackwell_launch.
+MKERNEL_VARIANTS = {
+    "256x256": (1, 256, 128),
+    "512x256": (2, 256, 128),
+    "256x128": (1, 128, 128),
+    "128x128": (1, 128, 64),
+}
+
+
+def runs_at(m, tile_n, args):
+    """128-wide tiles are only benchmarked for small M."""
+    return tile_n != 128 or m <= args.small_tile_max_m
+
+
+class CutlassGemms:
+    def __init__(self, cutlass_dir, swizzle):
+        path = Path(cutlass_dir) / CUTLASS_KERNEL
+        if not path.exists():
+            raise RuntimeError(f"{path} does not exist")
+        spec = importlib.util.spec_from_file_location("cutlass_local_gemm_rs", path)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.swizzle = swizzle
+
+    @staticmethod
+    def name(config):
+        use_2cta, mma, cluster, raster = config
+        return (f"CUTLASS[{'2sm' if use_2cta else '1sm'} mma{mma[0]}x{mma[1]} "
+                f"cluster{cluster[0]}x{cluster[1]} raster-{raster}]")
+
+    def launches(self, a, b, c, configs):
+        """Compile each config for these tensors; return ({name: launch}, {name: skip reason})."""
+        mod = self.mod
+        cutlass, cute, utils, cuda = mod.cutlass, mod.cute, mod.utils, mod.cuda
+        m, k = a.shape
+        n = b.shape[0]
+
+        def view(t):
+            # (rows, cols) row-major -> CuTe (rows, cols, L=1) with the batch stride outermost.
+            return mod.from_dlpack(t.unsqueeze(0).permute(1, 2, 0), assumed_align=16) \
+                .mark_layout_dynamic(leading_dim=1)
+
+        flags = torch.zeros((m // 64) * (n // 64) + 160, dtype=torch.int32, device=a.device)
+        flag = mod.from_dlpack(flags, assumed_align=16)
+        flag.element_type = cutlass.Int32
+        flag = flag.mark_layout_dynamic()
+        tensors = dict(a=view(a), b=view(b), c=view(c),
+                       # Unused by the GEMM-only kernel, but part of its signature.
+                       comm_in_multicast_tensor=view(c), comm_out_unicast_tensor=view(c),
+                       barrier_flag_unicast=flag, barrier_flag_multicast=flag,
+                       barrier_flag_unicast_per_peer=(flag,))
+        launches, skipped = {}, {}
+        for config in configs:
+            use_2cta, mma, cluster, raster = config
+            gemm = mod.Sm100PersistentDenseGemmReduceScatterLDMCKernel(
+                cutlass.Float32, cutlass.BFloat16, use_2cta, mma, cluster, True,
+                rank_id=0, num_ranks=1, reduce_scatter="none",
+                swizzle_size=self.swizzle, raster_order=raster)
+            try:
+                gemm.can_implement((m, n, k, 1), cutlass.BFloat16, cutlass.BFloat16, "k", "k", "n")
+            except mod.testing.CantImplementError as exc:
+                skipped[self.name(config)] = str(exc)
+                continue
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            compiled = cute.compile(
+                gemm, **tensors, stream=stream,
+                max_active_clusters=utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1]))
+
+            def launch(compiled=compiled):
+                compiled(**tensors, stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+            launches[self.name(config)] = launch
+        self.flags = flags  # the compiled launches reference this buffer
+        return launches, skipped
+
+
+def benchmark_shape(module, tk, cutlass_gemms, m, n, k, args):
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / k**0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / k**0.25
     b_transposed = b.T
@@ -91,11 +190,15 @@ def benchmark_shape(module, tk, m, n, k, args):
 
     launches = {"cuBLAS": cublas}
     outputs = {}
-    for consumers in args.consumer_warps:
-        def mkernel(consumers=consumers):
-            module.gemm_blackwell_launch(a, b, output, num_consumer_warps=consumers)
-        launches[f"mKernel[{consumers}]"] = mkernel
-        outputs[f"mKernel[{consumers}]"] = output
+    variants = [v for v in args.variants if runs_at(m, MKERNEL_VARIANTS[v][1], args)]
+    for variant in variants:
+        consumers, cols, rows = MKERNEL_VARIANTS[variant]
+
+        def mkernel(consumers=consumers, cols=cols, rows=rows):
+            module.gemm_blackwell_launch(a, b, output, num_consumer_warps=consumers,
+                                         col_block=cols, consumer_rows=rows)
+        launches[f"mKernel[{variant}]"] = mkernel
+        outputs[f"mKernel[{variant}]"] = output
     if tk is not None:
         # Keep the TKParallelTensor alive: c_tk.data_ aliases its VMM allocation.
         c_tk = tk.TKParallelTensor((m, n), dtype=torch.bfloat16, local_rank=torch.cuda.current_device(),
@@ -105,6 +208,13 @@ def benchmark_shape(module, tk, m, n, k, args):
             tk.gemm_only(a, b, c_tk, args.tk_dev_idx)
         launches["TK"] = thunderkittens
         outputs["TK"] = c_tk.data_
+    if cutlass_gemms is not None:
+        configs = [c for c in CUTLASS_CONFIGS if runs_at(m, c[1][1], args)]
+        cutlass_launches, cutlass_skipped = cutlass_gemms.launches(a, b, output, configs)
+        for name, reason in cutlass_skipped.items():
+            print(f"  skipping {name}: {reason}", flush=True)
+        launches.update(cutlass_launches)
+        outputs.update(dict.fromkeys(cutlass_launches, output))
 
     def check(name):
         try:
@@ -145,10 +255,12 @@ def benchmark_shape(module, tk, m, n, k, args):
             f"cuBLAS={cu * 1000:9.2f} us ({flops / (cu * 1e9):7.2f} TF/s)",
             flush=True,
         )
-        for consumers in args.consumer_warps:
-            mk = statistics.median(samples[f"mKernel[{consumers}]"])
+        for variant in variants:
+            consumers, cols, rows = MKERNEL_VARIANTS[variant]
+            mk = statistics.median(samples[f"mKernel[{variant}]"])
             print(
-                f"  consumers={consumers} tile={256 * consumers}x256  "
+                f"  mKernel 2sm tile={variant} (CTA {consumers * rows}x{cols}, "
+                f"{consumers} consumer{'s' if consumers > 1 else ''})  "
                 f"mKernel={mk * 1000:9.2f} us ({flops / (mk * 1e9):7.2f} TF/s)  "
                 f"{100 * cu / mk:.1f}% of cuBLAS throughput",
                 flush=True,
@@ -161,6 +273,14 @@ def benchmark_shape(module, tk, m, n, k, args):
                 f"{100 * cu / tk_ms:.1f}% of cuBLAS throughput",
                 flush=True,
             )
+        for name in samples:
+            if name.startswith("CUTLASS["):
+                ct = statistics.median(samples[name])
+                print(
+                    f"  {name}  {ct * 1000:9.2f} us ({flops / (ct * 1e9):7.2f} TF/s)  "
+                    f"{100 * cu / ct:.1f}% of cuBLAS throughput",
+                    flush=True,
+                )
     finally:
         torch.cuda.synchronize()
         graphs.clear()
@@ -173,9 +293,16 @@ def main():
     parser.add_argument("--k", type=int, help="Local GEMM K; default: 12288 / --emulated-world-size")
     parser.add_argument("--emulated-world-size", type=int, default=8,
                         help="Select default local K; does not launch multiple processes")
-    parser.add_argument("--consumer-warps", nargs="+", type=int, choices=(1, 2), default=[1, 2],
-                        help="Consumer counts to benchmark in this run (default: 1 2)")
+    parser.add_argument("--variants", nargs="+", choices=tuple(MKERNEL_VARIANTS),
+                        default=["256x256", "512x256", "128x128"],
+                        help="mKernel 2-SM output tiles to benchmark (default: 256x256 512x256 128x128)")
+    parser.add_argument("--small-tile-max-m", type=int, default=4096,
+                        help="Largest M at which 128-wide tiles run (default: 4096)")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--cutlass-dir", default=os.environ.get("CUTLASS_LOCAL_DIR"),
+                        help="CUTLASS checkout holding the CuTeDSL GEMM+RS example (default: $CUTLASS_LOCAL_DIR)")
+    parser.add_argument("--cutlass-swizzle", type=int, default=8, choices=(1, 2, 4, 8),
+                        help="Tile-scheduler swizzle size for every CUTLASS config (default: 8)")
     parser.add_argument("--tk-dir", default=os.environ.get("TK_GEMM_RS_DIR"),
                         help="ThunderKittens gemm_rs dir holding the GEMM-only _C*.so (default: $TK_GEMM_RS_DIR)")
     parser.add_argument("--tk-dev-idx", type=int, default=0, choices=range(8),
@@ -187,7 +314,7 @@ def main():
     parser.add_argument("--rest", type=float, default=5.0,
                         help="Idle seconds before each timed sample (default: 5)")
     args = parser.parse_args()
-    args.consumer_warps = list(dict.fromkeys(args.consumer_warps))
+    args.variants = list(dict.fromkeys(args.variants))
     try:
         shapes = [int(value) for value in args.shapes.split(",")]
     except ValueError:
@@ -195,7 +322,7 @@ def main():
     if args.emulated_world_size <= 0 or 12288 % args.emulated_world_size:
         parser.error("--emulated-world-size must be a positive divisor of 12288")
     k = 12288 // args.emulated_world_size if args.k is None else args.k
-    cluster_rows = 256 * max(args.consumer_warps)
+    cluster_rows = max(int(variant.split("x")[0]) for variant in args.variants)
     if args.tk_dir:
         cluster_rows = max(cluster_rows, 512)
         if k < 256:
@@ -216,24 +343,28 @@ def main():
     if torch.cuda.get_device_capability()[0] != 10:
         parser.error("This benchmark requires a Blackwell GPU")
     module = load_module.load("gemm_rs_blackwell")
-    if not hasattr(module, "gemm_blackwell_consumer_variants"):
+    if not hasattr(module, "gemm_blackwell_tile_variants"):
         parser.error("Rebuild with: make GPU=blackwell INTRA_NUM_DEVICES=2 gemm-rs-blackwell")
     tk = load_tk(args.tk_dir) if args.tk_dir else None
+    cutlass_gemms = CutlassGemms(args.cutlass_dir, args.cutlass_swizzle) if args.cutlass_dir else None
     # https://docs.pytorch.org/docs/stable/backends.html#torch.backends.cuda.preferred_blas_library
     torch.backends.cuda.preferred_blas_library("cublas")
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(42)
     print(
         f"{torch.cuda.get_device_name()}; device {args.device}; BF16, FP32 accumulation\n"
-        f"Consumer variants: {args.consumer_warps}\n"
+        f"mKernel 2-SM tiles: {args.variants}\n"
         f"ThunderKittens: {args.tk_dir or 'off'}\n"
+        f"CUTLASS: {args.cutlass_dir or 'off'}"
+        f"{f' (swizzle {args.cutlass_swizzle})' if args.cutlass_dir else ''}\n"
+        f"128-wide tiles only for M <= {args.small_tile_max_m}\n"
         f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples, "
         f"{args.rest:g} s rest before each.\n"
         "mKernel throughput: 100% matches cuBLAS; higher is faster. Correctness checked before timing.",
         flush=True,
     )
     for m in shapes:
-        benchmark_shape(module, tk, m, args.n, k, args)
+        benchmark_shape(module, tk, cutlass_gemms, m, args.n, k, args)
 
 
 if __name__ == "__main__":
