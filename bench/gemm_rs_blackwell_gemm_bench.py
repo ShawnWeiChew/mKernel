@@ -100,7 +100,7 @@ CUTLASS_CONFIGS = [
     (True, mma, cluster, raster)
     for mma in ((256, 256), (128, 128), (256, 128))
     for cluster in ((2, 1),)
-    for raster in ("m", "n")
+    for raster in ("m")
 ]
 
 # 2-SM output tile -> (num_consumer_warps, col_block, consumer_rows) for gemm_blackwell_launch.
