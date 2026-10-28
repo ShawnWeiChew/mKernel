@@ -10,8 +10,9 @@ GEMM dimension. By default K=12288/8=1536; use --emulated-world-size 2 for
 K=6144, or --k to specify it directly. The emulated size only selects K.
 Requires the RS body/signals to remain disabled in src/gemm_rs_blackwell.cu.
 Reports warm-cache CUDA graph timings, excluding allocation and the exit barrier.
-Samples run in a fixed order, each after --rest idle seconds, so every kernel
-starts from the same thermal/clock state.
+Samples run in a fixed order. Each sample rests --rest seconds, then times one
+replay of --graph-size back-to-back GEMMs (no warmup by default) and reports the
+per-GEMM average, so every kernel starts from the same thermal/clock state.
 Compare against a separate full GEMM+RS run at matching local dimensions to
 assess GEMM's contribution; overlap means the times are not additive.
 Both consumer counts are compiled into one extension and benchmarked by default.
@@ -179,8 +180,8 @@ def main():
                         help="ThunderKittens gemm_rs dir holding the GEMM-only _C*.so (default: $TK_GEMM_RS_DIR)")
     parser.add_argument("--tk-dev-idx", type=int, default=0, choices=range(8),
                         help="Rank whose TK tile rotation to emulate (default: 0)")
-    parser.add_argument("--warmup", type=int, default=5, help="Warmup graph replays per sample")
-    parser.add_argument("--iters", type=int, default=20, help="Timed graph replays per sample")
+    parser.add_argument("--warmup", type=int, default=0, help="Untimed graph replays after each rest")
+    parser.add_argument("--iters", type=int, default=1, help="Timed graph replays per sample")
     parser.add_argument("--graph-size", type=int, default=20, help="GEMMs per graph replay")
     parser.add_argument("--repeats", type=int, default=5, help="Number of samples for median timing")
     parser.add_argument("--rest", type=float, default=5.0,
