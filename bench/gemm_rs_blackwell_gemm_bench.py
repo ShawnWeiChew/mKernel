@@ -16,9 +16,17 @@ Both consumer counts are compiled into one extension and benchmarked by default.
 Use --consumer-warps 1 or --consumer-warps 2 to select just one. Each consumer
 handles 128 rows per CTA: cluster tiles are 256 or 512 rows, respectively.
 Both use one accumulator stage per consumer.
+
+Pass --tk-dir (or set TK_GEMM_RS_DIR) to also time ThunderKittens' GEMM-only
+gemm_rs_b200 build (its _C*.so, built with ARCH=SM103 make). It writes to a
+single-process (M, N) TKParallelTensor; --tk-dev-idx picks which rank's tile
+rotation to emulate. TK requires CUDA device 0, so for the second GPU use
+CUDA_VISIBLE_DEVICES=1 instead of --device 1.
 """
 
 import argparse
+import importlib.util
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -56,7 +64,19 @@ def time_graph(graph, args):
     return start.elapsed_time(end) / (args.iters * args.graph_size)
 
 
-def benchmark_shape(module, m, n, k, args):
+def load_tk(tk_dir):
+    candidates = sorted(Path(tk_dir).glob("_C*.so"), key=lambda p: p.stat().st_mtime_ns)
+    if not candidates:
+        raise RuntimeError(f"No _C*.so in {tk_dir}; run `ARCH=SM103 make` there first")
+    spec = importlib.util.spec_from_file_location("_C", candidates[-1])
+    tk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tk)
+    if not hasattr(tk, "gemm_only"):
+        raise RuntimeError(f"{candidates[-1]} lacks gemm_only; rebuild the TK GEMM-only checkout")
+    return tk
+
+
+def benchmark_shape(module, tk, m, n, k, args):
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / k**0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / k**0.25
     b_transposed = b.T
@@ -67,21 +87,32 @@ def benchmark_shape(module, m, n, k, args):
         torch.mm(a, b_transposed, out=reference)
 
     launches = {"cuBLAS": cublas}
+    outputs = {}
     for consumers in args.consumer_warps:
         def mkernel(consumers=consumers):
             module.gemm_blackwell_launch(a, b, output, num_consumer_warps=consumers)
         launches[f"mKernel[{consumers}]"] = mkernel
+        outputs[f"mKernel[{consumers}]"] = output
+    if tk is not None:
+        # Keep the TKParallelTensor alive: c_tk.data_ aliases its VMM allocation.
+        c_tk = tk.TKParallelTensor((m, n), dtype=torch.bfloat16, local_rank=torch.cuda.current_device(),
+                                   local_world_size=1, multicast=False)
+
+        def thunderkittens():
+            tk.gemm_only(a, b, c_tk, args.tk_dev_idx)
+        launches["TK"] = thunderkittens
+        outputs["TK"] = c_tk.data_
 
     def check(name):
         try:
-            torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(outputs[name], reference, rtol=2e-2, atol=2e-2)
         except AssertionError as exc:
             raise AssertionError(f"{name}: {exc}") from exc
 
     cublas()
     for name, launch in launches.items():
         if name != "cuBLAS":
-            output.fill_(float("nan"))
+            outputs[name].fill_(float("nan"))
             launch()
             check(name)
     graphs = {}
@@ -94,7 +125,7 @@ def benchmark_shape(module, m, n, k, args):
             graphs["cuBLAS"].replay()
             for name, graph in graphs.items():
                 if name != "cuBLAS":
-                    output.fill_(float("nan"))
+                    outputs[name].fill_(float("nan"))
                     graph.replay()
                     check(name)
 
@@ -120,6 +151,14 @@ def benchmark_shape(module, m, n, k, args):
                 f"{100 * cu / mk:.1f}% of cuBLAS throughput",
                 flush=True,
             )
+        if tk is not None:
+            tk_ms = statistics.median(samples["TK"])
+            print(
+                f"  ThunderKittens tile=512x256  "
+                f"TK={tk_ms * 1000:9.2f} us ({flops / (tk_ms * 1e9):7.2f} TF/s)  "
+                f"{100 * cu / tk_ms:.1f}% of cuBLAS throughput",
+                flush=True,
+            )
     finally:
         torch.cuda.synchronize()
         graphs.clear()
@@ -135,6 +174,10 @@ def main():
     parser.add_argument("--consumer-warps", nargs="+", type=int, choices=(1, 2), default=[1, 2],
                         help="Consumer counts to benchmark in this run (default: 1 2)")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--tk-dir", default=os.environ.get("TK_GEMM_RS_DIR"),
+                        help="ThunderKittens gemm_rs dir holding the GEMM-only _C*.so (default: $TK_GEMM_RS_DIR)")
+    parser.add_argument("--tk-dev-idx", type=int, default=0, choices=range(8),
+                        help="Rank whose TK tile rotation to emulate (default: 0)")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup graph replays per sample")
     parser.add_argument("--iters", type=int, default=20, help="Timed graph replays per sample")
     parser.add_argument("--graph-size", type=int, default=20, help="GEMMs per graph replay")
@@ -149,6 +192,10 @@ def main():
         parser.error("--emulated-world-size must be a positive divisor of 12288")
     k = 12288 // args.emulated_world_size if args.k is None else args.k
     cluster_rows = 256 * max(args.consumer_warps)
+    if args.tk_dir:
+        cluster_rows = max(cluster_rows, 512)
+        if k < 256:
+            parser.error("TK requires K >= 256")
     if any(m <= 0 or m % cluster_rows for m in shapes):
         parser.error(f"Selected variants require M to be a positive multiple of {cluster_rows}")
     if args.n <= 0 or args.n % 256 or k <= 0 or k % 64:
@@ -159,12 +206,15 @@ def main():
         parser.error("CUDA is required")
     if not 0 <= args.device < torch.cuda.device_count():
         parser.error("--device must select a visible CUDA device")
+    if args.tk_dir and args.device != 0:
+        parser.error("TK requires CUDA device 0; use CUDA_VISIBLE_DEVICES to pick the GPU")
     torch.cuda.set_device(args.device)
     if torch.cuda.get_device_capability()[0] != 10:
         parser.error("This benchmark requires a Blackwell GPU")
     module = load_module.load("gemm_rs_blackwell")
     if not hasattr(module, "gemm_blackwell_consumer_variants"):
         parser.error("Rebuild with: make GPU=blackwell INTRA_NUM_DEVICES=2 gemm-rs-blackwell")
+    tk = load_tk(args.tk_dir) if args.tk_dir else None
     # https://docs.pytorch.org/docs/stable/backends.html#torch.backends.cuda.preferred_blas_library
     torch.backends.cuda.preferred_blas_library("cublas")
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
@@ -172,12 +222,13 @@ def main():
     print(
         f"{torch.cuda.get_device_name()}; device {args.device}; BF16, FP32 accumulation\n"
         f"Consumer variants: {args.consumer_warps}\n"
+        f"ThunderKittens: {args.tk_dir or 'off'}\n"
         f"GEMM only; {args.graph_size} GEMMs/graph; median of {args.repeats} samples.\n"
         "mKernel throughput: 100% matches cuBLAS; higher is faster. Correctness checked before timing.",
         flush=True,
     )
     for m in shapes:
-        benchmark_shape(module, m, args.n, k, args)
+        benchmark_shape(module, tk, m, args.n, k, args)
 
 
 if __name__ == "__main__":
