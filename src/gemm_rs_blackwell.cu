@@ -296,7 +296,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         const uint32_t timing_payload = timing_profile::pack_payload(warp_id, tile_id);
         timing_profile::emit(G.timings, &timing_head, EV_MMA_TILE_BEGIN, timing_payload);
 #endif
-        wait(epilogue_tmem_finished[consumer_id], (phasebits >> consumer_semaphore_idx) & 0b1);
+        // One handoff barrier pair per TMEM slot; the phase bit flips once per lap.
+        const int tmem_slot_idx = consumer_id * fg::TMEM_PIPELINE_STAGES + epilogue_stage_id;
+        wait(epilogue_tmem_finished[tmem_slot_idx], (phasebits >> consumer_semaphore_idx) & 0b1);
 #ifdef PROFILE_TIMINGS
         timing_profile::emit(G.timings, &timing_head, EV_MMA_TMEM_FREE, timing_payload);
 #endif
@@ -326,7 +328,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
             }
         }
 
-        kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[consumer_id]);
+        kittens::detail::tcgen05::commit<fg::NUM_CLUSTERS>(epilogue_ready[tmem_slot_idx]);
 #ifdef PROFILE_TIMINGS
         timing_profile::emit(G.timings, &timing_head, EV_MMA_COMMITTED, timing_payload);
 #endif
@@ -390,7 +392,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
             }
         };
 
-        wait(epilogue_ready[consumer_id], (phasebits >> epilogue_semaphore_idx) & 0b1);
+        const int tmem_slot_idx = consumer_id * fg::TMEM_PIPELINE_STAGES + epilogue_stage_id;
+        wait(epilogue_ready[tmem_slot_idx], (phasebits >> epilogue_semaphore_idx) & 0b1);
 #ifdef PROFILE_TIMINGS
         if (timing_leader) {
             timing_profile::emit(G.timings, &timing_head, EV_EPI_MMA_DONE, timing_payload);
@@ -412,7 +415,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         }
 #endif
         if (elect_warp_leader()) {
-            tma::cluster::arrive(epilogue_tmem_finished[consumer_id], 0);
+            tma::cluster::arrive(epilogue_tmem_finished[tmem_slot_idx], 0);
         }
 
         if (is_last_tile && consumer_id == 0) {

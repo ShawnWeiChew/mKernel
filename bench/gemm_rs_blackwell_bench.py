@@ -47,7 +47,7 @@ class BlackwellBenchConfig:
     mkernel_rs_strip_rows = [8, 16, 32]
     # MMA warps per CTA, keyed by M: 1 halves the cluster tile to 256 rows. It only
     # supports 1 or 2 signals per tile.
-    mkernel_mma_warps = {2048: [1, 2]}
+    mkernel_mma_warps = {2048: [1, 2], 4096: [1, 2]}
     mkernel_default_mma_warps = [2]
 
     def mkernel_candidates(self, M: int):
