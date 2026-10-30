@@ -46,8 +46,9 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
     )
 
     # Warm up without the ring: every launch would restart each CTA's head at 0.
+    candidate = (args.swizzle, args.signals_per_tile, args.rs_strip_rows)
     for _ in range(args.warmup):
-        run_mkernel(module, buffers)
+        run_mkernel(module, buffers, candidate)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -55,14 +56,15 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
     # of unrecorded launches with no host sync, so the recorded launch starts when
     # the previous one drains on its own GPU, and the RS tail couples those ends.
     for _ in range(args.lead_in):
-        run_mkernel(module, buffers)
+        run_mkernel(module, buffers, candidate)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.ready_mkernel, buffers.epochs_mkernel, timings=ring,
+        buffers.ready_mkernel, buffers.epochs_mkernel, swizzle_size=args.swizzle,
+        signals_per_tile=args.signals_per_tile, rs_strip_rows=args.rs_strip_rows, timings=ring,
     )
     end.record()
     end.synchronize()
@@ -130,6 +132,12 @@ def main():
     parser.add_argument(
         "--ranks", default="0", help="Comma-separated ranks that dump a trace, or 'all'",
     )
+    parser.add_argument("--swizzle", type=int, default=4, choices=(1, 2, 4, 8))
+    parser.add_argument(
+        "--signals-per-tile", type=int, default=1, choices=(1, 2, 4),
+        help="Ready-counter publications per 256x256 tile",
+    )
+    parser.add_argument("--rs-strip-rows", type=int, default=16, choices=(16, 32))
     parser.add_argument("--out-dir", default=str(HERE.parent / "traces"))
     parser.add_argument("--no-render", action="store_true", help="Write the .npz only")
     args = parser.parse_args()
