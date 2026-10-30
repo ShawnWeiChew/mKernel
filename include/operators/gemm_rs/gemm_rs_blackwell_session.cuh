@@ -22,7 +22,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                     gemm_rs_blackwell::DEFAULT_C_TILE_DIVISOR,
                                                     gemm_rs_blackwell::DEFAULT_SWIZZLE_SIZE,
                                                     gemm_rs_blackwell::DEFAULT_SIGNALS_PER_TILE,
-                                                    gemm_rs_blackwell::DEFAULT_RS_STRIP_ROWS>;
+                                                    gemm_rs_blackwell::DEFAULT_RS_STRIP_ROWS,
+                                                    gemm_rs_blackwell::DEFAULT_NUM_CONSUMER_WARPS>;
         m.attr("gemm_rs_blackwell_ready_rows") = fg::READY_ROWS;
         m.attr("gemm_rs_blackwell_ready_cols") = fg::READY_COLS;
     }
@@ -48,7 +49,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                     DEFAULT_C_TILE_DIVISOR,
                                                     DEFAULT_SWIZZLE_SIZE,
                                                     DEFAULT_SIGNALS_PER_TILE,
-                                                    DEFAULT_RS_STRIP_ROWS>::NUM_BLOCKS;
+                                                    DEFAULT_RS_STRIP_ROWS,
+                                                    DEFAULT_NUM_CONSUMER_WARPS>::NUM_BLOCKS;
     m.def(
         "gemm_rs_blackwell_launch",
         [](at::Tensor A,
@@ -59,6 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            int swizzle_size,
            int signals_per_tile,
            int rs_strip_rows,
+           int mma_warps,
            std::optional<at::Tensor> timings) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             TimingRecord* timing_records = nullptr;
@@ -86,6 +89,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                       swizzle_size,
                                       signals_per_tile,
                                       rs_strip_rows,
+                                      mma_warps,
                                       timing_records);
         },
         pybind11::arg("A"),
@@ -96,6 +100,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("swizzle_size") = DEFAULT_SWIZZLE_SIZE,
         pybind11::arg("signals_per_tile") = DEFAULT_SIGNALS_PER_TILE,
         pybind11::arg("rs_strip_rows") = DEFAULT_RS_STRIP_ROWS,
+        pybind11::arg("mma_warps") = DEFAULT_NUM_CONSUMER_WARPS,
         pybind11::arg("timings") = pybind11::none(),
         "Profile build of gemm_rs_blackwell_launch. Pass a zeroed int64 tensor of "
         "TIMING_NUM_BLOCKS * EVENTS_PER_BLOCK * 2 elements to record one launch.");
@@ -119,10 +124,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            dist::ParallelBuffer& completion_epochs,
            int swizzle_size,
            int signals_per_tile,
-           int rs_strip_rows) {
+           int rs_strip_rows,
+           int mma_warps) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
-            gemm_rs_blackwell::launch(
-                A, B, C, ready, completion_epochs, swizzle_size, signals_per_tile, rs_strip_rows);
+            gemm_rs_blackwell::launch(A,
+                                      B,
+                                      C,
+                                      ready,
+                                      completion_epochs,
+                                      swizzle_size,
+                                      signals_per_tile,
+                                      rs_strip_rows,
+                                      mma_warps);
         },
         pybind11::arg("A"),
         pybind11::arg("B"),
@@ -132,12 +145,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("swizzle_size") = gemm_rs_blackwell::DEFAULT_SWIZZLE_SIZE,
         pybind11::arg("signals_per_tile") = gemm_rs_blackwell::DEFAULT_SIGNALS_PER_TILE,
         pybind11::arg("rs_strip_rows") = gemm_rs_blackwell::DEFAULT_RS_STRIP_ROWS,
+        pybind11::arg("mma_warps") = gemm_rs_blackwell::DEFAULT_NUM_CONSUMER_WARPS,
         "Launch GEMM+RS and the exit barrier on the current stream. The result is "
         "C.data_[rank * M/world_size : (rank+1) * M/world_size]. Keep all buffers "
         "alive and serialize launches; graph replays advance the device epoch. "
         "swizzle_size (1, 2, 4, or 8) is the tile-column width of each rasterization "
         "supergroup. signals_per_tile (1, 2, or 4) is how many ready-counter "
-        "publications each 256x256 tile is split into; rs_strip_rows (8, 16, or 32) is the "
-        "height of each reduce-scatter strip.");
+        "publications each tile is split into; rs_strip_rows (8, 16, or 32) is the "
+        "height of each reduce-scatter strip. mma_warps (1 or 2) is the MMA warps per "
+        "CTA, giving 256- or 512-row cluster tiles; 1 allows signals_per_tile 1 or 2.");
 #endif
 }

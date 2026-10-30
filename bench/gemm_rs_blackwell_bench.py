@@ -45,12 +45,21 @@ class BlackwellBenchConfig:
     # the instantiated values in gemm_rs_blackwell::launch.
     mkernel_signals_per_tile = [1, 2, 4]
     mkernel_rs_strip_rows = [8, 16, 32]
+    # MMA warps per CTA, keyed by M: 1 halves the cluster tile to 256 rows. It only
+    # supports 1 or 2 signals per tile.
+    mkernel_mma_warps = {2048: [1, 2]}
+    mkernel_default_mma_warps = [2]
 
-    @property
-    def mkernel_candidates(self):
-        return list(itertools.product(
-            self.mkernel_swizzle_sizes, self.mkernel_signals_per_tile, self.mkernel_rs_strip_rows,
-        ))
+    def mkernel_candidates(self, M: int):
+        return [
+            (swizzle, signals, rs_rows, mma_warps)
+            for swizzle, signals, rs_rows, mma_warps in itertools.product(
+                self.mkernel_swizzle_sizes, self.mkernel_signals_per_tile,
+                self.mkernel_rs_strip_rows,
+                self.mkernel_mma_warps.get(M, self.mkernel_default_mma_warps),
+            )
+            if mma_warps == 2 or signals <= 2
+        ]
 
     # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
     # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009
@@ -224,16 +233,20 @@ def run_tk(tk_module, buffers: BlackwellBenchVars):
 
 
 def mkernel_config_label(candidate) -> str:
-    swizzle, signals, rs_rows = candidate
-    return f"swizzle={swizzle} signals={signals} rs_rows={rs_rows}"
+    swizzle, signals, rs_rows, mma_warps = candidate
+    return f"swizzle={swizzle} signals={signals} rs_rows={rs_rows} mma_warps={mma_warps}"
 
 
 def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, candidate=None):
-    """Launch one (swizzle, signals_per_tile, rs_strip_rows); None uses the defaults."""
+    """Launch one (swizzle, signals_per_tile, rs_strip_rows, mma_warps); None uses the
+    defaults."""
     kwargs = {}
     if candidate is not None:
-        swizzle, signals, rs_rows = candidate
-        kwargs = dict(swizzle_size=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows)
+        swizzle, signals, rs_rows, mma_warps = candidate
+        kwargs = dict(
+            swizzle_size=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows,
+            mma_warps=mma_warps,
+        )
     mkernel_module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
         buffers.ready_mkernel, buffers.epochs_mkernel, **kwargs,
@@ -271,7 +284,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
         )
         buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
         run_baseline(buffers)
-        for candidate in config.mkernel_candidates:
+        for candidate in config.mkernel_candidates(M):
             buffers.c_mkernel.data_.zero_()
             torch.cuda.synchronize()
             dist.barrier()
@@ -296,7 +309,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-        for candidate in config.mkernel_candidates:
+        for candidate in config.mkernel_candidates(M):
             buffers.mkernel_graph = capture_cuda_graph(
                 lambda: run_mkernel(mkernel_module, buffers, candidate)
             )
@@ -348,7 +361,7 @@ def gemm_rs_blackwell_prepare(
     # Autotune on graph replays; benchmark_cuda takes the max over ranks, so
     # every rank selects the same configuration.
     mkernel_timings = []
-    for candidate in config.mkernel_candidates:
+    for candidate in config.mkernel_candidates(M):
         buffers.mkernel_graph = capture_cuda_graph(
             lambda: run_mkernel(mkernel_module, buffers, candidate)
         )

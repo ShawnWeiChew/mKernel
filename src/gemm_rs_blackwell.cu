@@ -144,17 +144,20 @@ template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
                                                                       _C_TILE_DIVISOR,
                                                                       _SWIZZLE_SIZE,
                                                                       _SIGNALS_PER_TILE,
-                                                                      _RS_STRIP_ROWS>& G) {
+                                                                      _RS_STRIP_ROWS,
+                                                                      _CONSUMER_WARPS>& G) {
     using fg = fused_globals<_NUM_EPILOGUE_WARPS,
                              _C_TILE_DIVISOR,
                              _SWIZZLE_SIZE,
                              _SIGNALS_PER_TILE,
-                             _RS_STRIP_ROWS>;
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS>;
 
 #ifdef PROFILE_TIMINGS
     const uint64_t timing_entry_ns = timing_profile::globaltimer_ns();
@@ -251,8 +254,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
-            tma::cluster::expect_bytes(
-                tma_load[input_stage_id], sizeof(fg::A_tile) * 2 + sizeof(fg::B_tile), 0);
+            tma::cluster::expect_bytes(tma_load[input_stage_id],
+                                       sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile),
+                                       0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
@@ -276,8 +280,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         }
     };
 
-    auto consume = [&](typename fg::C_tt_tile* tmem,
-                       int& input_stage_id,
+    // Built from the published base rather than kept in an array: with two TMEM
+    // stages, indexing an array by the runtime stage puts it on the stack.
+    auto tmem_slot = [&](int consumer_id, int stage) {
+        return tm_alloc.template allocate<typename fg::C_tt_tile>(
+            (consumer_id * fg::TMEM_PIPELINE_STAGES + stage) * fg::COL_BLOCK);
+    };
+
+    auto consume = [&](int& input_stage_id,
                        int& epilogue_stage_id,
                        const int consumer_id,
                        const int tile_id) {
@@ -290,13 +300,13 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
 #ifdef PROFILE_TIMINGS
         timing_profile::emit(G.timings, &timing_head, EV_MMA_TMEM_FREE, timing_payload);
 #endif
+        auto accumulator = tmem_slot(consumer_id, epilogue_stage_id);
 
         {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            mm_ABt_ncta<fg::NUM_CLUSTERS>(
-                tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mm_ABt_ncta<fg::NUM_CLUSTERS>(accumulator, A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -308,8 +318,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
-            mma_ABt_ncta<fg::NUM_CLUSTERS>(
-                tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
+            mma_ABt_ncta<fg::NUM_CLUSTERS>(accumulator, A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
             if (input_stage_id == 0) {
@@ -330,7 +339,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
 
     auto epilogue = [&](int tile_row_idx,
                         int tile_col_idx,
-                        typename fg::C_tt_tile* tmem,
                         const int consumer_id,
                         int& epilogue_stage_id,
                         int& epilogue_smem_idx,
@@ -393,8 +401,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
             warpgroup::load_async(
                 c_reg[i],
-                tmem[epilogue_stage_id].template subtile<tt<float, fg::A_tile::rows, C_CHUNK_COLS>>(
-                    i * C_CHUNK_COLS));
+                tmem_slot(consumer_id, epilogue_stage_id)
+                    .template subtile<tt<float, fg::A_tile::rows, C_CHUNK_COLS>>(i * C_CHUNK_COLS));
         }
 
         tensor_load_wait();
@@ -509,17 +517,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
                 int epilogue_stage_id = 0;
                 const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
-                typename fg::C_tt_tile tmem[fg::TMEM_PIPELINE_STAGES];
-
-#pragma unroll
-                for (int i = 0; i < fg::TMEM_PIPELINE_STAGES; i++) {
-                    tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(
-                        (i + consumer_id * fg::TMEM_PIPELINE_STAGES) * fg::COL_BLOCK);
-                }
-
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     // TODO: check consume
-                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_id, i);
+                    consume(input_stage_id, epilogue_stage_id, consumer_id, i);
                 }
             }
 
@@ -703,17 +703,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         // Fresh mbarriers complete the phase before parity 0, so the first lap
         // of signal_empty passes without waiting.
         int signal_phase = 1;
-        typename fg::C_tt_tile tmem[fg::NUM_TMEM_SLOTS];
 
         everyone::tma::cluster::wait();
         wait(tmem_allocated, 0);
         // Tile views and the eventual deallocation use the published base.
         tm_alloc.set_addr(tmem_addr);
-
-#pragma unroll
-        for (int i = 0; i < fg::NUM_TMEM_SLOTS; i++) {
-            tmem[i] = tm_alloc.template allocate<fg::C_tt_tile>(i * fg::COL_BLOCK);
-        }
 #ifdef PROFILE_TIMINGS
         if (warpgroup::laneid() == 0) {
             emit_setup(G.timings, &timing_head, timing_entry_ns, warp_id);
@@ -732,7 +726,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
                 const int warp_level_tile_id = cluster_level_tile_id + c;
                 epilogue(warp_level_tile_id,
                          tile_col_idx,
-                         &tmem[c * fg::TMEM_PIPELINE_STAGES],
                          c,
                          epilogue_stage_id[c],
                          epilogue_smem_idx,
@@ -776,12 +769,14 @@ template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 __global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS,
                                           _C_TILE_DIVISOR,
                                           _SWIZZLE_SIZE,
                                           _SIGNALS_PER_TILE,
-                                          _RS_STRIP_ROWS>::NUM_CLUSTERS,
+                                          _RS_STRIP_ROWS,
+                                          _CONSUMER_WARPS>::NUM_CLUSTERS,
                             1,
                             1)
     __launch_bounds__(
@@ -789,29 +784,34 @@ __global__ __cluster_dims__(fused_globals<_NUM_EPILOGUE_WARPS,
                       _C_TILE_DIVISOR,
                       _SWIZZLE_SIZE,
                       _SIGNALS_PER_TILE,
-                      _RS_STRIP_ROWS>::NUM_THREADS,
+                      _RS_STRIP_ROWS,
+                      _CONSUMER_WARPS>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_NUM_EPILOGUE_WARPS,
                                                                         _C_TILE_DIVISOR,
                                                                         _SWIZZLE_SIZE,
                                                                         _SIGNALS_PER_TILE,
-                                                                        _RS_STRIP_ROWS> G) {
+                                                                        _RS_STRIP_ROWS,
+                                                                        _CONSUMER_WARPS> G) {
     gemm_rs_blackwell<_NUM_EPILOGUE_WARPS,
                       _C_TILE_DIVISOR,
                       _SWIZZLE_SIZE,
                       _SIGNALS_PER_TILE,
-                      _RS_STRIP_ROWS>(G);
+                      _RS_STRIP_ROWS,
+                      _CONSUMER_WARPS>(G);
 }
 
 template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 inline void initialize_gemm_rs_blackwell_state(const fused_globals<_NUM_EPILOGUE_WARPS,
                                                                    _C_TILE_DIVISOR,
                                                                    _SWIZZLE_SIZE,
                                                                    _SIGNALS_PER_TILE,
-                                                                   _RS_STRIP_ROWS>& G) {
+                                                                   _RS_STRIP_ROWS,
+                                                                   _CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
@@ -829,12 +829,14 @@ template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
                                                          _C_TILE_DIVISOR,
                                                          _SWIZZLE_SIZE,
                                                          _SIGNALS_PER_TILE,
-                                                         _RS_STRIP_ROWS>& G) {
+                                                         _RS_STRIP_ROWS,
+                                                         _CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -847,7 +849,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
                              _C_TILE_DIVISOR,
                              _SWIZZLE_SIZE,
                              _SIGNALS_PER_TILE,
-                             _RS_STRIP_ROWS>;
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
@@ -856,7 +859,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
                                          _C_TILE_DIVISOR,
                                          _SWIZZLE_SIZE,
                                          _SIGNALS_PER_TILE,
-                                         _RS_STRIP_ROWS>;
+                                         _RS_STRIP_ROWS,
+                                         _CONSUMER_WARPS>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -891,7 +895,8 @@ inline void prepare(at::Tensor& A,
                                                   DEFAULT_C_TILE_DIVISOR,
                                                   DEFAULT_SWIZZLE_SIZE,
                                                   DEFAULT_SIGNALS_PER_TILE,
-                                                  DEFAULT_RS_STRIP_ROWS>(
+                                                  DEFAULT_RS_STRIP_ROWS,
+                                                  DEFAULT_NUM_CONSUMER_WARPS>(
         A,
         B,
         C,
@@ -913,7 +918,7 @@ inline void prepare(at::Tensor& A,
 #define MKERNEL_LAUNCH_TIMINGS_ARG
 #endif
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS>
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
 inline void launch_with_config(at::Tensor& A,
                                at::Tensor& B,
                                dist::ParallelBuffer& C,
@@ -925,20 +930,46 @@ inline void launch_with_config(at::Tensor& A,
                                        DEFAULT_C_TILE_DIVISOR,
                                        _SWIZZLE_SIZE,
                                        _SIGNALS_PER_TILE,
-                                       _RS_STRIP_ROWS>(A,
-                                                       B,
-                                                       C,
-                                                       ready,
-                                                       completion_epochs,
-                                                       C.local_rank_,
-                                                       A.size(0),
-                                                       B.size(0),
-                                                       A.size(1),
-                                                       at::cuda::getCurrentCUDAStream().stream());
+                                       _RS_STRIP_ROWS,
+                                       _CONSUMER_WARPS>(A,
+                                                        B,
+                                                        C,
+                                                        ready,
+                                                        completion_epochs,
+                                                        C.local_rank_,
+                                                        A.size(0),
+                                                        B.size(0),
+                                                        A.size(1),
+                                                        at::cuda::getCurrentCUDAStream().stream());
 #ifdef PROFILE_TIMINGS
     globals.timings = timings;
 #endif
     launch_gemm_rs_blackwell(globals);
+}
+
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS>
+inline void launch_with_rows(at::Tensor& A,
+                             at::Tensor& B,
+                             dist::ParallelBuffer& C,
+                             dist::ParallelBuffer& ready,
+                             dist::ParallelBuffer& completion_epochs,
+                             int mma_warps MKERNEL_LAUNCH_TIMINGS_PARAM) {
+    switch (mma_warps) {
+        case 1:
+            // One MMA warp has a single 128-row half per tile, so four signals would
+            // split it into 64-column regions, finer than a ready counter.
+            if constexpr (_SIGNALS_PER_TILE <= 2) {
+                return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, 1>(
+                    A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
+            } else {
+                TORCH_CHECK(false, "mma_warps=1 supports signals_per_tile 1 or 2");
+            }
+        case 2:
+            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, 2>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
+        default:
+            TORCH_CHECK(false, "mma_warps must be 1 or 2, got ", mma_warps);
+    }
 }
 
 template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE>
@@ -947,17 +978,18 @@ inline void launch_with_signals(at::Tensor& A,
                                 dist::ParallelBuffer& C,
                                 dist::ParallelBuffer& ready,
                                 dist::ParallelBuffer& completion_epochs,
-                                int rs_strip_rows MKERNEL_LAUNCH_TIMINGS_PARAM) {
+                                int rs_strip_rows,
+                                int mma_warps MKERNEL_LAUNCH_TIMINGS_PARAM) {
     switch (rs_strip_rows) {
         case 8:
-            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
-                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
+                A, B, C, ready, completion_epochs, mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 16:
-            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
-                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
+                A, B, C, ready, completion_epochs, mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 32:
-            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
-                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
+                A, B, C, ready, completion_epochs, mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         default:
             TORCH_CHECK(false, "rs_strip_rows must be 8, 16, or 32, got ", rs_strip_rows);
     }
@@ -970,17 +1002,33 @@ inline void launch_with_swizzle(at::Tensor& A,
                                 dist::ParallelBuffer& ready,
                                 dist::ParallelBuffer& completion_epochs,
                                 int signals_per_tile,
-                                int rs_strip_rows MKERNEL_LAUNCH_TIMINGS_PARAM) {
+                                int rs_strip_rows,
+                                int mma_warps MKERNEL_LAUNCH_TIMINGS_PARAM) {
     switch (signals_per_tile) {
         case 1:
-            return launch_with_signals<_SWIZZLE_SIZE, 1>(
-                A, B, C, ready, completion_epochs, rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_signals<_SWIZZLE_SIZE, 1>(A,
+                                                         B,
+                                                         C,
+                                                         ready,
+                                                         completion_epochs,
+                                                         rs_strip_rows,
+                                                         mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 2:
-            return launch_with_signals<_SWIZZLE_SIZE, 2>(
-                A, B, C, ready, completion_epochs, rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_signals<_SWIZZLE_SIZE, 2>(A,
+                                                         B,
+                                                         C,
+                                                         ready,
+                                                         completion_epochs,
+                                                         rs_strip_rows,
+                                                         mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 4:
-            return launch_with_signals<_SWIZZLE_SIZE, 4>(
-                A, B, C, ready, completion_epochs, rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+            return launch_with_signals<_SWIZZLE_SIZE, 4>(A,
+                                                         B,
+                                                         C,
+                                                         ready,
+                                                         completion_epochs,
+                                                         rs_strip_rows,
+                                                         mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         default:
             TORCH_CHECK(false, "signals_per_tile must be 1, 2, or 4, got ", signals_per_tile);
     }
@@ -993,7 +1041,8 @@ inline void launch(at::Tensor& A,
                    dist::ParallelBuffer& completion_epochs,
                    int swizzle_size,
                    int signals_per_tile,
-                   int rs_strip_rows
+                   int rs_strip_rows,
+                   int mma_warps
 #ifdef PROFILE_TIMINGS
                    ,
                    TimingRecord* timings = nullptr
@@ -1007,7 +1056,8 @@ inline void launch(at::Tensor& A,
                                           ready,
                                           completion_epochs,
                                           signals_per_tile,
-                                          rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+                                          rs_strip_rows,
+                                          mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 2:
             return launch_with_swizzle<2>(A,
                                           B,
@@ -1015,7 +1065,8 @@ inline void launch(at::Tensor& A,
                                           ready,
                                           completion_epochs,
                                           signals_per_tile,
-                                          rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+                                          rs_strip_rows,
+                                          mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 4:
             return launch_with_swizzle<4>(A,
                                           B,
@@ -1023,7 +1074,8 @@ inline void launch(at::Tensor& A,
                                           ready,
                                           completion_epochs,
                                           signals_per_tile,
-                                          rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+                                          rs_strip_rows,
+                                          mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         case 8:
             return launch_with_swizzle<8>(A,
                                           B,
@@ -1031,7 +1083,8 @@ inline void launch(at::Tensor& A,
                                           ready,
                                           completion_epochs,
                                           signals_per_tile,
-                                          rs_strip_rows MKERNEL_LAUNCH_TIMINGS_ARG);
+                                          rs_strip_rows,
+                                          mma_warps MKERNEL_LAUNCH_TIMINGS_ARG);
         default:
             TORCH_CHECK(false, "swizzle_size must be 1, 2, 4, or 8, got ", swizzle_size);
     }
@@ -1046,22 +1099,26 @@ template void initialize_gemm_rs_blackwell_state<DEFAULT_NUM_EPILOGUE_WARPS,
                                                  DEFAULT_C_TILE_DIVISOR,
                                                  DEFAULT_SWIZZLE_SIZE,
                                                  DEFAULT_SIGNALS_PER_TILE,
-                                                 DEFAULT_RS_STRIP_ROWS>(
+                                                 DEFAULT_RS_STRIP_ROWS,
+                                                 DEFAULT_NUM_CONSUMER_WARPS>(
     const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS,
                         DEFAULT_C_TILE_DIVISOR,
                         DEFAULT_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
-                        DEFAULT_RS_STRIP_ROWS>& G);
+                        DEFAULT_RS_STRIP_ROWS,
+                        DEFAULT_NUM_CONSUMER_WARPS>& G);
 template void launch_gemm_rs_blackwell<DEFAULT_NUM_EPILOGUE_WARPS,
                                        DEFAULT_C_TILE_DIVISOR,
                                        DEFAULT_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,
-                                       DEFAULT_RS_STRIP_ROWS>(
+                                       DEFAULT_RS_STRIP_ROWS,
+                                       DEFAULT_NUM_CONSUMER_WARPS>(
     const fused_globals<DEFAULT_NUM_EPILOGUE_WARPS,
                         DEFAULT_C_TILE_DIVISOR,
                         DEFAULT_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
-                        DEFAULT_RS_STRIP_ROWS>& G);
+                        DEFAULT_RS_STRIP_ROWS,
+                        DEFAULT_NUM_CONSUMER_WARPS>& G);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH

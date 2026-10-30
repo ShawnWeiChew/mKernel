@@ -51,19 +51,22 @@ template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 struct fused_globals;
 
 template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
                                                   _C_TILE_DIVISOR,
                                                   _SWIZZLE_SIZE,
                                                   _SIGNALS_PER_TILE,
-                                                  _RS_STRIP_ROWS>& G);
+                                                  _RS_STRIP_ROWS,
+                                                  _CONSUMER_WARPS>& G);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
@@ -73,39 +76,47 @@ template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 void initialize_gemm_rs_blackwell_state(const fused_globals<_NUM_EPILOGUE_WARPS,
                                                             _C_TILE_DIVISOR,
                                                             _SWIZZLE_SIZE,
                                                             _SIGNALS_PER_TILE,
-                                                            _RS_STRIP_ROWS>& G);
+                                                            _RS_STRIP_ROWS,
+                                                            _CONSUMER_WARPS>& G);
 
 template <int _NUM_EPILOGUE_WARPS,
           int _C_TILE_DIVISOR,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS>
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
-    static constexpr int CONSUMER_WARPS = 2;
+    // MMA warps per CTA, each owning a 128-row slice of the CTA's tile. One warp
+    // halves the tile height (256x256 per cluster instead of 512x256).
+    static constexpr int CONSUMER_WARPS = _CONSUMER_WARPS;
+    static_assert(CONSUMER_WARPS == 1 || CONSUMER_WARPS == 2, "CONSUMER_WARPS must be 1 or 2");
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = _NUM_EPILOGUE_WARPS;
     static constexpr int REDUCE_SCATTER_WARPS = 4;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
 
-    // Warp layout: [epilogue WG(s)] [producer, 2x MMA, signal] [RS WG]. setmaxnreg
+    // Warp layout: [epilogue WG(s)] [producer, MMA warp(s), signal] [RS WG]. setmaxnreg
     // is .sync.aligned over a whole warpgroup, so the producer/MMA tail is filled
-    // out by the signal warp and the RS warps get a warpgroup of their own.
+    // out by the signal warp (and an idle warp with one MMA warp) and the RS warps
+    // get a warpgroup of their own.
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
-    // The warp that pads the producer/MMA warpgroup publishes tile arrivals, so
-    // the epilogue never stalls on the release fence of the signal.
-    static constexpr int SIGNAL_WARP_ID = FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS;
     static constexpr int MAINLOOP_WARPGROUP = EPILOGUE_WARPGROUPS;
     static constexpr int RS_WARPGROUP = MAINLOOP_WARPGROUP + 1;
     static constexpr int FIRST_RS_WARP_ID = RS_WARPGROUP * kittens::WARPGROUP_WARPS;
-    static_assert(SIGNAL_WARP_ID < FIRST_RS_WARP_ID,
+    // The warp that pads the producer/MMA warpgroup publishes tile arrivals, so
+    // the epilogue never stalls on the release fence of the signal. It stays the
+    // warpgroup's last warp for any MMA warp count, so trace layouts keep its id.
+    static constexpr int SIGNAL_WARP_ID = FIRST_RS_WARP_ID - 1;
+    static_assert(FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS <= SIGNAL_WARP_ID,
                   "Producer/MMA/signal warps must fit in one warpgroup");
     static_assert(REDUCE_SCATTER_WARPS == kittens::WARPGROUP_WARPS,
                   "The RS warps must form exactly one warpgroup");
@@ -127,7 +138,8 @@ struct fused_globals {
                   "Decreased register counts must not exceed the launch allocation");
     static constexpr int NUM_CLUSTERS = DEFAULT_NUM_CTA;
 
-    static constexpr int ROW_BLOCK = 256;
+    // A 2-CTA MMA covers 128 rows per CTA.
+    static constexpr int ROW_BLOCK = 128 * CONSUMER_WARPS;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
@@ -139,8 +151,9 @@ struct fused_globals {
     static constexpr int READY_COLS_PER_TILE = COL_BLOCK / READY_COLS;
 
     // Publications per tile, in epilogue store order: 1 is the whole tile, 2 is each
-    // consumer's half, and 4 also splits each half by columns, published midway
-    // through its stores. Each covers SIGNAL_ROWS x SIGNAL_COLS.
+    // consumer's half (column halves with one consumer), and 4 also splits each half
+    // by columns, published midway through its stores. Each covers SIGNAL_ROWS x
+    // SIGNAL_COLS; with one consumer, 4 would need 64-column ready counters.
     static constexpr int SIGNALS_PER_TILE = _SIGNALS_PER_TILE;
     static_assert(SIGNALS_PER_TILE == 1 || SIGNALS_PER_TILE == 2 || SIGNALS_PER_TILE == 4,
                   "SIGNALS_PER_TILE must be 1, 2, or 4");
@@ -180,7 +193,8 @@ struct fused_globals {
     static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
 
     // used for SMEM allocation
-    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = 4;
+    // One MMA warp halves each stage's A bytes, so two more stages fit in SMEM.
+    static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = CONSUMER_WARPS == 1 ? 6 : 4;
     static constexpr int EPILOGUE_PIPELINE_STAGES = 2;
     // Drained tiles the epilogue may hand off before the signal warp catches up.
     static constexpr int SIGNAL_PIPELINE_STAGES = 4;
@@ -201,6 +215,7 @@ struct fused_globals {
         (sizeof(A_tile) * CONSUMER_WARPS + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
         sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
     static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
+    static_assert(SMEM_FITS, "Pipeline stages exceed dynamic shared memory");
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
@@ -254,13 +269,15 @@ template <int _NUM_EPILOGUE_WARPS,
           int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS,
           typename DistributedTensor,
           typename LocalTensor>
 __host__ inline fused_globals<_NUM_EPILOGUE_WARPS,
                               _C_TILE_DIVISOR,
                               _SWIZZLE_SIZE,
                               _SIGNALS_PER_TILE,
-                              _RS_STRIP_ROWS>
+                              _RS_STRIP_ROWS,
+                              _CONSUMER_WARPS>
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
@@ -275,7 +292,8 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                              _C_TILE_DIVISOR,
                              _SWIZZLE_SIZE,
                              _SIGNALS_PER_TILE,
-                             _RS_STRIP_ROWS>;
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {

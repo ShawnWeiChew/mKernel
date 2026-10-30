@@ -46,7 +46,7 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
     )
 
     # Warm up without the ring: every launch would restart each CTA's head at 0.
-    candidate = (args.swizzle, args.signals_per_tile, args.rs_strip_rows)
+    candidate = (args.swizzle, args.signals_per_tile, args.rs_strip_rows, args.mma_warps)
     for _ in range(args.warmup):
         run_mkernel(module, buffers, candidate)
     torch.cuda.synchronize()
@@ -64,7 +64,8 @@ def profile_shape(config, module, M, N, K, args, dumps: bool) -> bool:
     module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
         buffers.ready_mkernel, buffers.epochs_mkernel, swizzle_size=args.swizzle,
-        signals_per_tile=args.signals_per_tile, rs_strip_rows=args.rs_strip_rows, timings=ring,
+        signals_per_tile=args.signals_per_tile, rs_strip_rows=args.rs_strip_rows,
+        mma_warps=args.mma_warps, timings=ring,
     )
     end.record()
     end.synchronize()
@@ -138,6 +139,10 @@ def main():
         help="Ready-counter publications per 256x256 tile",
     )
     parser.add_argument("--rs-strip-rows", type=int, default=16, choices=(8, 16, 32))
+    parser.add_argument(
+        "--mma-warps", type=int, default=2, choices=(1, 2),
+        help="MMA warps per CTA; 1 gives 256-row cluster tiles and needs --signals-per-tile <= 2",
+    )
     parser.add_argument("--out-dir", default=str(HERE.parent / "traces"))
     parser.add_argument("--no-render", action="store_true", help="Write the .npz only")
     args = parser.parse_args()
@@ -149,6 +154,8 @@ def main():
         parser.error("This profiler requires a single node")
     if any(m <= 0 or m % (config.world_size * 256) or m % 512 for m in shapes):
         parser.error("mKernel requires M divisible by both WORLD_SIZE * 256 and 512")
+    if args.mma_warps == 1 and args.signals_per_tile == 4:
+        parser.error("--mma-warps 1 supports --signals-per-tile 1 or 2")
     if args.warmup < 0 or args.lead_in < 0:
         parser.error("--warmup and --lead-in must be nonnegative")
     dump_ranks = (
