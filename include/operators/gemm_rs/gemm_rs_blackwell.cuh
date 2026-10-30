@@ -232,4 +232,23 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
     static_assert(always_false_v<LocalTensor>, "Construct fused_globals directly without Torch");
 #endif
 }
+
+namespace {
+__device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16* src) {
+    asm volatile(
+        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
+        "{%0, %1, %2, %3}, [%4];"
+        : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
+        : "l"(src)
+        // TODO: maybe I can remove the clobber here?
+        : "memory");
+}
+
+__device__ __forceinline__ void store_16B(comm::bf16* dst, const uint32_t* in) {
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(dst), "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3])
+                 : "memory");
+}
+}  // namespace
 };  // namespace gemm_rs_blackwell

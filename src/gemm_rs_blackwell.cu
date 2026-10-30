@@ -57,38 +57,6 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
-__device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16* src) {
-    asm volatile(
-        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
-        "{%0, %1, %2, %3}, [%4];"
-        : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
-        : "l"(src)
-        // TODO: maybe I can remove the clobber here?
-        : "memory");
-}
-
-__device__ __forceinline__ void store_32B(comm::bf16* dst, const uint32_t* in) {
-    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                 :
-                 : "l"(dst),
-                   "r"(in[0]),
-                   "r"(in[1]),
-                   "r"(in[2]),
-                   "r"(in[3]),
-                   "r"(in[4]),
-                   "r"(in[5]),
-                   "r"(in[6]),
-                   "r"(in[7])
-                 : "memory");
-}
-
-__device__ __forceinline__ void store_16B(comm::bf16* dst, const uint32_t* in) {
-    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                 :
-                 : "l"(dst), "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3])
-                 : "memory");
-}
-
 template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH>
 __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_tile,
                                                     comm::bf16* local_tile,
@@ -410,7 +378,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             warpgroup::sync(1);
 
             // TODO: check if warpgroup_id == 0 and elect_sync() work for this too
-            if (warpgroup::laneid() == 0) {
+            if (warp_id == 0 && elect_warp_leader()) {
                 dist::tma::store_async(G.C[G.dev_idx],
                                        C_smem[epilogue_smem_idx],
                                        {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
@@ -603,7 +571,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 #endif
 
             // These match the coordinates used by the epilogue's signal.
-            if (lane == 0) {
+            if (elect_warp_leader()) {
 #ifdef PROFILE_TIMINGS
                 timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
 #endif
@@ -705,7 +673,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
 
             // Only thread 0 issued and drained the TMA stores, so it alone hands
             // the tile to the signal warp.
-            if (warpgroup::laneid() == 0) {
+            if (warp_id == 0 && elect_warp_leader()) {
                 wait(signal_empty[signal_stage], signal_phase);
                 arrive(signal_full[signal_stage]);
             }
