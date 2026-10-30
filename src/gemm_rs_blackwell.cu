@@ -949,6 +949,9 @@ inline void launch_with_signals(at::Tensor& A,
                                 dist::ParallelBuffer& completion_epochs,
                                 int rs_strip_rows MKERNEL_LAUNCH_TIMINGS_PARAM) {
     switch (rs_strip_rows) {
+        case 8:
+            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
+                A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         case 16:
             return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
                 A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
@@ -956,7 +959,7 @@ inline void launch_with_signals(at::Tensor& A,
             return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
                 A, B, C, ready, completion_epochs MKERNEL_LAUNCH_TIMINGS_ARG);
         default:
-            TORCH_CHECK(false, "rs_strip_rows must be 16 or 32, got ", rs_strip_rows);
+            TORCH_CHECK(false, "rs_strip_rows must be 8, 16, or 32, got ", rs_strip_rows);
     }
 }
 

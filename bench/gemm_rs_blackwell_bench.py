@@ -40,11 +40,11 @@ class BlackwellBenchConfig:
 
     # Tile columns per rasterization supergroup; must match the instantiated
     # values in gemm_rs_blackwell::launch.
-    mkernel_swizzle_sizes = [1, 2, 4, 8]
+    mkernel_swizzle_sizes = [1, 2]
     # Ready-counter publications per 256x256 tile and RS strip heights; must match
     # the instantiated values in gemm_rs_blackwell::launch.
-    mkernel_signals_per_tile = [2]
-    mkernel_rs_strip_rows = [16, 32]
+    mkernel_signals_per_tile = [1, 2, 4]
+    mkernel_rs_strip_rows = [8, 16, 32]
 
     @property
     def mkernel_candidates(self):
@@ -355,7 +355,7 @@ def gemm_rs_blackwell_prepare(
         ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
         mkernel_timings.append((candidate, ms))
         buffers.mkernel_graph = None
-        time.sleep(3)
+        time.sleep(5)
     
     best_candidate, _ = min(mkernel_timings, key=lambda item: item[1])
     if config.is_chief:

@@ -137,7 +137,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "alive and serialize launches; graph replays advance the device epoch. "
         "swizzle_size (1, 2, 4, or 8) is the tile-column width of each rasterization "
         "supergroup. signals_per_tile (1, 2, or 4) is how many ready-counter "
-        "publications each 256x256 tile is split into; rs_strip_rows (16 or 32) is the "
+        "publications each 256x256 tile is split into; rs_strip_rows (8, 16, or 32) is the "
         "height of each reduce-scatter strip.");
 #endif
 }

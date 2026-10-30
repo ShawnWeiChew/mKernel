@@ -137,7 +137,7 @@ def main():
         "--signals-per-tile", type=int, default=1, choices=(1, 2, 4),
         help="Ready-counter publications per 256x256 tile",
     )
-    parser.add_argument("--rs-strip-rows", type=int, default=16, choices=(16, 32))
+    parser.add_argument("--rs-strip-rows", type=int, default=16, choices=(8, 16, 32))
     parser.add_argument("--out-dir", default=str(HERE.parent / "traces"))
     parser.add_argument("--no-render", action="store_true", help="Write the .npz only")
     args = parser.parse_args()
