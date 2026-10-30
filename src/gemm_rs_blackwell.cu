@@ -486,45 +486,50 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                      tile_id += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
                         num_tile_rows_per_cluster, num_tile_cols, tile_id);
-                    const int row_start = (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
-                                           cta_rank * fg::CONSUMER_WARPS) *
-                        fg::A_tile::rows;
-                    const int device_to_signal = row_start / rows_per_device;
-                    const int local_tile_for_device = (row_start % rows_per_device) / fg::ROW_BLOCK;
+#pragma unroll
+                    for (int s = 0; s < fg::SIGNALS_PER_TILE; s++) {
+                        const int last_consumer = (s + 1) * fg::CONSUMERS_PER_SIGNAL - 1;
+                        const int row_start = (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
+                                               cta_rank * fg::CONSUMER_WARPS +
+                                               s * fg::CONSUMERS_PER_SIGNAL) *
+                            fg::A_tile::rows;
+                        const int device_to_signal = row_start / rows_per_device;
+                        const int local_signal_row = (row_start % rows_per_device) / fg::SIGNAL_ROWS;
 #ifdef PROFILE_TIMINGS
-                    // Pairs with the epilogue's EV_EPI_STORE_DRAINED for this tile.
-                    const uint32_t timing_payload = timing_profile::pack_payload(
-                        warp_id, tile_id * fg::CONSUMER_WARPS + fg::CONSUMER_WARPS - 1);
-                    timing_profile::emit(
-                        G.timings, &timing_head, EV_SIG_TILE_BEGIN, timing_payload);
+                        // Pairs with the epilogue's EV_EPI_STORE_DRAINED for this region.
+                        const uint32_t timing_payload = timing_profile::pack_payload(
+                            warp_id, tile_id * fg::CONSUMER_WARPS + last_consumer);
+                        timing_profile::emit(
+                            G.timings, &timing_head, EV_SIG_TILE_BEGIN, timing_payload);
 #endif
-                    // The epilogue's mbarrier arrive releases its drained stores at
-                    // CTA scope; the release below extends them to the owner.
-                    wait(signal_full[signal_stage], signal_phase);
+                        // The epilogue's mbarrier arrive releases its drained stores at
+                        // CTA scope; the release below extends them to the owner.
+                        wait(signal_full[signal_stage], signal_phase);
 #ifdef PROFILE_TIMINGS
-                    timing_profile::emit(
-                        G.timings, &timing_head, EV_SIG_EPI_DRAINED, timing_payload);
+                        timing_profile::emit(
+                            G.timings, &timing_head, EV_SIG_EPI_DRAINED, timing_payload);
 #endif
-                    // Fence then relaxed red: the same release as red.release, split
-                    // so the trace shows the fence and the red separately.
-                    auto* ready_counter =
-                        &G.C_barrier[device_to_signal][{local_tile_for_device, tile_col_idx}];
-                    const bool local_owner = device_to_signal == G.dev_idx;
+                        // Fence then relaxed red: the same release as red.release, split
+                        // so the trace shows the fence and the red separately.
+                        auto* ready_counter =
+                            &G.C_barrier[device_to_signal][{local_signal_row, tile_col_idx}];
+                        const bool local_owner = device_to_signal == G.dev_idx;
 
-                    comm::atomic_u32::fence_acq_rel_gpu();
+                        comm::atomic_u32::fence_acq_rel_gpu();
 #ifdef PROFILE_TIMINGS
-                    timing_profile::emit(G.timings, &timing_head, EV_SIG_FENCED, timing_payload);
+                        timing_profile::emit(G.timings, &timing_head, EV_SIG_FENCED, timing_payload);
 #endif
 
-                    comm::atomic_u32::relaxed_add_gpu(ready_counter, 1);
+                        comm::atomic_u32::relaxed_add_gpu(ready_counter, 1);
 #ifdef PROFILE_TIMINGS
-                    timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
+                        timing_profile::emit(G.timings, &timing_head, EV_EPI_SIGNALED, timing_payload);
 #endif
-                    arrive(signal_empty[signal_stage]);
+                        arrive(signal_empty[signal_stage]);
 
-                    signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
-                    if (signal_stage == 0) {
-                        signal_phase ^= 1;
+                        signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+                        if (signal_stage == 0) {
+                            signal_phase ^= 1;
+                        }
                     }
                 }
             }
@@ -576,7 +581,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 timing_profile::emit(G.timings, &timing_head, EV_RS_TILE_BEGIN, timing_payload);
 #endif
                 // Peers publish tile arrivals with system-scope atomics.
-                const auto* ready_counter = &G.C_barrier[G.dev_idx][{local_tile_row, tile_col}];
+                const int signal_row = local_tile_row * fg::SIGNALS_PER_TILE +
+                    strip_idx / fg::RS_STRIPS_PER_SIGNAL;
+                const auto* ready_counter = &G.C_barrier[G.dev_idx][{signal_row, tile_col}];
                 uint32_t observed = comm::atomic_u32::acquire_load_gpu(ready_counter);
 #ifdef PROFILE_TIMINGS
                 timing_profile::emit(G.timings,
@@ -658,28 +665,33 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                          epilogue_smem_idx,
                          tile_id + num_clusters >= total_num_tiles,
                          tile_id);
-            }
 
-            // TODO: for now, I am going to signal with a 256 * 256 tile, tune later
-            dist::tma::store_async_wait();
+                // Publish once every consumer in this signal region has stored. The
+                // drain is what makes the region visible, so splitting adds a drain.
+                if ((c + 1) % fg::CONSUMERS_PER_SIGNAL != 0) {
+                    continue;
+                }
+                dist::tma::store_async_wait();
 #ifdef PROFILE_TIMINGS
-            // Pairs with the last subtile's EV_EPI_STORES_ISSUED.
-            const uint32_t timing_payload = timing_profile::pack_payload(
-                warp_id, tile_id * fg::CONSUMER_WARPS + fg::CONSUMER_WARPS - 1);
-            if (warpgroup::laneid() == 0) {
-                timing_profile::emit(G.timings, &timing_head, EV_EPI_STORE_DRAINED, timing_payload);
-            }
+                // Pairs with this region's last EV_EPI_STORES_ISSUED.
+                const uint32_t timing_payload =
+                    timing_profile::pack_payload(warp_id, tile_id * fg::CONSUMER_WARPS + c);
+                if (warpgroup::laneid() == 0) {
+                    timing_profile::emit(
+                        G.timings, &timing_head, EV_EPI_STORE_DRAINED, timing_payload);
+                }
 #endif
 
-            // Only thread 0 issued and drained the TMA stores, so it alone hands
-            // the tile to the signal warp.
-            if (warp_id == 0 && elect_warp_leader()) {
-                wait(signal_empty[signal_stage], signal_phase);
-                arrive(signal_full[signal_stage]);
-            }
-            signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
-            if (signal_stage == 0) {
-                signal_phase ^= 1;
+                // Only the elected thread issued and drained the TMA stores, so it
+                // alone hands the region to the signal warp.
+                if (warp_id == 0 && elect_warp_leader()) {
+                    wait(signal_empty[signal_stage], signal_phase);
+                    arrive(signal_full[signal_stage]);
+                }
+                signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
+                if (signal_stage == 0) {
+                    signal_phase ^= 1;
+                }
             }
         }
 

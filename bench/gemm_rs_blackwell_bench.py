@@ -51,29 +51,18 @@ class BlackwellBenchConfig:
         "cluster_shape_mn": (2, 1),
     }
 
-    # (raster_order, swizzle_size, mma_tiler_mn)
-    cutlass_autotune_configs = [
-        ("m", 1, (256, 256)),
-        ("m", 2, (256, 256)),
-        ("m", 4, (256, 256)),
-        ("m", 8, (256, 256)),
-        ("n", 1, (256, 256)),
-        ("n", 2, (256, 256)),
-        ("n", 4, (256, 256)),
-        ("n", 8, (256, 256)),
-    ]
-
-    # M=2048 also tries the smaller tile.
-    cutlass_autotune_configs_2048 = cutlass_autotune_configs + [
-        ("m", 1, (128, 128)),
-        ("m", 2, (128, 128)),
-        ("m", 4, (128, 128)),
-        ("m", 8, (128, 128)),
-        ("n", 1, (128, 128)),
-        ("n", 2, (128, 128)),
-        ("n", 4, (128, 128)),
-        ("n", 8, (128, 128)),
-    ]
+    # (raster_order, swizzle_size, mma_tiler_mn), keyed by M. Picked from an
+    # autotune sweep over raster {m,n} x swizzle {1,2,4,8} x tile {128,256}^2
+    # at N=7168, K_local=1536, 8 ranks; raster=m swizzle=1 is within 0.5% of
+    # the best everywhere, so it is also the fallback for untuned shapes.
+    cutlass_tuned_configs = {
+        2048: ("m", 1, (128, 128)),
+        4096: ("m", 1, (256, 256)),
+        8192: ("m", 1, (256, 256)),
+        16384: ("m", 2, (256, 256)),
+        32768: ("m", 1, (256, 256)),
+    }
+    cutlass_default_config = ("m", 1, (256, 256))
 
 
 class DistBufferLike(Protocol):
@@ -174,7 +163,8 @@ def make_blackwell_buffers(
         local_world_size=config.world_size, multicast=True,
     )
     buffers.ready_mkernel = mkernel_module.DistBuffer(
-        (M // config.world_size // 256, N // 256), dtype=torch.int32,
+        (M // config.world_size // mkernel_module.gemm_rs_blackwell_signal_rows, N // 256),
+        dtype=torch.int32,
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
     buffers.epochs_mkernel = mkernel_module.DistBuffer(
@@ -363,46 +353,17 @@ def gemm_rs_blackwell_prepare(
     fns.append((bench_mkernel_eager, "mKernel eager", True))
     fns.append((bench_mkernel_graph, "mKernel graph", True))
     if cutlass_available(config):
-        candidates = (
-            config.cutlass_autotune_configs_2048 if M == 2048
-            else config.cutlass_autotune_configs
-        )
-        timings = []
-        for candidate in candidates:
-            ms = load_thirdparty.run_cutlass_reduce_scatter_once(
+        candidate = config.cutlass_tuned_configs.get(M, config.cutlass_default_config)
+        if config.is_chief:
+            print(f"  [cutlass] {cutlass_config_label(candidate)}", flush=True)
+
+        def bench_cutlass():
+            return load_thirdparty.run_cutlass_reduce_scatter_once(
                 m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
                 warmup=warmup, iterations=iters,
             )
-            if ms is not None:
-                timings.append((candidate, ms))
 
-            time.sleep(3)
-
-        if not timings:
-            if config.is_chief:
-                print(
-                    f"[skip] CUTLASS GEMM reduce-scatter: no config ran at M={M} N={N}",
-                    flush=True,
-                )
-        else:
-            # Max-rank timings ensure every rank selects the same candidate.
-            best_config, _ = min(timings, key=lambda item: item[1])
-            if config.is_chief:
-                for candidate, ms in sorted(timings, key=lambda item: item[1]):
-                    mark = " <- best" if candidate == best_config else ""
-                    print(
-                        f"  [autotune] {cutlass_config_label(candidate)}: "
-                        f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
-                        flush=True,
-                    )
-
-            def bench_cutlass():
-                return load_thirdparty.run_cutlass_reduce_scatter_once(
-                    m=M, n=N, k=K, config=cutlass_config_kwargs(config, best_config),
-                    warmup=warmup, iterations=iters,
-                )
-
-            fns.append((bench_cutlass, "cutlass", False))
+        fns.append((bench_cutlass, "cutlass", False))
 
     if tk_module is not None:
         def bench_tk_eager():

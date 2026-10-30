@@ -15,6 +15,11 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.attr("gemm_rs_blackwell_world_size") = INTRA_NUM_DEVICES;
+    // Rows covered by one ready counter; size `ready` as (M / world_size / this, N / 256).
+    m.attr("gemm_rs_blackwell_signal_rows") =
+        gemm_rs_blackwell::fused_globals<gemm_rs_blackwell::DEFAULT_NUM_EPILOGUE_WARPS,
+                                         gemm_rs_blackwell::DEFAULT_C_TILE_DIVISOR,
+                                         gemm_rs_blackwell::DEFAULT_SWIZZLE_SIZE>::SIGNAL_ROWS;
     m.def(
         "gemm_rs_blackwell_prepare",
         [](at::Tensor A,
