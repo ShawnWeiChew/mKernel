@@ -134,7 +134,7 @@ class BlackwellBenchConfig:
     # kernel picks its own config, so keep this in sync with the .cu table.
     # (signal_strategy, fused_exit_barrier) pairs swept on top of the tuned tile config.
     # The kernel's own default per M is set in gemm_rs_blackwell::entrypoint.
-    SYNC_VARIANTS = [("push", False), ("push", True), ("pull", False), ("pull", True)]
+    SYNC_VARIANTS = [ ("push", True)]
 
     def mkernel_tuned_config(self, M: int):
         if M <= 4096:
