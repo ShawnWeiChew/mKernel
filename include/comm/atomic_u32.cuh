@@ -115,6 +115,14 @@ __device__ inline void relaxed_add_gpu(PtrT* ptr, int32_t v) {
                  : "memory");
 }
 
+template <typename PtrT>
+__device__ inline void relaxed_store_gpu(PtrT* ptr, int32_t v) {
+    asm volatile("st.relaxed.gpu.global.s32 [%0], %1;"
+                 :
+                 : "l"(reinterpret_cast<volatile int32_t*>(ptr)), "r"(v)
+                 : "memory");
+}
+
 // ============================================================================
 // Relaxed loads — no synchronization, just an opaque 32-bit read. Mostly used
 // for poll loops where the reader will re-load with stronger ordering after

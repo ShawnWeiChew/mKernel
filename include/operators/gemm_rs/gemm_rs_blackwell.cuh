@@ -39,6 +39,17 @@ static constexpr int DEFAULT_SCHEDULER_SWIZZLE_SIZE = 4;
 static constexpr int DEFAULT_SIGNALS_PER_TILE = 1;
 static constexpr int DEFAULT_RS_STRIP_ROWS = 32;
 
+// How the epilogue tells the RS warps that a region of C has landed.
+enum SignalStrategy {
+    // Each producer bumps a counter in the owning rank's buffer; the owner polls
+    // its own counter until every rank has added.
+    PUSH = 0,
+    // Each producer marks the region in its own buffer; the owner polls every
+    // rank's flag at once with a multicast min-reduce.
+    PULL = 1,
+};
+static constexpr SignalStrategy DEFAULT_SIGNAL_STRATEGY = PUSH;
+
 // The P2P tensor holds:
 // 1. epoch counter (first 32B, algined to a sector)
 // 2. GEMM-RS ready signal (rest of the buffer)
@@ -55,22 +66,26 @@ using completion_epoch_dist_tensor =
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
 struct fused_globals;
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
 void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                   _SIGNALS_PER_TILE,
                                                   _RS_STRIP_ROWS,
-                                                  _CONSUMER_WARPS>& G);
+                                                  _CONSUMER_WARPS,
+                                                  _SIGNAL_STRATEGY>& G);
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -133,11 +148,18 @@ struct fused_globals {
     static_assert(C_TILE_DIVISOR % SIGNAL_COL_SPLITS == 0,
                   "A signal region must end on a C chunk boundary");
 
+    static constexpr SignalStrategy SIGNAL_STRATEGY = _SIGNAL_STRATEGY;
+
+    // PUSH routes each signal to the owner, so a rank only holds its own rows' slots.
+    // PULL has every rank mark its own buffer, so each holds a slot for every row.
+    static constexpr int READY_ROW_DIVISOR = SIGNAL_STRATEGY == PUSH ? NUM_DEVICES : 1;
+
     __host__ __device__ static constexpr int ready_numel(int M, int N) {
-        return (M / NUM_DEVICES / ROW_BLOCK) * (N / COL_BLOCK) * SIGNALS_PER_TILE;
+        return (M / READY_ROW_DIVISOR / ROW_BLOCK) * (N / COL_BLOCK) * SIGNALS_PER_TILE;
     }
 
-    //  [tile_row, tile_col, region] indexing for the ready buffer
+    //  [tile_row, tile_col, region] indexing for the ready buffer. tile_row is local to
+    //  the owning rank under PUSH and global under PULL.
     __host__ __device__ static constexpr int ready_idx(int local_tile_row,
                                                        int tile_col,
                                                        int num_tile_cols,
@@ -193,9 +215,11 @@ struct fused_globals {
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
     using C_dist_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
 
-    // Peers bump counters through unicast pointers, so no multicast VA is needed.
-    using C_ready_barrier =
-        dist::distributed_tensor<dist::local_tensor<int, -1, -1, -1, -1>, NUM_DEVICES, false>;
+    // PUSH bumps peer counters through unicast pointers; PULL reads every rank's flag
+    // through the multicast VA.
+    using C_ready_barrier = dist::distributed_tensor<dist::local_tensor<int, -1, -1, -1, -1>,
+                                                     NUM_DEVICES,
+                                                     SIGNAL_STRATEGY == PULL>;
 
     int dev_idx;
     int M;
@@ -236,12 +260,14 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY,
           typename DistributedTensor,
           typename LocalTensor>
 __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                               _SIGNALS_PER_TILE,
                               _RS_STRIP_ROWS,
-                              _CONSUMER_WARPS>
+                              _CONSUMER_WARPS,
+                              _SIGNAL_STRATEGY>
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
@@ -251,8 +277,11 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                                int N,
                                int K,
                                cudaStream_t stream) {
-    using fg =
-        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    using fg = fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                             _SIGNALS_PER_TILE,
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS,
+                             _SIGNAL_STRATEGY>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
@@ -284,6 +313,19 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
             epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.raw_ptrs_[i]);
             ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
         }
+        auto C_barrier = [&] {
+            if constexpr (fg::SIGNAL_STRATEGY == PULL) {
+                TORCH_CHECK(sync.multicast_ptr_ != nullptr,
+                            "PULL signalling needs the sync buffer allocated with multicast=True");
+                const uint64_t ready_mc =
+                    reinterpret_cast<uint64_t>(sync.multicast_ptr_) + SYNC_HEADER_BYTES;
+                return dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+                    ready_mc, ready_ptrs, 1, 1, 1, ready_numel);
+            } else {
+                return dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+                    ready_ptrs, 1, 1, 1, ready_numel);
+            }
+        }();
         return {.dev_idx = dev_idx,
                 .M = M,
                 .N = N,
@@ -291,8 +333,7 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                 .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
                 .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
                 .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
-                .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
-                    ready_ptrs, 1, 1, 1, ready_numel),
+                .C_barrier = C_barrier,
                 .completion_epochs = dist::make_distributed_tensor<completion_epoch_dist_tensor>(
                     epoch_ptrs, 1, 1, 1, 1),
                 .stream = stream};

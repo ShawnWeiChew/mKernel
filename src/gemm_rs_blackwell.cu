@@ -152,13 +152,18 @@ __global__ void exit_epoch_barrier(int* local_ready,
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
 __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                                       _SIGNALS_PER_TILE,
                                                                       _RS_STRIP_ROWS,
-                                                                      _CONSUMER_WARPS>& G) {
-    using fg =
-        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+                                                                      _CONSUMER_WARPS,
+                                                                      _SIGNAL_STRATEGY>& G) {
+    using fg = fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                             _SIGNALS_PER_TILE,
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS,
+                             _SIGNAL_STRATEGY>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -457,6 +462,16 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             // stores drain. The release fence before the red waits on this SM's
             // outstanding traffic, which is why it is kept off the epilogue.
             if (elect_warp_leader()) {
+                // PULL flags hold the epoch of the launch that last wrote them, so stale
+                // slots read as old rather than needing a reset. The previous exit barrier
+                // wrote the epoch, hence the PDL wait before reading it.
+                [[maybe_unused]] uint32_t launch_epoch = 0;
+                if constexpr (fg::SIGNAL_STRATEGY == PULL) {
+                    pdl::wait();
+                    launch_epoch =
+                        comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) +
+                        1u;
+                }
                 int signal_stage = 0;
                 int signal_phase = 0;
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
@@ -471,14 +486,23 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
                         const int cta_row_start =
                             (tile_row_idx * fg::NUM_CLUSTERS + cta_rank) * fg::ROW_BLOCK;
-                        const int device_to_signal = cta_row_start / rows_per_device;
-                        const int local_tile_row =
-                            (cta_row_start % rows_per_device) / fg::ROW_BLOCK;
-
-                        comm::atomic_u32::relaxed_add_gpu(
-                            G.C_barrier[device_to_signal].raw_ptr +
-                                fg::ready_idx(local_tile_row, tile_col_idx, num_tile_cols, s),
-                            1);
+                        if constexpr (fg::SIGNAL_STRATEGY == PUSH) {
+                            const int device_to_signal = cta_row_start / rows_per_device;
+                            const int local_tile_row =
+                                (cta_row_start % rows_per_device) / fg::ROW_BLOCK;
+                            comm::atomic_u32::relaxed_add_gpu(
+                                G.C_barrier[device_to_signal].raw_ptr +
+                                    fg::ready_idx(local_tile_row, tile_col_idx, num_tile_cols, s),
+                                1);
+                        } else {
+                            // Our own buffer holds a flag for every rank's rows, so index by
+                            // the global row: a local row would alias across owners.
+                            const int global_tile_row = cta_row_start / fg::ROW_BLOCK;
+                            comm::atomic_u32::relaxed_store_gpu(
+                                G.C_barrier[G.dev_idx].raw_ptr +
+                                    fg::ready_idx(global_tile_row, tile_col_idx, num_tile_cols, s),
+                                int32_t(launch_epoch));
+                        }
                         arrive(signal_empty[signal_stage]);
 
                         signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
@@ -501,6 +525,12 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         everyone::tma::cluster::wait();
 
         constexpr uint32_t ready_count = uint32_t(fg::NUM_DEVICES);
+        // Same epoch the signal warps of every rank stamp this launch with.
+        [[maybe_unused]] uint32_t launch_epoch = 0;
+        if constexpr (fg::SIGNAL_STRATEGY == PULL) {
+            launch_epoch =
+                comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
+        }
 
         const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
         for (int unit_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS;
@@ -522,12 +552,33 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
             // These match the coordinates used by the epilogue's signal.
             if (elect_warp_leader()) {
-                // Seeing the region's counter complete also proves all of its adds
-                // have landed, which the exit barrier's reset relies on.
-                const auto* ready_counter = G.C_barrier[G.dev_idx].raw_ptr +
-                    fg::ready_idx(local_tile_row, tile_col, num_tile_cols, region);
-                while (comm::atomic_u32::acquire_load_gpu(ready_counter) < ready_count) {
-                    __nanosleep(16);
+                if constexpr (fg::SIGNAL_STRATEGY == PUSH) {
+                    // Seeing the region's counter complete also proves all of its adds
+                    // have landed, which the exit barrier's reset relies on.
+                    const auto* ready_counter = G.C_barrier[G.dev_idx].raw_ptr +
+                        fg::ready_idx(local_tile_row, tile_col, num_tile_cols, region);
+                    while (comm::atomic_u32::acquire_load_gpu(ready_counter) < ready_count) {
+                        __nanosleep(16);
+                    }
+                } else {
+                    // Every rank flagged this region at the same global row in its own
+                    // buffer; the multicast address reduces across all of them.
+                    const int* ready_flags = G.C_barrier.mc_ptr +
+                        fg::ready_idx(G.dev_idx * tile_rows_per_device + local_tile_row,
+                                      tile_col,
+                                      num_tile_cols,
+                                      region);
+                    uint val;
+                    comm::multimem<uint>::ld_reduce<comm::reduce_op::MIN,
+                                                    comm::memory_model::STRONG>(
+                        val, reinterpret_cast<const uint*>(ready_flags));
+                    // TODO: for now, this will not work at wraparound
+                    while (val < launch_epoch) {
+                        __nanosleep(16);
+                        comm::multimem<uint>::ld_reduce<comm::reduce_op::MIN,
+                                                        comm::memory_model::STRONG>(
+                            val, reinterpret_cast<const uint*>(ready_flags));
+                    }
                 }
             }
             __syncwarp();
@@ -599,31 +650,43 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
-__global__ __cluster_dims__(
-    fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::
-        NUM_CLUSTERS,
-    1,
-    1)
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
+__global__ __cluster_dims__(fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                          _SIGNALS_PER_TILE,
+                                          _RS_STRIP_ROWS,
+                                          _CONSUMER_WARPS,
+                                          _SIGNAL_STRATEGY>::NUM_CLUSTERS,
+                            1,
+                            1)
     __launch_bounds__(
-        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::
-            NUM_THREADS,
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                      _SIGNALS_PER_TILE,
+                      _RS_STRIP_ROWS,
+                      _CONSUMER_WARPS,
+                      _SIGNAL_STRATEGY>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                                         _SIGNALS_PER_TILE,
                                                                         _RS_STRIP_ROWS,
-                                                                        _CONSUMER_WARPS> G) {
-    gemm_rs_blackwell<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>(
-        G);
+                                                                        _CONSUMER_WARPS,
+                                                                        _SIGNAL_STRATEGY> G) {
+    gemm_rs_blackwell<_SCHEDULER_SWIZZLE_SIZE,
+                      _SIGNALS_PER_TILE,
+                      _RS_STRIP_ROWS,
+                      _CONSUMER_WARPS,
+                      _SIGNAL_STRATEGY>(G);
 }
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+          int _CONSUMER_WARPS,
+          SignalStrategy _SIGNAL_STRATEGY>
 inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                          _SIGNALS_PER_TILE,
                                                          _RS_STRIP_ROWS,
-                                                         _CONSUMER_WARPS>& G) {
+                                                         _CONSUMER_WARPS,
+                                                         _SIGNAL_STRATEGY>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -632,8 +695,11 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
     }
 #endif
 
-    using fg =
-        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    using fg = fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                             _SIGNALS_PER_TILE,
+                             _RS_STRIP_ROWS,
+                             _CONSUMER_WARPS,
+                             _SIGNAL_STRATEGY>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
@@ -641,7 +707,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
     auto this_kernel = fused_kernel_stub<_SCHEDULER_SWIZZLE_SIZE,
                                          _SIGNALS_PER_TILE,
                                          _RS_STRIP_ROWS,
-                                         _CONSUMER_WARPS>;
+                                         _CONSUMER_WARPS,
+                                         _SIGNAL_STRATEGY>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -664,8 +731,11 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
     // Full completion dependency, including in captured graphs. The next use
     // of these buffers on this stream cannot pass until every rank is done.
     // Clear only the prefix of the ready grid this launch's M and N used.
+    // PULL flags are epoch-stamped and must not be cleared: a peer may still be polling
+    // them through the multicast VA while this rank runs its exit barrier.
+    const int ready_numel_to_clear = fg::SIGNAL_STRATEGY == PUSH ? fg::ready_numel(G.M, G.N) : 0;
     exit_epoch_barrier<<<1, EXIT_BARRIER_THREADS, 0, stream>>>(
-        G.C_barrier[G.dev_idx].raw_ptr, fg::ready_numel(G.M, G.N), G.completion_epochs, G.dev_idx);
+        G.C_barrier[G.dev_idx].raw_ptr, ready_numel_to_clear, G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -681,7 +751,7 @@ inline void prepare(at::Tensor& A,
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
 
-// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> for M.
+// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps, signal_strategy> for M.
 // Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
 inline void entrypoint(at::Tensor& A,
                        at::Tensor& B,
@@ -695,23 +765,23 @@ inline void entrypoint(at::Tensor& A,
     }
 
     if (M <= 2048) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1, PUSH>(
             A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 4096) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1, PUSH>(
             A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 8192) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
+        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1, PUSH>(
             A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 16384) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
+        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1, PUSH>(
             A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 32768) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1>(
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1, PUSH>(
             A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
         launch_gemm_rs_blackwell(globals);
     } else {
@@ -724,11 +794,13 @@ inline void entrypoint(at::Tensor& A,
 template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,
                                        DEFAULT_RS_STRIP_ROWS,
-                                       DEFAULT_NUM_CONSUMER_WARPS>(
+                                       DEFAULT_NUM_CONSUMER_WARPS,
+                                       DEFAULT_SIGNAL_STRATEGY>(
     const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
                         DEFAULT_RS_STRIP_ROWS,
-                        DEFAULT_NUM_CONSUMER_WARPS>& G);
+                        DEFAULT_NUM_CONSUMER_WARPS,
+                        DEFAULT_SIGNAL_STRATEGY>& G);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH

@@ -374,10 +374,11 @@ def make_blackwell_buffers(
         (M, N), dtype=torch.bfloat16, local_rank=config.local_rank,
         local_world_size=config.world_size, multicast=True,
     )
-    # Completion epoch header followed by the ready counters, one per rank.
+    # Completion epoch header followed by the ready counters, one per rank. Multicast
+    # so PULL configs can min-reduce every rank's flags in one load.
     buffers.sync_mkernel = mkernel_module.DistBuffer(
         mkernel_module.gemm_rs_blackwell_sync_shape, dtype=torch.int32,
-        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
     mkernel_module.gemm_rs_blackwell_prepare(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel, buffers.sync_mkernel,
