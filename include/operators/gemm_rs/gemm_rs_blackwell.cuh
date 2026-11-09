@@ -49,9 +49,13 @@ enum SignalStrategy {
     PULL = 1,
 };
 static constexpr SignalStrategy DEFAULT_SIGNAL_STRATEGY = PUSH;
+// true: the last CTA on each rank runs the cross-rank exit barrier inside the GEMM
+// kernel. false: a separate exit_epoch_barrier kernel follows on the stream.
+static constexpr bool DEFAULT_FUSED_EXIT_BARRIER = false;
 
 // The P2P tensor holds:
-// 1. epoch counter (first 32B, algined to a sector)
+// 1. header (first 32B, aligned to a sector): word 0 is the completion epoch, word 1
+//    counts finished CTAs for the fused exit barrier
 // 2. GEMM-RS ready signal (rest of the buffer)
 static constexpr int SYNC_HEADER_BYTES = 32;
 static constexpr int SYNC_HEADER_WORDS = SYNC_HEADER_BYTES / sizeof(uint32_t);
@@ -67,25 +71,29 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 struct fused_globals;
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                   _SIGNALS_PER_TILE,
                                                   _RS_STRIP_ROWS,
                                                   _CONSUMER_WARPS,
-                                                  _SIGNAL_STRATEGY>& G);
+                                                  _SIGNAL_STRATEGY,
+                                                  _FUSED_EXIT_BARRIER>& G);
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -149,6 +157,7 @@ struct fused_globals {
                   "A signal region must end on a C chunk boundary");
 
     static constexpr SignalStrategy SIGNAL_STRATEGY = _SIGNAL_STRATEGY;
+    static constexpr bool FUSED_EXIT_BARRIER = _FUSED_EXIT_BARRIER;
 
     // PUSH routes each signal to the owner, so a rank only holds its own rows' slots.
     // PULL has every rank mark its own buffer, so each holds a slot for every row.
@@ -235,6 +244,8 @@ struct fused_globals {
 
     cudaStream_t stream = nullptr;
 
+    int completion_counter = 0;
+
     struct pipeline_inputs {
         A_tile A[CONSUMER_WARPS];
         B_tile B;
@@ -261,13 +272,15 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
           SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER,
           typename DistributedTensor,
           typename LocalTensor>
 __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                               _SIGNALS_PER_TILE,
                               _RS_STRIP_ROWS,
                               _CONSUMER_WARPS,
-                              _SIGNAL_STRATEGY>
+                              _SIGNAL_STRATEGY,
+                              _FUSED_EXIT_BARRIER>
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
@@ -281,7 +294,8 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                              _SIGNALS_PER_TILE,
                              _RS_STRIP_ROWS,
                              _CONSUMER_WARPS,
-                             _SIGNAL_STRATEGY>;
+                             _SIGNAL_STRATEGY,
+                             _FUSED_EXIT_BARRIER>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {

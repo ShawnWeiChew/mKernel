@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include "memory/tk_ops_thread_mma_tcgen05.cuh"
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
@@ -8,6 +10,7 @@
 #endif
 
 #include <cuda.h>
+#include <cuda/atomic>
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -15,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -153,17 +157,20 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                                       _SIGNALS_PER_TILE,
                                                                       _RS_STRIP_ROWS,
                                                                       _CONSUMER_WARPS,
-                                                                      _SIGNAL_STRATEGY>& G) {
+                                                                      _SIGNAL_STRATEGY,
+                                                                      _FUSED_EXIT_BARRIER>& G) {
     using fg = fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                              _SIGNALS_PER_TILE,
                              _RS_STRIP_ROWS,
                              _CONSUMER_WARPS,
-                             _SIGNAL_STRATEGY>;
+                             _SIGNAL_STRATEGY,
+                             _FUSED_EXIT_BARRIER>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -645,18 +652,75 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             tm_alloc.deprovision();
         }
     }
+
+    if constexpr (fg::FUSED_EXIT_BARRIER) {
+        uint32_t* block_completion_counter = G.completion_epochs[G.dev_idx].raw_ptr + 1;
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ctr(*block_completion_counter);
+        __shared__ int completion_counter;
+
+        // Every role in this CTA has finished before it counts itself done.
+        __syncthreads();
+        if (warp_id == 0 && elect_warp_leader()) {
+            completion_counter = ctr.fetch_add(1u, cuda::memory_order_acq_rel) + 1u;
+        }
+        // Publish the count to the whole CTA before anyone branches on it.
+        __syncthreads();
+
+        if (completion_counter == fg::NUM_BLOCKS) {
+            if (warpgroup_id == 0 || warpgroup_id == 1) {
+                auto* local_epoch = G.completion_epochs[G.dev_idx].raw_ptr;
+                uint32_t completed_epoch = 0;
+                if (laneid() == 0) {
+                    completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
+                }
+                // ensure that all threads read the same completed epoch before subsequent store
+                completed_epoch = __shfl_sync(0xffffffff, completed_epoch, 0);
+
+                // we choose to clear the buffer rather than increment an epoch so that
+                // we are not bound to the same input length (so we can signal and poll different
+                // lengths of the ready buffer)
+                if constexpr (fg::SIGNAL_STRATEGY == PUSH) {
+                    for (int i = threadIdx.x; i < fg::ready_numel(G.M, G.N);
+                         i += EXIT_BARRIER_THREADS) {
+                        G.C_barrier[G.dev_idx].raw_ptr[i] = 0;
+                    }
+                    group<8>::sync(2);
+                }
+
+                if (warp_id == 0 && threadIdx.x == 0) {
+                    comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
+                }
+
+                for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES;
+                     peer += EXIT_BARRIER_THREADS) {
+                    while (!epoch_reached(
+                        comm::atomic_u32::acquire_load_sys(G.completion_epochs[peer].raw_ptr),
+                        completed_epoch)) {
+                        __nanosleep(16);
+                    }
+                }
+            } else if (warp_id == 2 * WARPGROUP_WARPS) {
+                if (elect_warp_leader()) {
+                    ctr.store(0, cuda::memory_order_relaxed);
+                }
+            }
+        }
+        __syncthreads();
+    }
 }
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 __global__ __cluster_dims__(fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                           _SIGNALS_PER_TILE,
                                           _RS_STRIP_ROWS,
                                           _CONSUMER_WARPS,
-                                          _SIGNAL_STRATEGY>::NUM_CLUSTERS,
+                                          _SIGNAL_STRATEGY,
+                                          _FUSED_EXIT_BARRIER>::NUM_CLUSTERS,
                             1,
                             1)
     __launch_bounds__(
@@ -664,29 +728,34 @@ __global__ __cluster_dims__(fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                       _SIGNALS_PER_TILE,
                       _RS_STRIP_ROWS,
                       _CONSUMER_WARPS,
-                      _SIGNAL_STRATEGY>::NUM_THREADS,
+                      _SIGNAL_STRATEGY,
+                      _FUSED_EXIT_BARRIER>::NUM_THREADS,
         1) void fused_kernel_stub(const __grid_constant__ fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                                         _SIGNALS_PER_TILE,
                                                                         _RS_STRIP_ROWS,
                                                                         _CONSUMER_WARPS,
-                                                                        _SIGNAL_STRATEGY> G) {
+                                                                        _SIGNAL_STRATEGY,
+                                                                        _FUSED_EXIT_BARRIER> G) {
     gemm_rs_blackwell<_SCHEDULER_SWIZZLE_SIZE,
                       _SIGNALS_PER_TILE,
                       _RS_STRIP_ROWS,
                       _CONSUMER_WARPS,
-                      _SIGNAL_STRATEGY>(G);
+                      _SIGNAL_STRATEGY,
+                      _FUSED_EXIT_BARRIER>(G);
 }
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
-          SignalStrategy _SIGNAL_STRATEGY>
+          SignalStrategy _SIGNAL_STRATEGY,
+          bool _FUSED_EXIT_BARRIER>
 inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                          _SIGNALS_PER_TILE,
                                                          _RS_STRIP_ROWS,
                                                          _CONSUMER_WARPS,
-                                                         _SIGNAL_STRATEGY>& G) {
+                                                         _SIGNAL_STRATEGY,
+                                                         _FUSED_EXIT_BARRIER>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -699,7 +768,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
                              _SIGNALS_PER_TILE,
                              _RS_STRIP_ROWS,
                              _CONSUMER_WARPS,
-                             _SIGNAL_STRATEGY>;
+                             _SIGNAL_STRATEGY,
+                             _FUSED_EXIT_BARRIER>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
@@ -708,7 +778,8 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
                                          _SIGNALS_PER_TILE,
                                          _RS_STRIP_ROWS,
                                          _CONSUMER_WARPS,
-                                         _SIGNAL_STRATEGY>;
+                                         _SIGNAL_STRATEGY,
+                                         _FUSED_EXIT_BARRIER>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -733,10 +804,13 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
     // Clear only the prefix of the ready grid this launch's M and N used.
     // PULL flags are epoch-stamped and must not be cleared: a peer may still be polling
     // them through the multicast VA while this rank runs its exit barrier.
-    const int ready_numel_to_clear = fg::SIGNAL_STRATEGY == PUSH ? fg::ready_numel(G.M, G.N) : 0;
-    exit_epoch_barrier<<<1, EXIT_BARRIER_THREADS, 0, stream>>>(
-        G.C_barrier[G.dev_idx].raw_ptr, ready_numel_to_clear, G.completion_epochs, G.dev_idx);
-    MKERNEL_CUDACHECK(cudaGetLastError());
+    if constexpr (!fg::FUSED_EXIT_BARRIER) {
+        const int ready_numel_to_clear =
+            fg::SIGNAL_STRATEGY == PUSH ? fg::ready_numel(G.M, G.N) : 0;
+        exit_epoch_barrier<<<1, EXIT_BARRIER_THREADS, 0, stream>>>(
+            G.C_barrier[G.dev_idx].raw_ptr, ready_numel_to_clear, G.completion_epochs, G.dev_idx);
+        MKERNEL_CUDACHECK(cudaGetLastError());
+    }
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 inline void prepare(at::Tensor& A,
@@ -751,39 +825,63 @@ inline void prepare(at::Tensor& A,
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
 
-// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps, signal_strategy> for M.
-// Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
+// Synchronization variant: how tiles are signalled and where the exit barrier runs.
+struct SyncVariant {
+    SignalStrategy signal_strategy;
+    bool fused_exit_barrier;
+};
+
+// Launches one tile config with a variant chosen at runtime. Each of the four
+// variants is its own kernel instantiation.
+template <int SWIZZLE, int SIGNALS_PER_TILE, int RS_STRIP_ROWS, int MMA_WARPS>
+inline void launch_with_variant(at::Tensor& A,
+                                at::Tensor& B,
+                                dist::ParallelBuffer& C,
+                                dist::ParallelBuffer& sync,
+                                cudaStream_t stream,
+                                SyncVariant variant) {
+    auto launch = [&]<SignalStrategy SIGNAL_STRATEGY, bool FUSED_EXIT_BARRIER>() {
+        auto globals = gemm_rs_blackwell_make_globals<SWIZZLE,
+                                                      SIGNALS_PER_TILE,
+                                                      RS_STRIP_ROWS,
+                                                      MMA_WARPS,
+                                                      SIGNAL_STRATEGY,
+                                                      FUSED_EXIT_BARRIER>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    };
+    if (variant.signal_strategy == PUSH) {
+        variant.fused_exit_barrier ? launch.template operator()<PUSH, true>()
+                                   : launch.template operator()<PUSH, false>();
+    } else {
+        variant.fused_exit_barrier ? launch.template operator()<PULL, true>()
+                                   : launch.template operator()<PULL, false>();
+    }
+}
+
+// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> and sync variant
+// for M. A caller-supplied variant (the bench sweep) overrides the tuned one.
+// Keep in sync with BlackwellBenchConfig.mkernel_tuned_config in gemm_rs_bench.py.
 inline void entrypoint(at::Tensor& A,
                        at::Tensor& B,
                        dist::ParallelBuffer& C,
                        dist::ParallelBuffer& sync,
-                       cudaStream_t stream = nullptr) {
+                       cudaStream_t stream = nullptr,
+                       std::optional<SyncVariant> variant = std::nullopt) {
     const int M = A.size(0);
 
     if (!stream) {
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
-
-    if (M <= 2048) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1, PUSH>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 4096) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1, PUSH>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 8192) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1, PUSH>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
+    if (M <= 4096) {
+        launch_with_variant<2, 2, 32, 1>(
+            A, B, C, sync, stream, variant.value_or(SyncVariant{PUSH, false}));
     } else if (M <= 16384) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1, PUSH>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
+        launch_with_variant<1, 2, 16, 1>(
+            A, B, C, sync, stream, variant.value_or(SyncVariant{PUSH, false}));
     } else if (M <= 32768) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1, PUSH>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
+        launch_with_variant<2, 2, 16, 1>(
+            A, B, C, sync, stream, variant.value_or(SyncVariant{PUSH, false}));
     } else {
         TORCH_CHECK(false, "gemm_rs_blackwell is not tuned for M > 32768, got M=", M);
     }
@@ -795,12 +893,14 @@ template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,
                                        DEFAULT_RS_STRIP_ROWS,
                                        DEFAULT_NUM_CONSUMER_WARPS,
-                                       DEFAULT_SIGNAL_STRATEGY>(
+                                       DEFAULT_SIGNAL_STRATEGY,
+                                       DEFAULT_FUSED_EXIT_BARRIER>(
     const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
                         DEFAULT_RS_STRIP_ROWS,
                         DEFAULT_NUM_CONSUMER_WARPS,
-                        DEFAULT_SIGNAL_STRATEGY>& G);
+                        DEFAULT_SIGNAL_STRATEGY,
+                        DEFAULT_FUSED_EXIT_BARRIER>& G);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH

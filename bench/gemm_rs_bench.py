@@ -132,6 +132,10 @@ class BlackwellBenchConfig:
     # (swizzle, signals_per_tile, rs_strip_rows, mma_warps) that
     # gemm_rs_blackwell::entrypoint selects for M. Informational only: the
     # kernel picks its own config, so keep this in sync with the .cu table.
+    # (signal_strategy, fused_exit_barrier) pairs swept on top of the tuned tile config.
+    # The kernel's own default per M is set in gemm_rs_blackwell::entrypoint.
+    SYNC_VARIANTS = [("push", False), ("push", True), ("pull", False), ("pull", True)]
+
     def mkernel_tuned_config(self, M: int):
         if M <= 4096:
             return [(2, 2, 32, 1)]
@@ -183,8 +187,11 @@ class BlackwellBenchVars:
     tk_graph: torch.cuda.CUDAGraph | None = None
 
     c_mkernel: DistBufferLike | None = None
-    sync_mkernel: DistBufferLike | None = None
+    # One sync buffer per variant: a PULL run leaves epoch stamps in the ready slots
+    # that a PUSH run on the same buffer would read as already-complete counters.
+    sync_mkernel: dict[tuple[str, bool], DistBufferLike] | None = None
     mkernel_graph: torch.cuda.CUDAGraph | None = None
+    mkernel_graphs: dict[tuple[str, bool], torch.cuda.CUDAGraph] | None = None
 
 def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_module):
     all_correct = True
@@ -198,14 +205,15 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
         buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
         run_baseline(buffers)
 
-        for candidate in config.mkernel_tuned_config(M):
+        tile_label = mkernel_config_label(config.mkernel_tuned_config(M)[0])
+        for variant in config.sync_variants:
             buffers.c_mkernel.data_.zero_()
             torch.cuda.synchronize()
             dist.barrier()
-            run_mkernel(mkernel_module, buffers, candidate)
+            run_mkernel(mkernel_module, buffers, variant)
             torch.cuda.synchronize()
             all_correct = check_close(
-                f"gemm_rs mKernel eager {mkernel_config_label(candidate)} M={M}",
+                f"gemm_rs mKernel eager {tile_label} {sync_variant_label(variant)} M={M}",
                 mkernel_output(config, buffers), buffers.baseline_c_rs,
             ) and all_correct
 
@@ -223,9 +231,9 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-        for candidate in config.mkernel_tuned_config(M):
+        for variant in config.sync_variants:
             buffers.mkernel_graph = capture_cuda_graph(
-                lambda: run_mkernel(mkernel_module, buffers, candidate)
+                lambda: run_mkernel(mkernel_module, buffers, variant)
             )
             # Change inputs on each replay to expose stale counters/output. Prepare
             # is deliberately never repeated: the graph must advance its own epoch.
@@ -235,7 +243,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                 buffers.mkernel_graph.replay()
                 torch.cuda.synchronize()
                 all_correct = check_close(
-                    f"gemm_rs mKernel graph {mkernel_config_label(candidate)} "
+                    f"gemm_rs mKernel graph {tile_label} {sync_variant_label(variant)} "
                     f"replay={replay + 1} M={M}",
                     mkernel_output(config, buffers), buffers.baseline_c_rs,
                 ) and all_correct
@@ -270,16 +278,19 @@ def gemm_rs_blackwell_prepare(
         buffers.baseline_graph.replay()
 
     fns = [(bench_baseline, "baseline", True)]
-    def bench_mkernel_eager():
-        run_mkernel(mkernel_module, buffers, config.mkernel_tuned_config(M))
+    buffers.mkernel_graphs = {}
+    for variant in config.sync_variants:
+        def bench_mkernel_eager(variant=variant):
+            run_mkernel(mkernel_module, buffers, variant)
 
-    buffers.mkernel_graph = capture_cuda_graph(bench_mkernel_eager)
+        buffers.mkernel_graphs[variant] = capture_cuda_graph(bench_mkernel_eager)
 
-    def bench_mkernel_graph():
-        buffers.mkernel_graph.replay()
+        def bench_mkernel_graph(variant=variant):
+            buffers.mkernel_graphs[variant].replay()
 
-    fns.append((bench_mkernel_eager, "mKernel eager", True))
-    fns.append((bench_mkernel_graph, "mKernel graph", True))
+        label = sync_variant_label(variant)
+        fns.append((bench_mkernel_eager, f"mKernel eager {label}", True))
+        fns.append((bench_mkernel_graph, f"mKernel graph {label}", True))
     if cutlass_available(config):
         candidate = config.cutlass_tuned_configs.get(M, config.cutlass_default_config)
         if config.is_chief:
@@ -376,13 +387,17 @@ def make_blackwell_buffers(
     )
     # Completion epoch header followed by the ready counters, one per rank. Multicast
     # so PULL configs can min-reduce every rank's flags in one load.
-    buffers.sync_mkernel = mkernel_module.DistBuffer(
-        mkernel_module.gemm_rs_blackwell_sync_shape, dtype=torch.int32,
-        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
-    )
-    mkernel_module.gemm_rs_blackwell_prepare(
-        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel, buffers.sync_mkernel,
-    )
+    buffers.sync_mkernel = {}
+    for variant in config.sync_variants:
+        buffers.sync_mkernel[variant] = mkernel_module.DistBuffer(
+            mkernel_module.gemm_rs_blackwell_sync_shape, dtype=torch.int32,
+            local_rank=config.local_rank, local_world_size=config.world_size,
+            multicast=True,
+        )
+        mkernel_module.gemm_rs_blackwell_prepare(
+            buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
+            buffers.sync_mkernel[variant],
+        )
     # Every rank must finish its local reset before any peer publishes a tile.
     torch.cuda.synchronize()
     dist.barrier()
@@ -422,12 +437,19 @@ def mkernel_config_label(candidate) -> str:
     return f"swizzle={swizzle} signals={signals} rs_rows={rs_rows} mma_warps={mma_warps}"
 
 
-def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, candidate=None):
-    """Launch GEMM+RS. The kernel picks its tuned config from M; `candidate` is
-    accepted only so callers can keep labelling runs with it."""
+def sync_variant_label(variant) -> str:
+    signal_strategy, fused_exit_barrier = variant
+    return f"{signal_strategy}/{'fused' if fused_exit_barrier else 'unfused'}"
+
+
+def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, variant):
+    """Launch GEMM+RS with one (signal_strategy, fused_exit_barrier) variant. The
+    kernel picks its tile config from M."""
+    signal_strategy, fused_exit_barrier = variant
     mkernel_module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.sync_mkernel,
+        buffers.sync_mkernel[variant],
+        signal_strategy=signal_strategy, fused_exit_barrier=fused_exit_barrier,
     )
 
 
@@ -471,8 +493,21 @@ def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
     """Per-rank GEMM throughput, with elapsed time including reduce-scatter."""
     return 2 * M * N * K / (elapsed_time_ms * 1.0e9)
 
+def parse_sync_variants(arg: str | None, all_variants):
+    if arg is None:
+        return list(all_variants)
+    by_label = {sync_variant_label(v): v for v in all_variants}
+    chosen = []
+    for label in (x.strip() for x in arg.split(",") if x.strip()):
+        if label not in by_label:
+            raise ValueError(f"unknown sync variant {label!r}; pick from {sorted(by_label)}")
+        chosen.append(by_label[label])
+    return chosen
+
+
 def blackwell_main(args, local_rank: int) -> int:
     config = BlackwellBenchConfig()
+    config.sync_variants = parse_sync_variants(args.sync_variants, config.SYNC_VARIANTS)
     mkernel_module = load_module.load(config.KERNEL_NAME)
 
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
@@ -505,6 +540,24 @@ def blackwell_main(args, local_rank: int) -> int:
                             flush=True,
                         )
                 time.sleep(5)
+            for mode in ("eager", "graph"):
+                ranked = sorted(
+                    (results[f"mKernel {mode} {sync_variant_label(v)}"], v)
+                    for v in config.sync_variants
+                    if f"mKernel {mode} {sync_variant_label(v)}" in results
+                )
+                if not ranked:
+                    continue
+                # The comparisons below use the best variant for each launch mode.
+                results[f"mKernel {mode}"] = ranked[0][0]
+                if config.is_chief:
+                    print(f"  mKernel {mode} sync variants, fastest first:", flush=True)
+                    for ms, v in ranked:
+                        print(
+                            f"    {sync_variant_label(v):<14} {ms:.3f} ms  "
+                            f"({ms / ranked[0][0]:.3f}x of best)",
+                            flush=True,
+                        )
             if config.is_chief and "cutlass" in results:
                 print(
                     f"  CUTLASS speedup vs cuBLAS+NCCL: "
@@ -557,6 +610,9 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--save-json", type=str, default=None)
+    p.add_argument("--sync-variants", type=str, default=None,
+                   help="blackwell: comma-separated subset of push/unfused, push/fused, "
+                        "pull/unfused, pull/fused (default: all four)")
     p.add_argument("--compare-to", type=str, default=None)
     p.add_argument("--node-idx", type=int, default=None)
     p.add_argument("--arch", type=str, default=HopperBenchConfig.arch, 
